@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -8,7 +7,7 @@ from rich.table import Table
 
 from evolith.controller.archive import SteppingStonesArchive
 from evolith.controller.engine import EvolithRSIEngine
-from evolith.models import EvolutionPlane
+from evolith.lab.cli import register
 from evolith.planes.l1_kernels import L1_KERNEL_TARGETS
 from evolith.planes.l2_policies import BASELINE_L2_POLICY_CODE, L2_POLICY_MUTATIONS
 from evolith.verifiers.dream_simulator import DreamTraceSimulator
@@ -16,13 +15,13 @@ from evolith.verifiers.kernel_sandbox import HardenedKernelVerifier
 
 app = typer.Typer(
     name="evolith",
-    help="Evolith: Inference Engine Recursive Self-Improvement (RSI) Framework",
+    help="Evolith: independently verified and measured GPU inference optimization.",
     add_completion=False,
 )
 console = Console()
 
 
-@app.command("evolve")
+@app.command("demo-evolve")
 def evolve_cmd(
     plane: str = typer.Option(
         "all",
@@ -144,7 +143,7 @@ def evolve_cmd(
         )
 
 
-@app.command("verify-kernel")
+@app.command("demo-verify-kernel")
 def verify_kernel_cmd(
     op_name: str = typer.Option(
         "fused_add_rmsnorm_fp8_quant",
@@ -176,7 +175,7 @@ def verify_kernel_cmd(
         )
 
 
-@app.command("dream-sim")
+@app.command("demo-dream-sim")
 def dream_sim_cmd() -> None:
     """Replay 320 multi-turn agent + tool-pause traces in the millisecond Dream Simulator."""
     sim = DreamTraceSimulator()
@@ -200,7 +199,7 @@ def dream_sim_cmd() -> None:
     )
 
 
-@app.command("archive")
+@app.command("demo-archive")
 def archive_cmd(
     db_path: str = typer.Option(
         ":memory:",
@@ -224,6 +223,8 @@ def archive_cmd(
         )
     )
 
+
+register(app)
 
 if __name__ == "__main__":
     app()

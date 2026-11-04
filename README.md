@@ -1,105 +1,131 @@
-# Evolith (`evolith`)
+# Evolith
 
-> **Living Silicon & Self-Evolving Inference Engines**  
-> A Dual-Plane Recursive Self-Improvement (RSI) Framework for LLM Inference Engines (`vLLM` / `SGLang` / `TensorRT-LLM`).
+**Measurement-first GPU inference optimization.** Evolith searches a bounded,
+trusted Triton parameter space, verifies candidates against an independent
+reference, and measures them against an optimized implementation before
+considering a runtime replacement. It does not claim recursive self-improvement
+from synthetic speedups.
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Architecture: Dual-Plane RSI](https://img.shields.io/badge/RSI-Dual--Plane%20L1%2BL2-00b4d8.svg)](./ARCHITECTURE.md)
+## Implemented scope
 
----
+- **L0:** separate candidate worker processes with timeouts, strict parameter
+  schemas, immutable inputs, NaN/Inf rejection, padded/prime shapes, independent
+  float64 reference, randomized paired CUDA-event timings and raw samples.
+- **L1:** BF16, zero-centered RMSNorm with optional residual addition, matching
+  Qwen3.5/Gemma semantics. Residual addition rounds to BF16 before normalization.
+  Search varies warps and rows per program, not arbitrary generated source.
+- **Promotion:** a fresh-seed confirmation is mandatory. Exact shape contracts
+  are eligible only when the one-sided 99% paired-bootstrap lower bound exceeds
+  a 3% gain and timing CV is at most 10%. This is an exploratory gate, not a
+  multiple-testing or independent replication guarantee.
+- **Actual model regression:** an opt-in vLLM worker adapter, frozen weights,
+  deterministic generated-token/logprob comparison, repeated AB/BA trials,
+  observed fallback counters, and a separate end-to-end deployment gate.
+- **Model-guided iteration:** the local model can propose strict parameter JSON
+  for another search round. Model-generated Python is never executed.
+- **History:** unique run IDs, atomic JSON reports, source/environment metadata,
+  and append-only SQLite records. No result is replaced by a later run.
 
-## Why `Evolith`?
+The first supported target is **Qwen3.5-27B BF16**. Qwen3.8-Flash-Next is not
+claimed supported by the currently tested vLLM 0.19 runtime. L2 runtime policy
+optimization, a calibrated trace simulator, arbitrary kernel generation and
+self-hosted acceleration remain future work.
 
-Traditional LLM inference engines rely on human kernel engineers to hand-tune CUDA/Triton kernels and static runtime heuristics (`chunked_prefill_size=2048`, fixed speculative draft depth $k=5$, naive LRU KV cache eviction). Whenever hardware changes (`H100` $\rightarrow$ `B200` $\rightarrow$ `MI350X`) or workload distributions shift (short chat $\rightarrow$ 128K multi-turn coding agents with tool pauses), static heuristics degrade by **30%–60%**.
-
-**Evolith** decouples the inference engine into **Immutable Safety Contracts** and **Two Orthogonal Evolvable Planes**, closing a **Self-Referential Ignition Flywheel**:
-
-1. **Plane L1 — Hardware Kernel & Graph Compiler Evolution**:
-   - Evolves custom epilogue fusions (`fused_add_rmsnorm_fp8_quant`) and long-context attention scoring (`triattention_prerope_score`) across shape buckets (`Batch = 1, 16, 128`).
-   - Protected by a **4-Stage Hardened Anti-Cheat Kernel Sandbox**:
-     - **Stage 1 (Static AST Gate)**: Blocks reward hacking such as global tensor memoization (`_STATIC_TENSOR_CACHE`), thread-block skipping, or host-synchronization tricks.
-     - **Stage 2 (Prime-Shape & Checksum Gate)**: Verifies numerical accuracy across power-of-two and prime/ragged dimensions (`Batch=13`) while checking SHA-256 input tensor checksums against in-place corruption.
-     - **Stage 3 (Ring-Buffer + L2 Cache Scrub Timing)**: Eliminates L2 cache warm-start illusions.
-     - **Stage 4 (Roofline Reflection Card)**: Classifies each candidate into `MEMORY_BOUND`, `COMPUTE_BOUND`, `LATENCY_LAUNCH_BOUND`, or `REGISTER_SPILL` and generates structured reflection cards.
-2. **Plane L2 — Runtime Scheduler, Speculative & KV Policy Evolution**:
-   - Evolves pure-Python `@evolvable_policy` hooks (`propose_speculative_config`, `compute_chunked_prefill_budget`, `score_kv_block_retention`).
-   - Verified in **~20 milliseconds** via the **Trace-Driven Dream Simulator** (`DreamTraceSimulator`), replaying 320 bursty multi-turn coding agent + tool-execution traces without waiting 15 minutes per live benchmark.
-3. **Evolutionary Controller (DGM + GEPA + HarnessLens)**:
-   - **Stepping-Stones Archive (`SteppingStonesArchive`)**: SQLite-backed MAP-Elites grid + Pareto frontier with **16x Compressed 4-Tuple Lineage Memory** (`[Hypothesis, PatchSummary, MetricDelta, FailureRootCause]`).
-   - **GEPA AST Function-Level Crossover**: Splices the best speculative drafter from Parent A with the best Continuum TTL KV eviction policy from Parent B via Python AST transformation.
-   - **HarnessLens Anti-Overfitting Defense**: Complexity-penalized pre-commit gate (`occams_razor_gate`) + periodic AST **Subtractive Ablation GC** ("Dream Pruning").
-
----
-
-## Quickstart
-
-### Installation
+## CPU tests
 
 ```bash
-uv venv
-uv pip install -e ".[dev]"
+uv sync --extra dev
+uv run pytest -q
 ```
 
-### 1. Run Full Dual-Plane Evolution & Self-Referential Ignition
+GPU tests skip without CUDA/Triton. The old NumPy prototype remains available
+only through `demo-evolve`, `demo-verify-kernel`, `demo-dream-sim` and
+`demo-archive`. Its inferred hardware counters, synthetic goodput and ignition
+estimates are **not measured results** and cannot authorize the new adapter.
+
+## GPU runtime
+
+Use a CUDA runtime supporting RTX 5090 (SM120), PyTorch 2.10, Triton 3.6 and
+vLLM 0.19 on Linux Python 3.10–3.13 (tested: 3.12). Install into an isolated
+environment with `uv sync --extra gpu --python 3.12`, or
+use the container helper. The helper requires an existing compatible image and
+complete local model weights. It intentionally disables networking and downloads.
 
 ```bash
-uv run evolith evolve
+export EVOLITH_IMAGE=vllm/vllm-openai:v0.19.0
+export EVOLITH_MODEL=/data/models/Qwen3.5-27B
+export EVOLITH_GPUS=2
+
+bash scripts/container.sh doctor --model-path /models/qwen
+bash scripts/container.sh evolve \
+  --model-path /models/qwen --output /results --rows 1,4,16,64
 ```
 
-### 2. Run the 4-Stage Anti-Cheat Kernel Sandbox
+The final JSON names the run's `/results/<run-id>/manifest.json`. No CPU or
+synthetic fallback is used when GPU requirements fail. No winner is also a
+valid experimental outcome.
 
-Inspect how `Evolith` catches and blocks the `_STATIC_TENSOR_CACHE` memoization reward hack while profiling valid single-pass and shape-aware kernels across buckets:
+Verify a measured artifact on four GPUs. Two 32 GB cards held the weights but
+did not leave enough profiled workspace/KV-cache headroom in the tested runtime:
 
 ```bash
-uv run evolith verify-kernel --op fused_add_rmsnorm_fp8_quant
+export EVOLITH_GPUS=0,1,2,3
+export EVOLITH_MEMORY=128g
+export EVOLITH_CPUS=24
+bash scripts/container.sh verify-model \
+  --model-path /models/qwen \
+  --manifest /results/<run-id>/manifest.json \
+  --output /results \
+  --tensor-parallel 4 \
+  --proposals /results/next-proposals.json
 ```
 
-### 3. Run the Millisecond Trace-Driven Dream Simulator
+An end-to-end run refuses an empty manifest, a different model/runtime, or a
+changed kernel source. Successful correctness checks do **not** automatically
+approve deployment: `deployment_approved` additionally requires a passing
+end-to-end timing gate. Reports retain the native fallback reasons and counts.
+The adapter is removed when verification ends.
+Worker integration uses string-named RPCs with JSON arguments; it does not
+enable vLLM's insecure callable/pickle serialization.
 
-Compare the Generation-0 workload-blind baseline against the Generation-4 co-optimized policy across 320 multi-turn coding agent traces:
+If no candidate passes confirmation, use `verify-model --baseline-only` with the
+same manifest to measure the unmodified model and generate next-round proposals.
+This never installs a candidate or reports an optimization speedup.
+
+Feed local-model proposals into the next measured round:
 
 ```bash
-uv run evolith dream-sim
+export EVOLITH_GPUS=2
+bash scripts/container.sh evolve \
+  --model-path /models/qwen --output /results \
+  --proposals /results/next-proposals.json
 ```
 
-### 4. Inspect the 16x Compressed 4-Tuple Lineage Archive
+The source and model mounts are read-only; only `results/` and `cache/` are
+writable. The helper exposes no network port and does not stop other services.
+Existing services can still create resource contention; use idle devices.
+For GPU tests, install pytest and dependencies into `cache/testdeps` offline,
+then run `bash scripts/container.sh test -q /workspace/tests`.
 
-```bash
-uv run evolith archive
-```
+## Measurement boundaries
 
-### 5. Run the Test Suite
+- The microbenchmark uses a warm ring of eight inputs, not a universal cache
+  scrub. CUDA-event time includes device idle gaps from host launches.
+- Padded tensors contain NaN/noise sentinels. This detects some erroneous reads
+  but does not prove memory safety; use Compute Sanitizer for broader coverage.
+- The reference explicitly checks output finiteness and bytewise input
+  preservation. It does not establish model-wide quality equivalence.
+- End-to-end tests currently cover six serialized, short deterministic text
+  generations in eager mode, not production load, full logits, long contexts,
+  SLO goodput or energy.
+- Model fingerprints cover config, index and shard sizes, not full weight
+  contents. Treat artifacts as local trusted records, not signed attestations.
+- Worker processes isolate crashes/timeouts, **not hostile code**. The trusted
+  kernel template is part of the reviewed codebase; JSON cannot add imports,
+  functions or arbitrary launch dimensions.
 
-```bash
-uv run pytest -v
-```
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the original research blueprint.
+That blueprint is aspirational, not a list of implemented capabilities.
 
----
-
-## Project Structure
-
-```text
-evolith/
-├── ARCHITECTURE.md                      # Detailed bilingual engineering blueprint
-├── pyproject.toml                       # Package & CLI configuration
-├── src/evolith/
-│   ├── cli.py                           # Typer + Rich CLI (`evolve`, `verify-kernel`, `dream-sim`, `archive`)
-│   ├── models.py                        # Pydantic models for Roofline profiles, SimMetrics, and LineageNode
-│   ├── planes/
-│   │   ├── l1_kernels.py                # ShapeBucketDispatchTable & L1 kernel evolution targets
-│   │   └── l2_policies.py               # EngineStepState & L2 scheduler/speculative/KV policy mutations
-│   ├── verifiers/
-│   │   ├── kernel_sandbox.py            # 4-Stage Hardened Anti-Cheat Kernel Verifier
-│   │   └── dream_simulator.py           # Millisecond Discrete-Event Trace Simulator (320 agent requests)
-│   └── controller/
-│       ├── archive.py                   # SQLite Stepping-Stones Archive & 16x 4-Tuple Memory Compression
-│       └── engine.py                    # EvolithRSIEngine (GEPA AST Crossover, Occam Gate, Subtractive GC)
-└── tests/
-    └── test_evolith.py                  # End-to-end unit tests for all verifiers, gates, and evolution loops
-```
-
----
-
-## Documentation
-
-See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the full architectural blueprint, mathematical formulations, anti-reward-hacking specification, and roadmap.
+Actual first-machine results and reproduction commands:
+[2026-11-04 validation](docs/validation-2026-11-04.md).
