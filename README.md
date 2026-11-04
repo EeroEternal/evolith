@@ -6,6 +6,12 @@ reference, and measures them against an optimized implementation before
 considering a runtime replacement. It does not claim recursive self-improvement
 from synthetic speedups.
 
+The governing principle is **self-directed improvement**, not a permanent,
+human-chosen hotspot: observe the workload, choose a supported target, propose
+changes, independently verify, retain only an approved successor, and repeat.
+Correctness and measurement gates are not evolvable rewards. See
+[AGENTS.md](AGENTS.md).
+
 ## Implemented scope
 
 - **L0:** separate candidate worker processes with timeouts, strict parameter
@@ -23,6 +29,11 @@ from synthetic speedups.
   observed fallback counters, and a separate end-to-end deployment gate.
 - **Model-guided iteration:** the local model can propose strict parameter JSON
   for another search round. Model-generated Python is never executed.
+- **Autonomous controller:** `autoevolve` re-observes the running workload,
+  chooses an exact contract by sampled cumulative cost and archived experience,
+  avoids repeated configurations within a session, and continues within fixed
+  time/evaluation/cycle budgets. A successor must beat the current approved
+  incumbent, not merely the original native implementation.
 - **History:** unique run IDs, atomic JSON reports, source/environment metadata,
   and append-only SQLite records. No result is replaced by a later run.
 
@@ -57,6 +68,41 @@ export EVOLITH_MODEL=/data/models/Qwen3.5-27B
 export EVOLITH_GPUS=2
 
 bash scripts/container.sh doctor --model-path /models/qwen
+```
+
+### Autonomous evolution
+
+No manually selected row counts or hotspot are required:
+
+```bash
+export EVOLITH_GPUS=0,1,2,3
+export EVOLITH_MEMORY=192g
+export EVOLITH_CPUS=24
+export EVOLITH_TIMEOUT=1900
+bash scripts/container.sh autoevolve \
+  --model-path /models/qwen --output /results \
+  --cycles 3 --evaluation-budget 32 --time-budget 1800
+```
+
+The result identifies the session report, stop reason and optional approved
+manifest. A budget stop with no approved artifact is a valid result; the native
+engine remains unchanged. Nothing is installed into a persistent service.
+Use `--workload /workspace/workloads/local.json` with a local
+`{"prompts":["Your representative request"]}` file to change the workload.
+The file is data, never executable code. Keep private workloads in the ignored
+`workloads/` directory.
+
+The initial observation capability covers GemmaRMSNorm only. It estimates
+per-contract cost from capped CUDA-event samples; **it is not a whole-engine
+profiler or arbitrary source evolution**. See
+[controller design and limits](docs/autonomous-evolution.md).
+
+### Individual experimental stages
+
+For manual diagnosis or reproduction of one measured stage:
+
+```bash
+export EVOLITH_GPUS=2
 bash scripts/container.sh evolve \
   --model-path /models/qwen --output /results --rows 1,4,16,64
 ```

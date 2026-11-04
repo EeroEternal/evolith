@@ -50,3 +50,12 @@ class RunStore:
                 {"run_id": r[0], "kind": r[1], "report": json.loads(r[2])}
                 for r in conn.execute("SELECT run_id, kind, report FROM runs ORDER BY rowid")
             ]
+
+    def recent(self, kind: str, limit: int = 32) -> list[dict]:
+        if not 1 <= limit <= 256:
+            raise ValueError("History limit must be between 1 and 256.")
+        with sqlite3.connect(self.path) as conn:
+            return [json.loads(row[0]) for row in conn.execute(
+                "SELECT report FROM runs WHERE kind = ? ORDER BY rowid DESC LIMIT ?",
+                (kind, limit),
+            )]

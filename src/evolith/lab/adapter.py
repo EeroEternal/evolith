@@ -18,10 +18,11 @@ def install(manifest_data: dict, model) -> dict:
 
     from evolith.lab.contracts import Manifest
     from evolith.lab.kernels import kernel_hash
+    from evolith.lab.observation import active
 
     global _manifest
-    if _originals:
-        raise RuntimeError("Adapter already installed in this worker.")
+    if _originals or active():
+        raise RuntimeError("Adapter or observer already installed in this worker.")
     manifest = Manifest.model_validate(manifest_data)
     if manifest.kernel_hash != kernel_hash():
         raise ValueError("Kernel source hash differs from the measured artifact.")
@@ -97,4 +98,14 @@ class EvolithWorkerExtension:
         return stats(self.model_runner.model)
 
     def evolith_restore(self) -> dict:
+        from evolith.lab import observation
+        observation.stop()
         return restore(self.model_runner.model)
+
+    def evolith_observe_start(self, eps: float) -> dict:
+        from evolith.lab import observation
+        return observation.start(self.model_runner.model, eps)
+
+    def evolith_observe_stop(self) -> dict:
+        from evolith.lab import observation
+        return observation.stop()

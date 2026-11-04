@@ -11,12 +11,18 @@ from evolith.lab.contracts import Evaluation, KernelConfig, Manifest, Proposal, 
 from evolith.lab.store import RunStore, new_run_id, write_json
 
 
-def execute_job(request: dict, directory: Path, timeout: float) -> list[Evaluation]:
-    """Only trusted workers and validated parameters run here, never model source."""
+class WorkerTimeout(RuntimeError):
+    pass
+
+
+def execute_request(module: str, request: dict, directory: Path, timeout: float) -> dict:
+    """Only these trusted worker entrypoints may run, never model source."""
+    if module not in ("evolith.lab.worker", "evolith.lab.autonomy_worker"):
+        raise ValueError("Unknown worker entrypoint.")
     directory.mkdir(parents=True, exist_ok=False)
     write_json(directory / "request.json", request)
     command = [
-        sys.executable, "-m", "evolith.lab.worker",
+        sys.executable, "-m", module,
         "--request", str((directory / "request.json").resolve()),
         "--response", str((directory / "response.json").resolve()),
     ]
@@ -34,11 +40,15 @@ def execute_job(request: dict, directory: Path, timeout: float) -> list[Evaluati
             os.killpg(process.pid, signal.SIGKILL)
             output, _ = process.communicate()
         (directory / "worker.log").write_text(output)
-        raise RuntimeError(f"Worker exceeded {timeout}s; process group terminated.") from None
+        raise WorkerTimeout(f"Worker exceeded {timeout}s; process group terminated.") from None
     (directory / "worker.log").write_text(output)
     if process.returncode:
         raise RuntimeError(f"Worker exited {process.returncode}; see {directory / 'worker.log'}")
-    data = json.loads((directory / "response.json").read_text())
+    return json.loads((directory / "response.json").read_text())
+
+
+def execute_job(request: dict, directory: Path, timeout: float) -> list[Evaluation]:
+    data = execute_request("evolith.lab.worker", request, directory, timeout)
     results = [Evaluation.model_validate(r) for r in data["evaluations"]]
     expected = [Shape.model_validate(s).key for s in request["shapes"]]
     if [r.shape.key for r in results] != expected or any(
@@ -52,6 +62,7 @@ def search(
     model_path: Path, output: Path, rows: list[int], *,
     proposals: Path | None = None, rounds: int = 11, iterations: int = 32,
     seed: int = 2026, min_gain: float = 0.03, worker_timeout: float = 300,
+    targets: list[Shape] | None = None,
 ) -> dict:
     from evolith.lab.gpu import environment, model_info
     from evolith.lab.kernels import kernel_hash
@@ -69,12 +80,15 @@ def search(
         else [KernelConfig(num_warps=w, rows_per_program=r) for w in (4, 8) for r in (1, 4)]
     )
     configs = list({c.key: c for c in configs}.values())
-    shapes = [
+    shapes = targets if targets is not None else [
         Shape(rows=n, hidden=info["hidden"], residual=r)
         for n in sorted(set(rows)) for r in (False, True)
     ]
     if not shapes:
         raise ValueError("At least one row count is required.")
+    if any(s.hidden != info["hidden"] for s in shapes):
+        raise ValueError("Target hidden dimension differs from the model.")
+    shapes = list({s.key: s for s in shapes}.values())
     evaluations: list[Evaluation] = []
     errors = []
 

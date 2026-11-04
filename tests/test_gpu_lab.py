@@ -49,3 +49,33 @@ def test_unsupported_rank_refuses_before_launch():
             torch.tensor(1, device="cuda", dtype=torch.bfloat16),
             None, torch.ones(1, device="cuda", dtype=torch.bfloat16), 1e-6, KernelConfig(),
         )
+
+
+def test_runtime_observer_preserves_outputs_caps_samples_and_restores_method():
+    from vllm.config.vllm import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    from evolith.lab import observation
+
+    with set_current_vllm_config(VllmConfig()):
+        norm = GemmaRMSNorm(5120, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+        norm.weight.data.zero_()
+        x = torch.randn((7, 5120), device="cuda", dtype=torch.bfloat16)
+        before = x.clone()
+        expected = norm(x)
+        original = norm._forward_method
+        try:
+            assert observation.start(norm, 1e-6)["observed_modules"] == 1
+            for _ in range(20):
+                torch.testing.assert_close(norm(x), expected, rtol=0, atol=0)
+            ranks = observation.stop()
+        finally:
+            observation.stop()
+        assert norm._forward_method == original
+        assert not observation.active()
+        assert ranks["targets"][0]["calls"] == 20
+        assert len(ranks["targets"][0]["sample_us"]) == 16
+        torch.testing.assert_close(x, before, rtol=0, atol=0)
+        report = observation.aggregate([ranks], "weights", "workload")
+        assert report.targets[0].eligible
+        assert report.targets[0].shape.rows == 7

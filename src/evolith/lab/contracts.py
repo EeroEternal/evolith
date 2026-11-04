@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,6 +24,12 @@ class KernelConfig(StrictModel):
 
 class Proposal(StrictModel):
     candidates: list[KernelConfig] = Field(min_length=1, max_length=12)
+
+
+class Workload(StrictModel):
+    prompts: list[Annotated[str, Field(min_length=1, max_length=8192)]] = Field(
+        min_length=1, max_length=32,
+    )
 
 
 class Shape(StrictModel):

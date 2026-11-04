@@ -15,3 +15,5 @@ build/
 .env
 results/
 .ruff_cache/
+workloads/
+cache/

@@ -147,3 +147,49 @@ bash scripts/container.sh evolve \
 
 Measurements can legitimately select no winners. Review raw samples, coverage
 and the end-to-end gate before drawing performance conclusions.
+
+## Autonomous-controller follow-up
+
+Session: `results/20261104T131709Z-bcea83804f52/report.json`.
+
+A single `autoevolve` invocation completed two rounds without human-selected
+row counts or parameter proposals, in 604.6 seconds. It used TP=4 for observation
+and local-model proposal generation, with a 1,500-second wall-time budget and
+16-evaluation budget. Search used the trusted worker and fixed admission rules.
+
+| Cycle | Observation run | Automatically selected contract | Evaluations | Confirmed winners |
+| --- | --- | --- | ---: | ---: |
+| 0 | `20261104T131723Z-04acd03ff220` | `1:5120:bfloat16:1` | 5 | 0 |
+| 1 | `20261104T132344Z-960ed3f3b4cc` | `1:5120:bfloat16:1` | 4 | 0 |
+
+The controller chose that contract from measured cumulative normalization cost,
+not a hardcoded decode target. It re-observed the model in the second cycle and
+included the first cycle's failure feedback in the next proposal request.
+
+- Cycle 0 configurations: `w4-r1`, `w8-r2`, `w16-r4`, `w8-r8`.
+- Cycle 1 configurations: `w4-r2`, `w4-r4`, `w4-r8`, `w8-r1`.
+- All nine evaluations passed their independent numerical checks, 324 checks
+  in total.
+- `w4-r1` initially appeared to improve the microbenchmark by 1.0493x, but fresh
+  confirmation measured 0.9953x. It was correctly rejected.
+- Both instrumented baseline generations passed output regression, with
+  maximum returned generated-token logprob difference 0.0.
+- The observer also found eight unsupported 3D normalization contracts. Those
+  remained native and were recorded as capability gaps, not forced into a
+  2D contract.
+- The session stopped at `cycle_budget`, with `deployment_approved: false`
+  and no approved manifest. No candidate reached the full-model timing stage.
+
+This demonstrates real autonomous iteration and rejection, **not a measured
+end-to-end improvement or an actual incumbent upgrade**. Successor-versus-incumbent
+switching, provenance checks, composed lineage and rejection retention are also
+covered by CPU control-flow tests; this session did not exercise a successful
+promotion on hardware.
+
+The first new GPU test run found a missing vLLM configuration context in the
+test fixture (67 passed, 1 failed). The fixture was corrected, and the pre-session
+suite then passed all 68 tests. Additional history/capability-gap tests were
+added afterward. Final verification: **71 passed on the GPU machine** and
+**62 passed, 1 GPU-module skip in the locked CPU environment**. Ruff, lockfile,
+shell syntax, whitespace and source/wheel build checks passed. All Evolith
+containers exited; all eight GPUs returned to 2 MiB reported memory usage.

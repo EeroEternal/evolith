@@ -6,7 +6,7 @@ import statistics
 import time
 from pathlib import Path
 
-from evolith.lab.contracts import Manifest, Proposal
+from evolith.lab.contracts import Manifest, Proposal, Workload, content_hash
 from evolith.lab.store import RunStore, new_run_id, write_json
 
 PROMPTS = [
@@ -68,32 +68,87 @@ def measure_model_trials(trials: dict):
     )
 
 
+def propose(llm, info: dict, env: dict, manifest: Manifest | None,
+            observation: dict | None, history: list[dict]) -> Proposal:
+    from vllm import SamplingParams
+    from vllm.sampling_params import StructuredOutputsParams
+
+    targets = sorted((observation or {}).get("targets", []),
+                     key=lambda row: row["estimated_rank_total_us"], reverse=True)[:6]
+    context = {
+        "hidden": info["hidden"], "gpu": env["gpu"],
+        "measured_targets": [
+            {"shape": row["shape"], "cost_us": round(row["estimated_rank_total_us"], 2)}
+            for row in targets
+        ],
+        "confirmed_winners": {k: v.key for k, v in manifest.winners.items()} if manifest else {},
+        "recent_outcomes": history[-4:],
+    }
+    prompt = (
+        "Propose at most four diverse Triton zero-centered RMSNorm configurations using "
+        "the measured workload and previous failures below. Do not select a permanent "
+        "hotspot. Respond only with JSON matching "
+        '{"candidates":[{"num_warps":4,"rows_per_program":1}]}. '
+        "num_warps must be 4,8,16; rows_per_program must be 1,2,4,8. "
+        "No code, explanations, evaluation changes or resource changes are permitted. "
+        + json.dumps(context, separators=(",", ":"))
+    )
+    prompt = llm.get_tokenizer().apply_chat_template(
+        [{"role": "user", "content": prompt}], tokenize=False,
+        add_generation_prompt=True, enable_thinking=False,
+    )
+    sampling = SamplingParams(
+        temperature=0, max_tokens=512,
+        structured_outputs=StructuredOutputsParams(json=Proposal.model_json_schema()),
+    )
+    answer = llm.generate([prompt], sampling, use_tqdm=False)[0].outputs[0].text
+    return Proposal.model_validate_json(answer)
+
+
 def verify_model(
-    model_path: Path, manifest_path: Path, output: Path, *,
+    model_path: Path, manifest_path: Path | None, output: Path, *,
     tensor_parallel: int = 4, max_tokens: int = 32, proposals: Path | None = None,
     baseline_only: bool = False,
+    observe: bool = False, workload: Path | None = None,
+    baseline_manifest: Path | None = None, required_shapes: list[str] | None = None,
+    history: list[dict] | None = None,
 ) -> dict:
     from vllm import LLM, SamplingParams
 
     from evolith.lab.gpu import environment, model_info
 
-    manifest = Manifest.model_validate_json(manifest_path.read_text())
+    manifest = Manifest.model_validate_json(manifest_path.read_text()) if manifest_path else None
+    incumbent = Manifest.model_validate_json(baseline_manifest.read_text()) if baseline_manifest else None
     info = model_info(model_path)
-    if info["fingerprint"] != manifest.model_fingerprint:
+    if any(info["fingerprint"] != m.model_fingerprint for m in (manifest, incumbent) if m):
         raise ValueError("Model fingerprint does not match the measured artifact.")
-    if not manifest.winners and not baseline_only:
+    if (manifest is None or not manifest.winners) and not baseline_only:
         raise ValueError("No independently confirmed kernels; refusing a fake optimized-model run.")
+    if observe and not baseline_only:
+        raise ValueError("Profiling must be separate from candidate timing.")
+    if required_shapes and any(
+        manifest is None or key not in manifest.winners
+        or (incumbent and manifest.winners[key] == incumbent.winners.get(key))
+        for key in required_shapes
+    ):
+        raise ValueError("Required contracts must be new candidate changes.")
+    prompts = Workload.model_validate_json(workload.read_text()).prompts if workload else PROMPTS + HOLDOUT
+    workload_fingerprint = content_hash({"prompts": prompts, "max_tokens": max_tokens})
+    from evolith.lab.kernels import kernel_hash
     run_id = new_run_id()
     directory = output.resolve() / run_id
     directory.mkdir(parents=True, exist_ok=False)
     report = {
         "run_id": run_id, "status": "running", "model": info,
-        "kernel_run_id": manifest.run_id, "environment": environment(),
+        "kernel_run_id": manifest.run_id if manifest else None, "environment": environment(),
+        "baseline_kernel_run_id": incumbent.run_id if incumbent else None,
+        "workload_fingerprint": workload_fingerprint, "request_count": len(prompts),
+        "kernel_hash": kernel_hash(),
         "tensor_parallel": tensor_parallel, "max_tokens": max_tokens,
         "engine_mode": "eager model; native RMSNorm retains its existing compiled implementation",
     }
     write_json(directory / "report.json", report)
-    report["request_mode"] = "six serialized requests; single-stream decode"
+    report["request_mode"] = "serialized requests; single-stream decode"
     llm = None
     sampling = SamplingParams(temperature=0, max_tokens=max_tokens, logprobs=1, ignore_eos=True)
 
@@ -103,6 +158,11 @@ def verify_model(
         for prompt in prompts:
             outputs.extend(llm.generate([prompt], sampling, use_tqdm=False))
         return summarize(outputs, time.perf_counter() - started)
+
+    def switch(selected):
+        llm.collective_rpc("evolith_restore")
+        if selected is not None:
+            return llm.collective_rpc("evolith_activate", args=(selected.model_dump(),))
 
     try:
         llm = LLM(
@@ -115,25 +175,35 @@ def verify_model(
             disable_log_stats=True,
             worker_extension_cls="evolith.lab.adapter.EvolithWorkerExtension",
         )
-        # Warm both prompt families on the frozen baseline before collecting samples.
-        generate(PROMPTS + HOLDOUT)
-        baseline = generate(PROMPTS + HOLDOUT)
+        switch(incumbent)
+        generate(prompts)
+        baseline = generate(prompts)
         report["baseline"] = baseline
         if baseline_only:
-            repeated = generate(PROMPTS + HOLDOUT)
+            if observe:
+                from evolith.lab.observation import aggregate
+                report["observer_installation"] = llm.collective_rpc("evolith_observe_start", args=(info["eps"],))
+                repeated = generate(prompts)
+                ranks = llm.collective_rpc("evolith_observe_stop")
+                report["observation"] = aggregate(ranks, info["fingerprint"], workload_fingerprint).model_dump()
+            else:
+                repeated = generate(prompts)
             report["baseline_repeat"] = repeated
             report["correctness"] = compare_outputs(baseline, repeated)
             report["status"] = "baseline_measured" if report["correctness"]["passed"] else "rejected"
             report["deployment_approved"] = False
             report["adapter_exercised"] = False
         else:
-            report["installation"] = llm.collective_rpc("evolith_activate", args=(manifest.model_dump(),))
-            generate(PROMPTS + HOLDOUT)  # compilation/warmup excluded from timing
-            candidate = generate(PROMPTS + HOLDOUT)
+            report["installation"] = switch(manifest)
+            generate(prompts)  # compilation/warmup excluded from timing
+            candidate = generate(prompts)
             report["candidate"] = candidate
             report["correctness"] = compare_outputs(baseline, candidate)
             report["dispatch"] = llm.collective_rpc("evolith_stats")
-            report["adapter_exercised"] = any(
+            report["required_candidate_shapes"] = required_shapes or []
+            report["adapter_exercised"] = bool(report["dispatch"]) and all(
+                all(rank.get(f"accelerated:{key}", 0) > 0 for key in required_shapes)
+                if required_shapes else
                 any(key.startswith("accelerated:") and count > 0 for key, count in rank.items())
                 for rank in report["dispatch"]
             )
@@ -143,10 +213,8 @@ def verify_model(
                 for trial in range(5):
                     modes = ("baseline", "candidate") if trial % 2 == 0 else ("candidate", "baseline")
                     for mode in modes:
-                        llm.collective_rpc("evolith_restore")
-                        if mode == "candidate":
-                            llm.collective_rpc("evolith_activate", args=(manifest.model_dump(),))
-                        measured = generate(PROMPTS + HOLDOUT)
+                        switch(manifest if mode == "candidate" else incumbent)
+                        measured = generate(prompts)
                         comparison = compare_outputs(baseline, measured)
                         if not comparison["passed"]:
                             raise RuntimeError(f"{mode} regression during trial {trial}: {comparison}")
@@ -168,35 +236,15 @@ def verify_model(
                 and report.get("e2e_measurement", {}).get("accepted", False)
             )
         if proposals is not None:
-            llm.collective_rpc("evolith_restore")
-            prompt = (
-                "Choose at most four Triton zero-centered RMSNorm configurations for hidden=5120 "
-                "on RTX 5090. Respond ONLY with JSON matching "
-                '{"candidates":[{"num_warps":4,"rows_per_program":1}]}. '
-                "num_warps must be 4,8,16; rows_per_program must be 1,2,4,8. "
-                "Use diverse configurations to explore latency at small batch sizes. "
-                "Do not write code or explanations. Independent confirmation winners: "
-                + json.dumps({k: v.model_dump() for k, v in manifest.winners.items()})
-                + ". Selected observations (speedup, lower bound, max CV): "
-                + json.dumps([
-                    {"config": e.config.key, "rows": e.shape.rows, "residual": e.shape.residual,
-                     "stage": e.stage, "speedup": round(e.timing.speedup, 3),
-                     "lower": round(e.timing.lower_bound, 3),
-                     "cv": round(max(e.timing.baseline_cv, e.timing.candidate_cv), 3)}
-                    for e in manifest.evaluations if e.timing
-                ][-6:])
-            )
-            from vllm.sampling_params import StructuredOutputsParams
-            proposal_sampling = SamplingParams(
-                temperature=0, max_tokens=1024,
-                structured_outputs=StructuredOutputsParams(json=Proposal.model_json_schema()),
-            )
-            prompt = llm.get_tokenizer().apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                tokenize=False, add_generation_prompt=True, enable_thinking=False,
-            )
-            answer = llm.generate([prompt], proposal_sampling, use_tqdm=False)[0].outputs[0].text
-            proposal = Proposal.model_validate_json(answer)
+            switch(incumbent)
+            from evolith.lab.observation import session_identity
+            identity = session_identity(info["fingerprint"], workload_fingerprint, report["kernel_hash"],
+                                        report["environment"], tensor_parallel)
+            remembered = [row["feedback"] for row in reversed(
+                RunStore(output / "runs.sqlite3").recent("autonomous_cycle")
+            ) if row.get("identity") == identity]
+            proposal = propose(llm, info, report["environment"], manifest or incumbent,
+                               report.get("observation"), [*remembered, *(history or [])][-4:])
             write_json(proposals, proposal.model_dump())
             report["proposal_file"] = str(proposals)
             report["proposal_source"] = "local Qwen3.5-27B inference; validated parameter JSON only"

@@ -15,6 +15,36 @@ def emit(value: dict) -> None:
 
 
 def register(app: typer.Typer) -> None:
+    @app.command("autoevolve")
+    def autoevolve(
+        model_path: Annotated[Path, typer.Option(exists=True, file_okay=False)],
+        output: Annotated[Path, typer.Option()] = Path("results"),
+        workload: Annotated[Path | None, typer.Option(exists=True, dir_okay=False)] = None,
+        cycles: Annotated[int, typer.Option(min=1, max=8)] = 3,
+        evaluation_budget: Annotated[int, typer.Option(min=2, max=128)] = 32,
+        time_budget: Annotated[int, typer.Option(min=30, max=7200)] = 1800,
+        candidates_per_cycle: Annotated[int, typer.Option(min=1, max=12)] = 4,
+        tensor_parallel: Annotated[int, typer.Option(min=1, max=8)] = 4,
+        max_tokens: Annotated[int, typer.Option(min=1, max=256)] = 16,
+        rounds: Annotated[int, typer.Option(min=5, max=101)] = 19,
+        iterations: Annotated[int, typer.Option(min=1, max=1000)] = 128,
+        seed: Annotated[int, typer.Option(min=0)] = 2026,
+    ):
+        """Observe, choose targets, propose, verify and iterate within immutable budgets."""
+        try:
+            from evolith.lab.autonomy import Budget, run
+            result = run(
+                model_path, output, budget=Budget(
+                    cycles=cycles, evaluations=evaluation_budget, seconds=time_budget,
+                    candidates_per_cycle=candidates_per_cycle,
+                ), tensor_parallel=tensor_parallel, max_tokens=max_tokens, workload=workload,
+                rounds=rounds, iterations=iterations, seed=seed,
+            )
+            emit(result)
+        except (ImportError, RuntimeError, ValueError, TypeError, OSError) as exc:
+            emit(refusal(str(exc)))
+            raise typer.Exit(2) from exc
+
     @app.command("doctor")
     def doctor(
         model_path: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
