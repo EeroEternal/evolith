@@ -225,5 +225,108 @@ def archive_cmd(
     )
 
 
+@app.command("zstep-evolve")
+def zstep_evolve_cmd(
+    source: str = typer.Option("~/github/zstep", "--source"),
+    host: str = typer.Option("10.23.51.33", "--host"),
+    user: str = typer.Option("node-user", "--user"),
+    generations: int = typer.Option(1, "--generations", min=1, max=100),
+    local_timeout: int = typer.Option(1800, "--local-timeout", min=1),
+) -> None:
+    """Run isolated zstep source evolution; no deployment or upstream commit occurs."""
+    from evolith.zstep.archive import ZStepArchive
+    from evolith.zstep.loop import ZStepRSILoop
+    from evolith.zstep.task import ZStepRSITask
+
+    task = ZStepRSITask(
+        project_root=Path.cwd(),
+        source_repo=Path(source).expanduser().resolve(),
+        remote_host=host,
+        remote_user=user,
+        max_generations=generations,
+        local_timeout_sec=local_timeout,
+    )
+    with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
+        statuses = ZStepRSILoop(task, archive=archive).run()
+    for status in statuses:
+        console.print(f"zstep candidate: {status.value}")
+
+
+@app.command("zstep-resume")
+def zstep_resume_cmd(
+    candidate_id: str,
+    source: str = typer.Option("~/github/zstep", "--source"),
+    host: str = typer.Option("10.23.51.33", "--host"),
+    user: str = typer.Option("node-user", "--user"),
+) -> None:
+    """Resume an interrupted zstep candidate from frozen source archives and round checkpoints."""
+    from evolith.zstep.archive import ZStepArchive
+    from evolith.zstep.loop import ZStepRSILoop
+    from evolith.zstep.task import ZStepRSITask
+
+    task = ZStepRSITask(
+        project_root=Path.cwd(),
+        source_repo=Path(source).expanduser().resolve(),
+        remote_host=host,
+        remote_user=user,
+    )
+    with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
+        try:
+            status = ZStepRSILoop(task, archive=archive).resume(candidate_id)
+        except KeyError:
+            console.print(f"Unknown zstep candidate: {candidate_id}")
+            raise typer.Exit(code=1) from None
+    console.print(f"zstep candidate {candidate_id}: {status.value}")
+
+
+@app.command("zstep-status")
+def zstep_status_cmd() -> None:
+    """Show isolated zstep candidate lineage and the best verified baseline."""
+    from evolith.zstep.archive import ZStepArchive
+
+    with ZStepArchive(Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3") as archive:
+        entries = archive.list_candidates()
+        parent = archive.current_parent()
+    if not entries:
+        console.print("No zstep candidates recorded.")
+        return
+    table = Table(title=f"zstep RSI (best verified parent: {parent or 'frozen baseline'})")
+    table.add_column("Candidate", no_wrap=True)
+    table.add_column("Parent", no_wrap=True)
+    table.add_column("LOC", justify="right", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Gain", justify="right", no_wrap=True)
+    table.add_column("Summary")
+    for entry in entries:
+        hyp = str(entry.get("hypothesis") or entry.get("patch_summary") or "")
+        detail = str(entry.get("failure_reason") or entry.get("metric_delta") or "")
+        plane_short = str(entry.get("plane") or "").replace("l1_kernel", "L1").replace("l2_scheduler", "L2")
+        prefix = f"[{plane_short}] " if plane_short else ""
+        summary = prefix + (f"{hyp} | {detail}".strip(" |") or "-")
+        table.add_row(
+            str(entry["candidate_id"]),
+            str(entry["parent_id"] or "-"),
+            str(entry.get("changed_lines") or 0),
+            str(entry["status"]),
+            f"{float(entry['geomean_gain']):.2%}",
+            summary[:120],
+        )
+    console.print(table)
+
+
+@app.command("zstep-evidence")
+def zstep_evidence_cmd(candidate_id: str) -> None:
+    """Print the evidence directory for a zstep candidate."""
+    from evolith.zstep.archive import ZStepArchive
+
+    with ZStepArchive(Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3") as archive:
+        try:
+            evidence = archive.evidence_dir(candidate_id)
+        except KeyError:
+            console.print(f"Unknown zstep candidate: {candidate_id}")
+            raise typer.Exit(code=1) from None
+    console.print(evidence)
+
+
 if __name__ == "__main__":
     app()

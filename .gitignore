@@ -13,3 +13,7 @@ build/
 *.sqlite
 *.sqlite3
 .env
+.evolith/
+.evolith_archive.db
+targets/
+.worktrees/

@@ -68,7 +68,19 @@ uv run evolith dream-sim
 uv run evolith archive
 ```
 
-### 5. Run the Test Suite
+### 5. Run Isolated Source-Level RSI on zstep
+
+The `zstep-evolve` command runs source-level RSI against an isolated clone of `zstep` (`targets/zstep/`), leaving `~/github/zstep` untouched. Each generation stages an external proposer sandbox, injects SM120 hardware/operator reflection cards and AIDE² 4-tuple compressed lineage memory into the Kimi CLI prompt, enforces local Rust/Python gates (including Linux x86_64 workspace typechecking on macOS), screens on remote GPUs (`prime_squares_table` greedy parity, 0 Triton recompilations, non-regression), and runs checkpointed round-major interleaved verification with Evolith's Occam's Razor complexity gate.
+
+```bash
+uv run evolith zstep-evolve --source ~/github/zstep --generations 1
+uv run evolith zstep-status
+uv run evolith zstep-resume <candidate-id>
+uv run evolith zstep-evidence <candidate-id>
+uv run evolith archive --db .evolith/zstep-rsi/archive.sqlite3
+```
+
+### 6. Run the Test Suite
 
 ```bash
 uv run pytest -v
