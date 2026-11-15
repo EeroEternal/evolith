@@ -4,9 +4,17 @@ import json
 from pathlib import Path
 import subprocess
 
+import httpx
 import pytest
 
-from evolith.zstep.proposer import KimiCodeProposer, PatchProposer, parse_proposal_metadata
+from evolith.zstep.proposer import (
+    KimiCodeProposer,
+    OpenAICompatibleProposer,
+    PatchProposer,
+    build_proposer,
+    extract_unified_diff,
+    parse_proposal_metadata,
+)
 from evolith.zstep.task import ZStepRSITask
 
 
@@ -151,3 +159,80 @@ def test_patch_proposer_applies_unified_diff_and_emits_metadata(tmp_path: Path) 
     assert meta.niche_key == "(plane=l2_scheduler,focus=dsv41_device_token_overlap)"
     assert meta.patch_summary == "Enable overlap"
     assert (tmp_path / "evidence/prompt.txt").read_text(encoding="utf-8") == "prompt body"
+
+
+def test_openai_compatible_proposer_sends_apc_prefix_and_applies_diff(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "candidate"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    target = repo / "worker/zstep_worker/runtime_loop.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("MAX_STEPS = 4\n\n", encoding="utf-8")
+    big_first = repo / "crates/zs-scheduler/src/serving.rs"
+    big_first.parent.mkdir(parents=True)
+    big_first.write_text("fn step() {}\n" * 11_500, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+
+    target.write_text("MAX_STEPS = 8\n\n", encoding="utf-8")
+    diff_text = subprocess.run(
+        ["git", "diff"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout
+    assert diff_text.endswith(" \n"), "expected trailing blank context line in diff"
+    subprocess.run(["git", "checkout", "--", "."], cwd=repo, check=True)
+
+    captured_requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(
+            {
+                "url": str(request.url),
+                "auth": request.headers.get("Authorization"),
+                "json": json.loads(request.content.decode("utf-8")),
+            }
+        )
+        completion = (
+            "Applying speculative graph width increase:\n"
+            f"```diff\n{diff_text}```\n"
+            'EVOLITH_PROPOSAL_JSON: {"hypothesis": "Self-hosted zstep proposal", '
+            '"niche_key": "(plane=l2_scheduler,focus=spec_decode_verify_graph)", '
+            '"patch_summary": "Bump MAX_STEPS"}\n'
+        )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": completion}}]},
+        )
+
+    task = make_task(
+        tmp_path,
+        proposer_backend="openai",
+        proposer_api_base="http://zstep.local:43537/v1",
+        proposer_model="DeepSeek-V4.1-Flash",
+    )
+    built = build_proposer(task)
+    assert isinstance(built, OpenAICompatibleProposer)
+
+    proposer = OpenAICompatibleProposer(
+        task,
+        api_key="test-key",
+        transport=httpx.MockTransport(handler),
+    )
+    out = proposer.propose(repo, "Optimize runtime_loop", tmp_path / "ev-openai")
+
+    assert target.read_text(encoding="utf-8") == "MAX_STEPS = 8\n\n"
+    assert len(captured_requests) == 1
+    assert captured_requests[0]["url"] == "http://zstep.local:43537/v1/chat/completions"
+    assert captured_requests[0]["auth"] == "Bearer test-key"
+    req_json = captured_requests[0]["json"]
+    assert isinstance(req_json, dict)
+    msgs = req_json["messages"]
+    assert "[Parent Source Snapshot — Deterministic APC Prefix]" in msgs[1]["content"]
+    assert "[TRUNCATED AT LINE" in msgs[1]["content"]
+    assert "=== FILE: worker/zstep_worker/runtime_loop.py ===" in msgs[1]["content"]
+    meta = parse_proposal_metadata(out)
+    assert meta.hypothesis == "Self-hosted zstep proposal"
+    assert extract_unified_diff(out).startswith(b"diff --git ")

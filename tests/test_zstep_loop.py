@@ -462,3 +462,152 @@ def test_auto_campaign_rotates_from_t1_1_to_t1_2_after_two_strikes(
     assert "T1-1 Blueprint" in proposer.prompts[0]
     assert "T1-1 Blueprint" in proposer.prompts[1]
     assert "T1-2 Blueprint" in proposer.prompts[2]
+
+
+def test_loop_propagates_campaign_allowed_roots_to_openai_proposer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    import httpx
+    from evolith.zstep.proposer import OpenAICompatibleProposer
+    from evolith.zstep.workspace import ZStepWorkspace
+
+    monkeypatch.setattr("evolith.zstep.loop.run_local_gates", lambda *args: None)
+    monkeypatch.setattr("evolith.zstep.loop.run_dispatch_verification", lambda *args: None)
+
+    src = tmp_path / "source"
+    src.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=src, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=src, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=src, check=True)
+    spec_file = src / "worker/zstep_worker/spec_decode.py"
+    forbidden_file = src / "worker/zstep_worker/runtime_loop.py"
+    spec_file.parent.mkdir(parents=True)
+    spec_file.write_text("SPEC_WIDTH = 4\n", encoding="utf-8")
+    forbidden_file.write_text("FORBIDDEN_IN_T2_3 = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=src, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=src, check=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=src, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    spec_file.write_text("SPEC_WIDTH = 6\n", encoding="utf-8")
+    diff_text = subprocess.run(
+        ["git", "diff"], cwd=src, check=True, capture_output=True, text=True
+    ).stdout
+    subprocess.run(["git", "checkout", "--", "."], cwd=src, check=True)
+
+    seen_user_msg: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content.decode("utf-8"))
+        seen_user_msg.append(body["messages"][1]["content"])
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                f"```diff\n{diff_text}```\n"
+                                'EVOLITH_PROPOSAL_JSON: {"hypothesis": "Widen spec graph", '
+                                '"niche_key": "(plane=l2_scheduler,focus=spec_decode_verify_graph)", '
+                                '"patch_summary": "SPEC_WIDTH=6"}\n'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    task = ZStepRSITask(
+        project_root=tmp_path,
+        source_repo=src,
+        baseline_sha=sha,
+        campaign="t2-3",
+        propose_only=True,
+        proposer_backend="openai",
+    )
+    proposer = OpenAICompatibleProposer(task, transport=httpx.MockTransport(handler))
+    with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
+        statuses = ZStepRSILoop(
+            task,
+            workspace=ZStepWorkspace(task),
+            archive=archive,
+            proposer=proposer,
+        ).run()
+
+    assert statuses == [CandidateStatus.PROPOSED]
+    assert len(seen_user_msg) == 1
+    assert "=== FILE: worker/zstep_worker/spec_decode.py ===" in seen_user_msg[0]
+    assert "=== FILE: worker/zstep_worker/runtime_loop.py ===" not in seen_user_msg[0]
+
+
+def test_loop_feeds_latest_candidate_screen_into_next_generation_reflection_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StalledSpecRemote(FakeRemote):
+        task_cache: Path
+
+        def screen_baseline(self, baseline_hash: str, baseline_archive: Path) -> Path:
+            self.task_cache.mkdir(parents=True, exist_ok=True)
+            path = self.task_cache / f"{baseline_hash[:16]}-screen-metrics.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "tiers": [
+                            {
+                                "label": "in512_c1",
+                                "repeat": 0,
+                                "output_throughput_tok_s": 100.0,
+                                "median_ttft_ms": 100.0,
+                                "mean_tpot_ms": 10.0,
+                                "p99_itl_ms": 20.0,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return path
+
+        def screen(self, candidate_id: str, source: Path, evidence: Path) -> Path:
+            self.screen_calls += 1
+            self._parity(evidence / "screen-parity.json", 0)
+            path = evidence / "screen-metrics.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "tiers": [
+                            {
+                                "label": "in512_c1",
+                                "repeat": 0,
+                                "output_throughput_tok_s": 85.0,
+                                "median_ttft_ms": 100.0,
+                                "mean_tpot_ms": 11.7,
+                                "p99_itl_ms": 22.0,
+                                "mean_acceptance_length": 2.38,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return path
+
+    remote = StalledSpecRemote()
+    loop, archive, proposer, _ = make_loop(
+        tmp_path, monkeypatch, generations=2, remote=remote
+    )
+    remote.task_cache = loop.task.baseline_cache_dir
+    try:
+        statuses = loop.run()
+    finally:
+        archive.close()
+
+    assert statuses == [CandidateStatus.SCREEN_REJECTED, CandidateStatus.SCREEN_REJECTED]
+    assert len(proposer.prompts) == 2
+    assert "[Algorithmic-vs-Wall-Clock Divergence]" in proposer.prompts[1]
+    assert "in512_c1(tau=2.38, speedup=0.85x)" in proposer.prompts[1]
+

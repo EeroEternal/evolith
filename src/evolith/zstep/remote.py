@@ -196,12 +196,60 @@ docker run --rm --name {container_name} --gpus all --ipc=host --network=host --e
                     "bash",
                     "-lc",
                     f"docker rm -f {shlex.quote(container_name)} >/dev/null 2>&1 || true; "
-                    f"rm -rf {shlex.quote(f'/tmp/{container_name}-overlay')}",
+                    f"rm -rf {shlex.quote(f'/tmp/{container_name}-overlay')} /dev/shm/zstep* >/dev/null 2>&1 || true",
                 ],
                 timeout=30,
             )
         except Exception:
             pass
+
+    def gpu_smoke_script(self, source_dir: str, tests: tuple[str, ...]) -> str:
+        container_name = self._container_name(source_dir, "gpu-smoke")
+        overlay_dir = f"/tmp/{container_name}-overlay"
+        test_args = " ".join(shlex.quote(t) for t in tests)
+        inner_cmd = (
+            "set -euo pipefail\n"
+            "PYTHONPATH=/workspace/worker /usr/bin/python3 -m pytest -q "
+            f"{test_args}\n"
+        )
+        return f"""set -euo pipefail
+trap 'rm -rf {shlex.quote(overlay_dir)} /dev/shm/zstep* >/dev/null 2>&1 || true' EXIT
+cd {shlex.quote(source_dir)}
+./scripts/prepare_sm120_overlay.sh {shlex.quote(overlay_dir)}
+DOCKER_OVERLAY_ARGS=($(./scripts/prepare_sm120_overlay.sh --print-docker-args {shlex.quote(overlay_dir)}))
+docker run --rm --name {container_name} --gpus all --ipc=host --network=host --entrypoint bash \\
+  -v "$PWD:/workspace" -w /workspace \\
+  -e OMP_NUM_THREADS=1 -e NCCL_P2P_DISABLE=1 -e NCCL_P2P_LEVEL=LOC \\
+  "${{DOCKER_OVERLAY_ARGS[@]}}" {self.task.image} -lc {shlex.quote(inner_cmd)}
+"""
+
+    def gpu_smoke(self, candidate_id: str, source: Path) -> None:
+        """
+        Runs fast container-level SM120 Python/CUDA smoke tests in seconds before
+        committing to full 475 GiB model loading and multi-tier benchmarks.
+        """
+        if not self.task.gpu_smoke_tests:
+            return
+        self._check_gpus()
+        stage = self._remote_run(candidate_id, "smoke")
+        lock = f"{stage}/.lock"
+        self._require_success(self._ssh(["mkdir", "-p", stage]), "create smoke stage")
+        self._require_success(self._ssh(["mkdir", lock]), "acquire smoke lock")
+        container_name = self._container_name(f"{stage}/src", "gpu-smoke")
+        try:
+            source_dir = self._upload_and_extract(source, stage)
+            script = self.gpu_smoke_script(source_dir, self.task.gpu_smoke_tests)
+            try:
+                result = self._ssh(["bash", "-lc", script])
+            except BaseException:
+                self._cleanup_orphan_container(container_name)
+                raise
+            if result.returncode:
+                self._cleanup_orphan_container(container_name)
+                detail = (result.stderr + result.stdout).strip()
+                raise RuntimeError(f"Remote GPU smoke exited {result.returncode}: {detail}")
+        finally:
+            self._cleanup_remote_stage(stage, lock)
 
     def _run_benchmark(
         self,

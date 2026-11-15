@@ -134,3 +134,25 @@ def test_blocked_niches_tracks_two_strikes_and_ignores_infra_failures(
         assert len(blocked["(plane=l2_scheduler,focus=h2d_pack)"]) == 2
         # Advancing to a new accepted parent starts with a clean slate
         assert archive.blocked_niches(strike_limit=2, parent_id="g0004-accepted") == {}
+
+
+def test_summarize_failure_reason_preserves_diagnostic_over_json_and_teardown_noise(
+    tmp_path: Path,
+) -> None:
+    filler = "x" * 290
+    noisy_log = (
+        "Remote benchmark exited 1:\n"
+        f"  {filler}\n"
+        "Error: exact_token_match_rate 0.8125 < 1.0 on prime_squares_table\n"
+        f"  \"verbose_tail\": \"{filler}\"\n"
+        "  ]\n"
+        "}\n"
+        "TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5\n"
+    )
+    with ZStepArchive(tmp_path / "diag.sqlite3") as archive:
+        archive.start_candidate("g0006", 6, None, b"diff", "s6")
+        archive.finish_candidate("g0006", CandidateStatus.SCREEN_REJECTED, "ev6", noisy_log)
+        row = archive.get_candidate("g0006")
+        reason = str(row["failure_reason"])
+        assert "exact_token_match_rate 0.8125 < 1.0" in reason
+        assert "TRITON_RECOMPILATIONS=0" not in reason

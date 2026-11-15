@@ -26,6 +26,10 @@ class TierMetric(BaseModel):
     p99_itl_ms: float
     steps: int | None = None
     overlapped_decode_steps: int | None = None
+    mean_acceptance_length: float | None = None
+    prefix_cache_hit_rate: float | None = None
+    idle_kv_cache_usage: float | None = None
+    non_spec_throughput_tok_s: float | None = None
 
 
 class RedTeamFinding(BaseModel):
@@ -100,6 +104,11 @@ class ZStepRSITask(BaseModel):
     sandbox_root: Path | None = None
     campaign: str = "none"
     propose_only: bool = False
+    proposer_backend: str = "kimi"
+    proposer_api_base: str = "http://127.0.0.1:8080/v1"
+    proposer_model: str = "DeepSeek-V4.1-Flash"
+    enable_gpu_smoke: bool = False
+    gpu_smoke_tests: tuple[str, ...] = ("worker/tests/test_shm_layout_parity.py",)
     premise_strike_limit: int = Field(default=2, ge=1)
     parity_prefill_chunk: int = Field(default=24, ge=1)
     max_cross_mode_logit_drift: float = Field(default=8.0, ge=0.0)

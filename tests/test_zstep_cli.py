@@ -128,11 +128,27 @@ def test_zstep_campaigns_and_propose_only_flags(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr("evolith.zstep.loop.ZStepRSILoop", FakeLoop)
     res = runner.invoke(
         app,
-        ["zstep-evolve", "--campaign", "t1-2", "--propose-only"],
+        [
+            "zstep-evolve",
+            "--campaign",
+            "t2-3",
+            "--propose-only",
+            "--proposer",
+            "openai",
+            "--proposer-api-base",
+            "http://127.0.0.1:43537/v1",
+            "--proposer-model",
+            "Qwen3.5-35B-A3B",
+            "--gpu-smoke",
+        ],
     )
     assert res.exit_code == 0, res.stdout
-    assert captured_tasks[0].campaign == "t1-2"
+    assert captured_tasks[0].campaign == "t2-3"
     assert captured_tasks[0].propose_only is True
+    assert captured_tasks[0].proposer_backend == "openai"
+    assert captured_tasks[0].proposer_api_base == "http://127.0.0.1:43537/v1"
+    assert captured_tasks[0].proposer_model == "Qwen3.5-35B-A3B"
+    assert captured_tasks[0].enable_gpu_smoke is True
     assert "proposed" in res.stdout
 
 

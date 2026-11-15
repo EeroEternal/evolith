@@ -236,12 +236,32 @@ def zstep_evolve_cmd(
         "auto",
         "--campaign",
         "-c",
-        help="Target campaign ('auto', 'none', 't1-1', 't1-2', 't1-3', 't2-1', 't2-2').",
+        help="Target campaign ('auto', 'none', 't1-1', 't1-2', 't1-3', 't2-1', 't2-2', 't2-3').",
     ),
     propose_only: bool = typer.Option(
         False,
         "--propose-only",
         help="Run proposer + local/RedTeam/dispatch gates and freeze archives without remote SSH.",
+    ),
+    proposer: str = typer.Option(
+        "kimi",
+        "--proposer",
+        help="Proposer backend: 'kimi' (CLI agent) or 'openai' (self-hosted zstep/Nebula OpenAI endpoint).",
+    ),
+    proposer_api_base: str = typer.Option(
+        "http://127.0.0.1:8080/v1",
+        "--proposer-api-base",
+        help="OpenAI-compatible `/v1` base URL when `--proposer openai` is selected.",
+    ),
+    proposer_model: str = typer.Option(
+        "DeepSeek-V4.1-Flash",
+        "--proposer-model",
+        help="Served model ID for `--proposer openai`.",
+    ),
+    gpu_smoke: bool = typer.Option(
+        False,
+        "--gpu-smoke",
+        help="Run fast container GPU smoke tests before full 475 GiB benchmark sweeps.",
     ),
 ) -> None:
     """Run isolated zstep source evolution; no deployment or upstream commit occurs."""
@@ -258,6 +278,10 @@ def zstep_evolve_cmd(
         local_timeout_sec=local_timeout,
         campaign=campaign,
         propose_only=propose_only,
+        proposer_backend=proposer,
+        proposer_api_base=proposer_api_base,
+        proposer_model=proposer_model,
+        enable_gpu_smoke=gpu_smoke,
     )
     with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
         statuses = ZStepRSILoop(task, archive=archive).run()
@@ -291,7 +315,7 @@ def zstep_submit_cmd(
         "none",
         "--campaign",
         "-c",
-        help="Target campaign ('none', 'auto', 't1-1', 't1-2', 't1-3', 't2-1', 't2-2').",
+        help="Target campaign ('none', 'auto', 't1-1', 't1-2', 't1-3', 't2-1', 't2-2', 't2-3').",
     ),
     propose_only: bool = typer.Option(
         False,

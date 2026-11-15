@@ -127,6 +127,7 @@ def build_sm120_reflection_card(
     candidate_dir: Path,
     baseline_screen_metrics: Path | None = None,
     blocked_niches: dict[str, list[str]] | None = None,
+    candidate_screen_metrics: Path | None = None,
 ) -> str:
     """
     Extracts real SM120 / RTX 6000D hardware & per-subsystem operator profiling
@@ -204,21 +205,77 @@ def build_sm120_reflection_card(
 
     if baseline_screen_metrics is not None:
         base_screen = _safe_load_json(baseline_screen_metrics)
+        cand_screen = (
+            _safe_load_json(candidate_screen_metrics)
+            if candidate_screen_metrics is not None
+            else None
+        )
+        base_by_label: dict[str, float] = {}
         if base_screen and isinstance(base_screen.get("tiers"), list):
             tier_parts: list[str] = []
+            high_tau_stalled: list[str] = []
             for row in base_screen["tiers"]:
+                label = str(row.get("label", ""))
+                out_tps = float(row.get("output_throughput_tok_s", 0.0))
+                if label and out_tps > 0.0:
+                    base_by_label[label] = out_tps
                 overlap_str = ""
                 steps = row.get("steps")
                 overlapped = row.get("overlapped_decode_steps")
                 if isinstance(steps, int) and steps > 0 and isinstance(overlapped, int):
                     overlap_str = f", overlap={overlapped}/{steps}({overlapped / steps:.0%})"
-                tier_parts.append(
-                    f"{row.get('label')}: out={float(row.get('output_throughput_tok_s', 0.0)):.1f} tok/s, "
-                    f"TTFT={float(row.get('median_ttft_ms', 0.0)):.1f}ms, "
-                    f"TPOT={float(row.get('mean_tpot_ms', 0.0)):.2f}ms{overlap_str}"
+                tau = row.get("mean_acceptance_length")
+                tau_str = f", tau={float(tau):.2f}" if isinstance(tau, (int, float)) else ""
+                apc_hit = row.get("prefix_cache_hit_rate")
+                apc_str = (
+                    f", apc_hit={float(apc_hit):.1%}"
+                    if isinstance(apc_hit, (int, float))
+                    else ""
                 )
+                tpot_ms = float(row.get("mean_tpot_ms", 0.0))
+                tier_parts.append(
+                    f"{label}: out={out_tps:.1f} tok/s, "
+                    f"TTFT={float(row.get('median_ttft_ms', 0.0)):.1f}ms, "
+                    f"TPOT={tpot_ms:.2f}ms{overlap_str}{tau_str}{apc_str}"
+                )
+                ref_tps = row.get("non_spec_throughput_tok_s")
+                if (
+                    isinstance(tau, (int, float))
+                    and float(tau) >= 2.2
+                    and isinstance(ref_tps, (int, float))
+                    and float(ref_tps) > 0.0
+                ):
+                    speedup = out_tps / float(ref_tps)
+                    if speedup < 1.05:
+                        high_tau_stalled.append(
+                            f"{label}(tau={float(tau):.2f}, speedup={speedup:.2f}x)"
+                        )
+            if cand_screen and isinstance(cand_screen.get("tiers"), list):
+                for crow in cand_screen["tiers"]:
+                    clabel = str(crow.get("label", ""))
+                    ctau = crow.get("mean_acceptance_length")
+                    ctps = float(crow.get("output_throughput_tok_s", 0.0))
+                    ref = crow.get("non_spec_throughput_tok_s") or base_by_label.get(clabel)
+                    if (
+                        isinstance(ctau, (int, float))
+                        and float(ctau) >= 2.2
+                        and isinstance(ref, (int, float))
+                        and float(ref) > 0.0
+                    ):
+                        speedup = ctps / float(ref)
+                        if speedup < 1.05:
+                            high_tau_stalled.append(
+                                f"{clabel}(tau={float(ctau):.2f}, speedup={speedup:.2f}x)"
+                            )
             if tier_parts:
                 lines.append("  - Current Baseline Screen Telemetry: " + " | ".join(tier_parts))
+            if high_tau_stalled:
+                lines.append(
+                    "  - [Algorithmic-vs-Wall-Clock Divergence]: "
+                    + ", ".join(high_tau_stalled)
+                    + " shows high draft acceptance (tau>=2.2) while wall-clock speedup <1.05x -> "
+                    "eliminate Python `.item()`/`.cpu()` syncs & `dist.broadcast`, and capture segmented draft/verify CUDAGraphs instead of tuning K."
+                )
 
     if blocked_niches:
         lines.append(
@@ -241,8 +298,10 @@ def build_sm120_reflection_card(
             "of the 3-token Engram window; keeping decode token/Engram state device-resident "
             "with explicit cross-stream event synchronization is a major L2 lever.",
             "    3. Target real hot paths (>3% impact): device-resident decode + Engram window, "
-            "SM120 shape-bucket/AllReduce dispatch thresholds (note NCCL beats SHM at small token "
-            "counts while SHM beats NCCL at large prefill), or adaptive chunked-prefill token budgets.",
+            "segmented speculative draft/verify CUDAGraphs (`dspark`/`mtp`), "
+            "SM120 shape-bucket/AllReduce dispatch thresholds (note `shm_v5` beats `NCCL_LOC` by 1.19x-3.93x "
+            "across M=1..128 decode while `NCCL_LOC` beats `shm_v5` at M>256 large prefill), "
+            "or adaptive chunked-prefill token budgets.",
         ]
     )
     return "\n".join(lines)

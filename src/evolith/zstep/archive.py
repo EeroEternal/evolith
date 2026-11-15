@@ -22,10 +22,50 @@ _EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+_NOISE_TAIL_TOKENS: tuple[str, ...] = (
+    "{",
+    "}",
+    "[",
+    "]",
+    "},",
+    "],",
+)
+_ROOT_CAUSE_KEYWORDS: tuple[str, ...] = (
+    "runtimeerror:",
+    "typeerror:",
+    "valueerror:",
+    "assertionerror",
+    "indexerror:",
+    "keyerror:",
+    "attributeerror:",
+    "cuda error",
+    "panicked at",
+    "error[e",
+    "error:",
+    "exact_token_match_rate",
+    "violated cross-mode invariance",
+    "logit drift",
+    "mismatch",
+    "regressed",
+    "leak",
+    "failed",
+)
+
+
+def _is_noise_tail_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped in _NOISE_TAIL_TOKENS:
+        return True
+    if stripped.startswith("TRITON_RECOMPILATIONS=0"):
+        return True
+    return False
+
+
 def _summarize_failure_reason(raw: str, max_chars: int = 360) -> str:
     """
     Distills multi-kilobyte remote compiler/progress logs into a concise single-line
-    root cause preserving the exception/tail lines (full log stays in `failure.json`).
+    root cause preserving diagnostic exception/assertion lines instead of trailing
+    JSON braces or `TRITON_RECOMPILATIONS=0` teardown banners (full log stays in `failure.json`).
     """
     text = raw.strip()
     if not text:
@@ -33,14 +73,37 @@ def _summarize_failure_reason(raw: str, max_chars: int = 360) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if len(lines) <= 2 and len(text) <= max_chars:
         return " | ".join(lines)
-    head = lines[0].split(":", 1)[0].strip() if lines[0].startswith("Remote benchmark") else lines[0][:100]
-    tail_candidates: list[str] = []
-    for line in reversed(lines[1:]):
-        if line not in tail_candidates:
-            tail_candidates.append(line)
-        if len(tail_candidates) >= 3:
+    head = (
+        lines[0].split(":", 1)[0].strip()
+        if lines[0].startswith("Remote benchmark")
+        else lines[0][:100]
+    )
+    body = lines[1:]
+    diagnostic_hits: list[str] = []
+    for line in reversed(body):
+        if _is_noise_tail_line(line):
+            continue
+        lower = line.lower()
+        if any(kw in lower for kw in _ROOT_CAUSE_KEYWORDS) and line not in diagnostic_hits:
+            diagnostic_hits.append(line)
+        if len(diagnostic_hits) >= 2:
             break
-    tail = " ; ".join(reversed(tail_candidates))
+
+    if diagnostic_hits:
+        tail = " ; ".join(reversed(diagnostic_hits))
+    else:
+        fallback_candidates: list[str] = []
+        for line in reversed(body):
+            if _is_noise_tail_line(line):
+                continue
+            if line not in fallback_candidates:
+                fallback_candidates.append(line)
+            if len(fallback_candidates) >= 3:
+                break
+        if fallback_candidates:
+            tail = " ; ".join(reversed(fallback_candidates))
+        else:
+            tail = " ; ".join(body[-2:])
     combined = f"{head}: {tail}" if tail and tail != head else head
     return combined[:max_chars]
 

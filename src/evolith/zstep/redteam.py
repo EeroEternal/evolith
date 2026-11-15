@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -92,6 +93,65 @@ _RUST_UNCHECKED_RE = re.compile(
 _SPOOF_RECOMP_RE = re.compile(
     r"triton_recompilations\s*[:=]\s*(?:Some\(\s*0\s*\)|0\b)"
 )
+_DISABLE_GRAPH_SABOTAGE_RE = re.compile(
+    r"\b(?:use_cuda_graph\s*=\s*False|disable_cuda_graph\s*=\s*True|max_graph_bucket\s*=\s*0)\b"
+)
+_TORCH_WHERE_SCALAR_OUT_RE = re.compile(
+    r"\bwhere\s*\([^;\n,]+,\s*(?:-?\d+(?:\.\d+)?\s*,\s*[^,\n]+|[^,\n]+,\s*-?\d+(?:\.\d+)?)\s*,\s*out\s*="
+)
+_INT32_INDEX_TENSORS_RE = re.compile(
+    r"\.(?:index_copy_|index_select)\s*\(\s*\d+\s*,\s*"
+    r"(?:self\.)?(?:comp_bt_gpu|out_tokens_gpu|slot_ids_gpu|input_ids_gpu)\b"
+    r"(?:\s*\[[^\]]*\])*"
+    r"(?!\s*\[|\s*\.\s*(?:to\s*\(\s*(?:dtype\s*=\s*)?torch\.(?:int64|long)|long\s*\(\s*\)))"
+)
+_HOTPATH_FN_PREFIXES: tuple[str, ...] = (
+    "execute",
+    "_execute_step",
+    "launch",
+    "finish",
+    "step",
+    "run_step",
+    "forward_step",
+    "_forward",
+    "_sample",
+    "_speculative",
+    "_run_decode",
+    "_run_draft",
+    "_run_verify",
+    "draft",
+    "_draft",
+    "verify",
+    "_verify",
+)
+_HOST_BUFFER_SUFFIXES: tuple[str, ...] = ("_cpu", "_np", "_host")
+_HOTPATH_SYNC_ATTRS: frozenset[str] = frozenset({"item", "cpu", "tolist"})
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _parse_added_line_numbers_by_file(patch_bytes: bytes) -> dict[str, set[int]]:
+    patch_text = patch_bytes.decode("utf-8", errors="replace")
+    added_lines: dict[str, set[int]] = {}
+    current_file: str | None = None
+    new_lineno: int | None = None
+    for raw_line in patch_text.splitlines():
+        if raw_line.startswith("+++ b/"):
+            current_file = raw_line[6:].strip()
+            added_lines.setdefault(current_file, set())
+            new_lineno = None
+        elif raw_line.startswith("+++ "):
+            current_file = None
+            new_lineno = None
+        elif raw_line.startswith("@@ "):
+            match = _HUNK_HEADER_RE.match(raw_line)
+            new_lineno = int(match.group(1)) if match else None
+        elif current_file is not None and new_lineno is not None:
+            if raw_line.startswith("+") and not raw_line.startswith("+++"):
+                added_lines[current_file].add(new_lineno)
+                new_lineno += 1
+            elif raw_line.startswith(" "):
+                new_lineno += 1
+    return added_lines
 
 
 def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
@@ -124,6 +184,20 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
                 )
             )
 
+        # Anti-cheat: degrading default CUDA Graph path to inflate relative speculative gains
+        if (
+            file_path.startswith("worker/zstep_worker/models/")
+            or "runtime_loop.py" in file_path
+        ) and _DISABLE_GRAPH_SABOTAGE_RE.search(joined):
+            findings.append(
+                RedTeamFinding(
+                    category="anti_cheat",
+                    severity="blocking",
+                    file_path=file_path,
+                    message="Patch disables CUDA Graphs (`use_cuda_graph=False` / `max_graph_bucket=0`) on model runner path (baseline-sabotage hazard)",
+                )
+            )
+
         # Category 1: indices_offsets (unchecked Rust indexing in scheduler/server)
         if file_path.endswith(".rs") and _RUST_UNCHECKED_RE.search(joined):
             findings.append(
@@ -132,6 +206,28 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
                     severity="blocking",
                     file_path=file_path,
                     message="Unchecked Rust indexing/slice construction (`get_unchecked` / `from_raw_parts`) in scheduler/server risks silent KV/slot memory corruption",
+                )
+            )
+
+        # Category 1b: indices_offsets (PyTorch int32 index tensor passed to index_copy_/index_select, g0004)
+        if file_path.endswith(".py") and _INT32_INDEX_TENSORS_RE.search(joined):
+            findings.append(
+                RedTeamFinding(
+                    category="indices_offsets",
+                    severity="blocking",
+                    file_path=file_path,
+                    message="`index_copy_`/`index_select` called with `int32` device buffer without `.to(torch.int64)` / `.long()` cast (raises CUDA RuntimeError)",
+                )
+            )
+
+        # Category 2: value_ranges (PyTorch torch.where(..., out=...) scalar overload crash, g0005)
+        if file_path.endswith(".py") and _TORCH_WHERE_SCALAR_OUT_RE.search(joined):
+            findings.append(
+                RedTeamFinding(
+                    category="value_ranges",
+                    severity="blocking",
+                    file_path=file_path,
+                    message="`torch.where(..., out=...)` called with Python numeric scalar operand; `out=` overload requires Tensor operands on CUDA",
                 )
             )
 
@@ -197,6 +293,21 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
                 )
             )
 
+        # Category 7b: initial_values (zero-init SHM recurrent slot sentinel collision)
+        if (
+            ("compressor_slot_ids" in joined or "restore_slot" in joined)
+            and ">= 0" in joined
+            and "num_recurrent_checkpoints" not in all_added_blob
+        ):
+            findings.append(
+                RedTeamFinding(
+                    category="initial_values",
+                    severity="warning",
+                    file_path=file_path,
+                    message="Zero-initialized SHM `compressor_slot_ids`/`restore_slot >= 0` checked without `num_recurrent_checkpoints > 0` guard",
+                )
+            )
+
     return findings
 
 
@@ -241,6 +352,136 @@ def _check_tp8_device_token_agreement(
     return []
 
 
+def _is_hotpath_function_name(name: str) -> bool:
+    return any(
+        name == prefix or name.startswith(f"{prefix}_")
+        for prefix in _HOTPATH_FN_PREFIXES
+    )
+
+
+def _is_host_buffer_expr(expr: ast.AST) -> bool:
+    cur = expr
+    while isinstance(cur, ast.Subscript):
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        return cur.id.endswith(_HOST_BUFFER_SUFFIXES)
+    if isinstance(cur, ast.Attribute):
+        return cur.attr.endswith(_HOST_BUFFER_SUFFIXES)
+    return False
+
+
+def _check_hotpath_ast_sync_and_collectives(
+    candidate_dir: Path, patch_stats: PatchStats
+) -> list[RedTeamFinding]:
+    """
+    AST-scans newly added lines inside step/draft/verify hot-path methods to block:
+      1. Host synchronization calls (`.item()`, `.cpu()`, `.tolist()`) on GPU tensors
+         that break CUDAGraph capture and stall GPU execution;
+      2. PCIe `dist.broadcast` / `torch.distributed.broadcast` regressions in steady-state step paths;
+      3. `torch.where(..., out=...)` multi-line calls with Python numeric literal operands.
+    """
+    findings: list[RedTeamFinding] = []
+    added_lines_map = _parse_added_line_numbers_by_file(patch_stats.patch)
+    for rel_path, added_linenos in sorted(added_lines_map.items()):
+        if not added_linenos or not rel_path.endswith(".py"):
+            continue
+        if not (
+            rel_path.startswith("worker/zstep_worker/models/")
+            or rel_path.startswith("worker/zstep_worker/kernels_sm120/")
+            or rel_path
+            in {
+                "worker/zstep_worker/spec_decode.py",
+                "worker/zstep_worker/runtime_loop.py",
+            }
+        ):
+            continue
+        full_path = candidate_dir / rel_path
+        if not full_path.is_file():
+            continue
+        try:
+            tree = ast.parse(full_path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+
+        # Multi-line torch.where(..., out=...) check across the file's added lines
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or getattr(node, "lineno", 0) not in added_linenos:
+                continue
+            func = node.func
+            is_where = (isinstance(func, ast.Attribute) and func.attr == "where") or (
+                isinstance(func, ast.Name) and func.id == "where"
+            )
+            if is_where and any(kw.arg == "out" for kw in node.keywords) and len(node.args) >= 3:
+                for operand in node.args[1:3]:
+                    is_num = isinstance(operand, ast.Constant) and isinstance(
+                        operand.value, (int, float)
+                    )
+                    is_neg_num = (
+                        isinstance(operand, ast.UnaryOp)
+                        and isinstance(operand.op, (ast.USub, ast.UAdd))
+                        and isinstance(operand.operand, ast.Constant)
+                        and isinstance(operand.operand.value, (int, float))
+                    )
+                    if is_num or is_neg_num:
+                        if not any(
+                            f.category == "value_ranges" and f.file_path == rel_path
+                            for f in findings
+                        ):
+                            findings.append(
+                                RedTeamFinding(
+                                    category="value_ranges",
+                                    severity="blocking",
+                                    file_path=rel_path,
+                                    message=f"Line {node.lineno}: `where(..., out=...)` called with numeric literal; `out=` overload requires Tensor operands",
+                                )
+                            )
+
+        # Hot-path function body check for .item()/.cpu()/.tolist() and dist.broadcast
+        for fn_node in ast.walk(tree):
+            if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not _is_hotpath_function_name(fn_node.name):
+                continue
+            for sub in ast.walk(fn_node):
+                lineno = getattr(sub, "lineno", 0)
+                if lineno not in added_linenos or not isinstance(sub, ast.Call):
+                    continue
+                func = sub.func
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr in _HOTPATH_SYNC_ATTRS
+                    and not _is_host_buffer_expr(func.value)
+                ):
+                    findings.append(
+                        RedTeamFinding(
+                            category="execution_context",
+                            severity="blocking",
+                            file_path=rel_path,
+                            message=(
+                                f"Line {lineno} in `{fn_node.name}`: host sync `.{func.attr}()` "
+                                "introduced on GPU step/draft/verify hot path (breaks CUDAGraph & stalls TP8)"
+                            ),
+                        )
+                    )
+                elif isinstance(func, ast.Attribute) and func.attr == "broadcast":
+                    owner_name = getattr(func.value, "id", "") or getattr(
+                        func.value, "attr", ""
+                    )
+                    if owner_name in {"dist", "distributed"}:
+                        findings.append(
+                            RedTeamFinding(
+                                category="execution_context",
+                                severity="blocking",
+                                file_path=rel_path,
+                                message=(
+                                    f"Line {lineno} in `{fn_node.name}`: `dist.broadcast` introduced "
+                                    "on non-P2P step hot path; use SHM all-rank reduction instead"
+                                ),
+                            )
+                        )
+    return findings
+
+
 def run_redteam_gate(
     candidate_dir: Path,
     patch_stats: PatchStats,
@@ -268,6 +509,7 @@ def run_redteam_gate(
 
     findings.extend(scan_patch_boundaries(patch_stats))
     findings.extend(_check_tp8_device_token_agreement(candidate_dir, patch_stats))
+    findings.extend(_check_hotpath_ast_sync_and_collectives(candidate_dir, patch_stats))
     blocking = [f for f in findings if f.severity == "blocking"]
     report = RedTeamReport(
         passed=not blocking,

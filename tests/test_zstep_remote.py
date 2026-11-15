@@ -316,3 +316,30 @@ def test_screen_baseline_recomputes_when_cached_file_lacks_new_c32_tier(
     runner.screen_baseline("a" * 64, base_tar)
     assert docker_runs == 1
     assert {r["label"] for r in json.loads(out.read_text())["tiers"]} == {"in512_c1", "in512_c32"}
+
+
+def test_gpu_smoke_runs_fast_pytest_and_cleans_shm_on_failure(tmp_path: Path) -> None:
+    task = make_task(tmp_path, enable_gpu_smoke=True)
+    cand_tar = tmp_path / "cand.tar.gz"
+    cand_tar.write_bytes(b"tar")
+
+    calls: list[str] = []
+
+    def failing_smoke(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        joined = " ".join(args)
+        calls.append(joined)
+        if "nvidia-smi" in joined:
+            return subprocess.CompletedProcess(
+                args, 0, "\n".join(f"{i}, 0 MiB" for i in range(8)) + "\n", ""
+            )
+        if "pytest -q" in joined:
+            return subprocess.CompletedProcess(
+                args, 1, "", "TypeError: where(): scalar out= unsupported"
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    runner = ZStepRemoteRunner(task, executor=failing_smoke)
+    with pytest.raises(RuntimeError, match="Remote GPU smoke exited 1"):
+        runner.gpu_smoke("g0007-smoke", cand_tar)
+
+    assert any("/dev/shm/zstep*" in c for c in calls)

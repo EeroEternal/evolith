@@ -358,3 +358,35 @@ def test_parity_exposure_invariance_and_cross_mode_logit_drift_guards(
     )
     d_healthy = evaluate_candidate(base, cand, healthy, task)  # type: ignore[arg-type]
     assert d_healthy.accepted
+
+    # 4. Post-run idle KV cache leak fails both screen and verify gates
+    leaky_screen = tmp_path / "screen-leak.json"
+    leaky_screen.write_text(
+        json.dumps(
+            {
+                "tiers": [
+                    {
+                        "label": "in512_c1",
+                        "repeat": 0,
+                        "output_throughput_tok_s": 120.0,
+                        "median_ttft_ms": 140.0,
+                        "mean_tpot_ms": 8.2,
+                        "p99_itl_ms": 8.8,
+                        "idle_kv_cache_usage": 0.0125,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    s_leak = evaluate_screen(leaky_screen, None, task)
+    assert not s_leak.passed
+    assert any("leaked idle KV cache" in r for r in s_leak.reasons)
+
+    cand_leaky = {
+        label: [row.model_copy(update={"idle_kv_cache_usage": 0.02}) for row in rows]
+        for label, rows in cand.items()
+    }
+    v_leak = evaluate_candidate(base, cand_leaky, healthy, task)  # type: ignore[arg-type]
+    assert not v_leak.accepted
+    assert any("leaked idle KV cache" in r for r in v_leak.reasons)

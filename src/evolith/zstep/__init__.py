@@ -6,6 +6,12 @@ from evolith.zstep.dispatch_verifier import (
     run_dispatch_verification,
 )
 from evolith.zstep.loop import ZStepRSILoop
+from evolith.zstep.proposer import (
+    KimiCodeProposer,
+    OpenAICompatibleProposer,
+    PatchProposer,
+    build_proposer,
+)
 from evolith.zstep.redteam import PremiseStrikeError, RedTeamRejectedError
 from evolith.zstep.task import (
     CandidateStatus,
@@ -24,6 +30,9 @@ __all__ = [
     "CandidateStatus",
     "DispatchVerificationError",
     "DispatchVerificationReport",
+    "KimiCodeProposer",
+    "OpenAICompatibleProposer",
+    "PatchProposer",
     "PatchStats",
     "PremiseStrikeError",
     "ProposalMetadata",
@@ -36,6 +45,7 @@ __all__ = [
     "ZStepArchive",
     "ZStepRSILoop",
     "ZStepRSITask",
+    "build_proposer",
     "list_campaigns",
     "resolve_campaign",
     "run_dispatch_verification",

@@ -20,7 +20,7 @@ from evolith.zstep.gates import (
     run_local_gates,
 )
 from evolith.zstep.profiling import build_sm120_reflection_card
-from evolith.zstep.proposer import KimiCodeProposer, parse_proposal_metadata
+from evolith.zstep.proposer import build_proposer, parse_proposal_metadata
 from evolith.zstep.redteam import (
     PremiseStrikeError,
     compute_spec_pins,
@@ -48,7 +48,7 @@ class ZStepRSILoop:
         self.task = task
         self.workspace = workspace or ZStepWorkspace(task)
         self.archive = archive or ZStepArchive(task.state_dir / "archive.sqlite3")
-        self.proposer = proposer or KimiCodeProposer(task)
+        self.proposer = proposer or build_proposer(task)
         self.remote = remote or ZStepRemoteRunner(task)
 
     def _find_cached_baseline_screen(self, baseline_hash: str | None = None) -> Path | None:
@@ -60,6 +60,24 @@ class ZStepRSILoop:
             candidates = sorted(self.task.baseline_cache_dir.glob("*-screen-metrics.json"))
             if candidates:
                 return candidates[-1]
+        return None
+
+    def _find_latest_candidate_screen(self, parent_id: str | None) -> Path | None:
+        for row in reversed(self.archive.list_candidates()):
+            if (row.get("parent_id") or None) != parent_id:
+                continue
+            evidence_raw = str(row.get("evidence_dir") or "").strip()
+            cid = str(row.get("candidate_id") or "").strip()
+            evidence_dir = (
+                Path(evidence_raw)
+                if evidence_raw
+                else (self.task.state_dir / "evidence" / cid if cid else None)
+            )
+            if evidence_dir is None:
+                continue
+            screen_file = evidence_dir / "screen-metrics.json"
+            if screen_file.is_file():
+                return screen_file
         return None
 
     def _prompt(
@@ -78,6 +96,7 @@ class ZStepRSILoop:
             candidate_dir,
             self._find_cached_baseline_screen(baseline_hash),
             blocked_niches=blocked_niches,
+            candidate_screen_metrics=self._find_latest_candidate_screen(parent_id),
         )
         campaign_section = (
             f"\n{active_campaign.blueprint}\n" if active_campaign is not None else ""
@@ -126,30 +145,38 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         active_task: ZStepRSITask | None = None,
     ) -> tuple[str, PatchStats]:
         task_override = active_task or self.task
-        if (
-            hasattr(self.workspace, "isolated_proposer_sandbox")
-            and hasattr(self.workspace, "capture_patch_stats")
-            and hasattr(self.workspace, "apply_patch")
-        ):
-            prev_ws_task = getattr(self.workspace, "task", None)
-            if prev_ws_task is not None:
-                self.workspace.task = task_override
-            try:
-                with self.workspace.isolated_proposer_sandbox(candidate_dir) as sandbox_dir:
-                    proposer_out = self.proposer.propose(sandbox_dir, prompt, evidence_dir)
-                    patch_stats = self.workspace.capture_patch_stats(sandbox_dir)
-                self.workspace.apply_patch(candidate_dir, patch_stats.patch)
-                return proposer_out, patch_stats
-            finally:
+        has_prop_task = hasattr(self.proposer, "task")
+        prev_prop_task = getattr(self.proposer, "task", None) if has_prop_task else None
+        if has_prop_task:
+            self.proposer.task = task_override
+        try:
+            if (
+                hasattr(self.workspace, "isolated_proposer_sandbox")
+                and hasattr(self.workspace, "capture_patch_stats")
+                and hasattr(self.workspace, "apply_patch")
+            ):
+                prev_ws_task = getattr(self.workspace, "task", None)
                 if prev_ws_task is not None:
-                    self.workspace.task = prev_ws_task
+                    self.workspace.task = task_override
+                try:
+                    with self.workspace.isolated_proposer_sandbox(candidate_dir) as sandbox_dir:
+                        proposer_out = self.proposer.propose(sandbox_dir, prompt, evidence_dir)
+                        patch_stats = self.workspace.capture_patch_stats(sandbox_dir)
+                    self.workspace.apply_patch(candidate_dir, patch_stats.patch)
+                    return proposer_out, patch_stats
+                finally:
+                    if prev_ws_task is not None:
+                        self.workspace.task = prev_ws_task
 
-        proposer_out = self.proposer.propose(candidate_dir, prompt, evidence_dir)
-        raw_patch = self.workspace.capture_patch(candidate_dir)
-        return proposer_out, PatchStats(
-            patch=raw_patch,
-            changed_lines=len(raw_patch.splitlines()),
-        )
+            proposer_out = self.proposer.propose(candidate_dir, prompt, evidence_dir)
+            raw_patch = self.workspace.capture_patch(candidate_dir)
+            return proposer_out, PatchStats(
+                patch=raw_patch,
+                changed_lines=len(raw_patch.splitlines()),
+            )
+        finally:
+            if has_prop_task:
+                self.proposer.task = prev_prop_task
 
     def _run_screen_and_gate(
         self,
@@ -157,6 +184,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         baseline_screen: Path | None,
         candidate_archive: Path,
         evidence_dir: Path,
+        active_task: ZStepRSITask | None = None,
     ) -> None:
         screen_metrics = self.remote.screen(candidate_id, candidate_archive, evidence_dir)
         screen_parity = evidence_dir / "screen-parity.json"
@@ -173,7 +201,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
             screen_decision = evaluate_screen(
                 screen_metrics,
                 screen_parity if has_parity else None,
-                self.task,
+                active_task or self.task,
                 baseline_screen,
             )
             (evidence_dir / "screen-decision.json").write_text(
@@ -343,6 +371,9 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     continue
                 stage = "preflight"
                 self.remote.preflight()
+                if active_task.enable_gpu_smoke and hasattr(self.remote, "gpu_smoke"):
+                    stage = "screen"
+                    self.remote.gpu_smoke(candidate_id, candidate_archive)
                 baseline_screen: Path | None = None
                 if hasattr(self.remote, "screen_baseline"):
                     stage = "baseline_screen"
@@ -356,6 +387,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     baseline_screen,
                     candidate_archive,
                     evidence_dir,
+                    active_task=active_task,
                 )
                 stage = "verify"
                 self.archive.update_stage(candidate_id, "verify")
@@ -442,6 +474,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     baseline_screen,
                     candidate_archive,
                     evidence_dir,
+                    active_task=active_task,
                 )
             else:
                 parity_path = evidence_dir / "screen-parity.json"

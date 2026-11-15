@@ -152,3 +152,64 @@ def test_reflection_card_extracts_full_subsystem_microbenches_overlap_and_frozen
     assert "T6:shm=5.23ms vs nccl=4.20ms" in card
     assert "overlap=450/500(90%)" in card
     assert "BLOCKED `(plane=l2_scheduler,focus=decode_h2d_pack)`" in card
+    assert "`shm_v5` beats `NCCL_LOC`" in card
+
+
+def test_reflection_card_diagnoses_high_tau_wallclock_divergence(
+    tmp_path: Path,
+) -> None:
+    base_path = tmp_path / "base.json"
+    base_path.write_text(
+        json.dumps(
+            {
+                "tiers": [
+                    {
+                        "label": "in512_c1",
+                        "output_throughput_tok_s": 118.6,
+                        "median_ttft_ms": 168.0,
+                        "mean_tpot_ms": 8.43,
+                    },
+                    {
+                        "label": "in512_c32",
+                        "output_throughput_tok_s": 840.0,
+                        "median_ttft_ms": 380.0,
+                        "mean_tpot_ms": 33.3,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cand_stalled = tmp_path / "spec-stalled.json"
+    cand_stalled.write_text(
+        json.dumps(
+            {
+                "tiers": [
+                    {
+                        "label": "in512_c1",
+                        "output_throughput_tok_s": 119.1,
+                        "median_ttft_ms": 170.0,
+                        "mean_tpot_ms": 8.40,
+                        "mean_acceptance_length": 3.53,
+                        "prefix_cache_hit_rate": 0.493,
+                    },
+                    {
+                        "label": "in512_c32",
+                        "output_throughput_tok_s": 960.0,
+                        "median_ttft_ms": 380.0,
+                        "mean_tpot_ms": 29.0,
+                        "mean_acceptance_length": 2.40,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    card = build_sm120_reflection_card(
+        tmp_path, base_path, candidate_screen_metrics=cand_stalled
+    )
+    assert "[Algorithmic-vs-Wall-Clock Divergence]" in card
+    assert "in512_c1(tau=3.53, speedup=1.00x)" in card
+    # c32 achieved 1.14x >= 1.05x and is NOT falsely flagged despite TPOT=29.0ms > 8ms
+    assert "in512_c32(tau=2.40" not in card
+    assert "segmented draft/verify CUDAGraphs" in card

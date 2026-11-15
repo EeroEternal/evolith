@@ -207,6 +207,14 @@ def evaluate_screen(
         reasons.append("screen benchmark produced no tier metrics")
         return ScreenDecision(passed=False, reasons=reasons)
 
+    for label, rows in sorted(candidate.items()):
+        for row in rows:
+            if row.idle_kv_cache_usage is not None and row.idle_kv_cache_usage > 0.0:
+                reasons.append(
+                    f"screen {label} leaked idle KV cache ({row.idle_kv_cache_usage:.4f} > 0.0)"
+                )
+                break
+
     gains: list[float] = []
     delta_parts: list[str] = []
     if baseline_metrics_path is not None and baseline_metrics_path.is_file():
@@ -267,6 +275,13 @@ def evaluate_candidate(
         reasons.append(f"candidate missing tier {label}")
     for label in sorted(set(candidate) - set(baseline)):
         reasons.append(f"baseline missing tier {label}")
+    for label, rows in sorted(candidate.items()):
+        for row in rows:
+            if row.idle_kv_cache_usage is not None and row.idle_kv_cache_usage > 0.0:
+                reasons.append(
+                    f"{label} leaked idle KV cache ({row.idle_kv_cache_usage:.4f} > 0.0)"
+                )
+                break
 
     gains: list[float] = []
     tier_deltas: list[str] = []

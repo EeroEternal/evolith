@@ -166,6 +166,39 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
             "(strict `0 Triton recompilations` gate)."
         ),
     ),
+    CampaignSpec(
+        campaign_id="t2-3-spec-decode-graph",
+        aliases=("t2-3", "spec-decode"),
+        priority_rank="T2-3",
+        title="Segmented Speculative Draft/Verify CUDAGraph & Lease-Safe Rollback",
+        plane=EvolutionPlane.L2_SCHEDULER,
+        expected_gain="1.8x ~ 3.3x single-stream & low-concurrency serving throughput",
+        primary_niche_key="(plane=l2_scheduler,focus=spec_decode_verify_graph)",
+        allowed_roots=(
+            "worker/zstep_worker/spec_decode.py",
+            "worker/zstep_worker/models/deepseek_v41.py",
+            "worker/zstep_worker/models/deepseek_v41_dspark.py",
+            "worker/zstep_worker/models/qwen35_moe.py",
+            "worker/zstep_worker/models/qwen35_mtp.py",
+            "crates/zs-scheduler/src",
+            "worker/tests",
+        ),
+        complexity_free_lines=160,
+        max_changed_lines=300,
+        blueprint=(
+            "[Active Campaign T2-3 Blueprint — Segmented Speculative Draft/Verify CUDAGraph]\n"
+            "  - Invariants Distilled from Live 8x RTX 6000D DSpark/MTP Verification:\n"
+            "    1. Zero Host Sync & Zero NCCL: never call `.item()`/`.cpu()` or `dist.broadcast` "
+            "inside draft/verify loops; capture segmented `verify_graphs` across `spec_verify_width` "
+            "and keep `--speculative-method none` (`M=1` graph) 100% unregressed.\n"
+            "    2. Recurrent State Rollback (`qwen35_moe.py` / `qwen35_mtp.py`): on partial draft "
+            "rejection, rewind 30-layer GDN `(conv_state, ssm_state_vk)` to the step-start snapshot "
+            "and guard SHM `compressor_slot_ids` behind `num_recurrent_checkpoints > 0`.\n"
+            "    3. Prefix Lease Page Accounting (`serving.rs`): after `promote_completed_prefixes_in_batch`, "
+            "enforce `seq.page_ids.len() == prefix_lease.pages() + seq.kv_leases.len()` on cross-page "
+            "rejection rewind so online `idle_kv_cache_usage == 0.0` always holds."
+        ),
+    ),
 )
 
 _CAMPAIGN_LOOKUP: dict[str, CampaignSpec] = {}

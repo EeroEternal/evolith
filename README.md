@@ -74,6 +74,8 @@ The `zstep-evolve` command runs source-level RSI against an isolated clone of `z
 
 ```bash
 uv run evolith zstep-evolve --source ~/github/zstep --generations 1
+# Self-Referential Ignition: host proposer on a live zstep/Nebula OpenAI endpoint (APC + DSpark/MTP)
+uv run evolith zstep-evolve --proposer openai --proposer-api-base http://127.0.0.1:8080/v1 --proposer-model DeepSeek-V4.1-Flash
 uv run evolith zstep-status
 uv run evolith zstep-resume <candidate-id>
 uv run evolith zstep-evidence <candidate-id>
@@ -114,4 +116,5 @@ evolith/
 
 ## Documentation
 
-See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the full architectural blueprint, mathematical formulations, anti-reward-hacking specification, and roadmap.
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — Full architectural blueprint, mathematical formulations, anti-reward-hacking specification, and roadmap.
+- **[docs/zstep-session-lessons.md](./docs/zstep-session-lessons.md)** — Empirical engineering lessons from full-stack `zstep` + `Nebula` optimization (APC, DSpark/MTP/Ngram speculative decoding, `g0001–g0006` failure analysis, and Self-Referential Ignition).

@@ -163,3 +163,113 @@ def test_redteam_blocks_tp8_device_tokens_when_shm_allreduce_only_writes_rank0(
     )
     report = run_redteam_gate(cand_dir, stats, task, tmp_path / "ev-tp8-good")
     assert report.passed is True
+
+
+def test_redteam_blocks_pytorch_dtype_overload_traps_and_graph_sabotage() -> None:
+    # g0004: int32 index buffer (including sliced arena) passed to index_copy_ without int64 cast
+    bad_idx = _diff_for(
+        "worker/zstep_worker/models/deepseek_v41.py",
+        ["self.last_token_gpu.index_copy_(0, self.comp_bt_gpu[:n], sampled)"],
+    )
+    assert any(
+        f.category == "indices_offsets" and f.severity == "blocking"
+        for f in scan_patch_boundaries(bad_idx)
+    )
+    good_idx = _diff_for(
+        "worker/zstep_worker/models/deepseek_v41.py",
+        [
+            "self.last_token_gpu.index_copy_(0, self.comp_bt_gpu[:n].to(torch.int64), sampled)",
+            "rows = table.index_select(0, self.slot_ids_gpu[:bs].long())",
+        ],
+    )
+    assert not any(
+        f.category == "indices_offsets" and f.severity == "blocking"
+        for f in scan_patch_boundaries(good_idx)
+    )
+
+    # g0005: torch.where(..., out=...) with Python numeric scalar in either position 2 or 3
+    for where_line in (
+        "torch.where(mask, next_tok, 0, out=self.staging_gpu)",
+        "torch.where(mask, 0, next_tok, out=self.staging_gpu)",
+    ):
+        bad_where = _diff_for(
+            "worker/zstep_worker/models/deepseek_v41.py",
+            [where_line],
+        )
+        assert any(
+            f.category == "value_ranges" and f.severity == "blocking"
+            for f in scan_patch_boundaries(bad_where)
+        )
+
+    # Baseline-sabotage reward hack: disabling CUDA Graphs on model runner
+    sabotage = _diff_for(
+        "worker/zstep_worker/models/qwen35_moe.py",
+        ["self.max_graph_bucket = 0"],
+    )
+    assert any(
+        f.category == "anti_cheat" and f.severity == "blocking"
+        for f in scan_patch_boundaries(sabotage)
+    )
+
+    # Zero-initialized SHM recurrent slot sentinel warning
+    sentinel_warn = _diff_for(
+        "worker/zstep_worker/models/qwen35_moe.py",
+        ["if restore_slot >= 0: self.restore_gdn(restore_slot)"],
+    )
+    assert any(
+        f.category == "initial_values" and f.severity == "warning"
+        for f in scan_patch_boundaries(sentinel_warn)
+    )
+
+
+def test_redteam_ast_blocks_hotpath_host_sync_and_dist_broadcast(
+    tmp_path: Path,
+) -> None:
+    task = make_task(tmp_path)
+    cand_dir = tmp_path / "cand-ast"
+    model_file = cand_dir / "worker/zstep_worker/models/deepseek_v41.py"
+    model_file.parent.mkdir(parents=True)
+    model_file.write_text(
+        "class Runner:\n"
+        "    def __init__(self, t):\n"
+        "        self.v = t.item()\n"
+        "    def execute(self, logits, tok_gpu):\n"
+        "        host_ids = self.out_tokens_cpu[:4].tolist()\n"
+        "        n_acc = int(logits.argmax().item())\n"
+        "        dist.broadcast(tok_gpu, src=0)\n"
+        "        return host_ids, n_acc\n",
+        encoding="utf-8",
+    )
+    # Post-sync CPU buffer `.tolist()` alone passes without false-positive rejection
+    safe_cpu_patch = (
+        "diff --git a/worker/zstep_worker/models/deepseek_v41.py b/worker/zstep_worker/models/deepseek_v41.py\n"
+        "--- a/worker/zstep_worker/models/deepseek_v41.py\n"
+        "+++ b/worker/zstep_worker/models/deepseek_v41.py\n"
+        "@@ -4,1 +4,2 @@\n"
+        "     def execute(self, logits, tok_gpu):\n"
+        "+        host_ids = self.out_tokens_cpu[:4].tolist()\n"
+    ).encode("utf-8")
+    safe_stats = PatchStats(
+        patch=safe_cpu_patch,
+        changed_lines=1,
+        changed_files=("worker/zstep_worker/models/deepseek_v41.py",),
+    )
+    assert run_redteam_gate(cand_dir, safe_stats, task, tmp_path / "ev-ast-safe").passed
+
+    # GPU `.item()` and `dist.broadcast` inside `execute` are blocked
+    patch = (
+        "diff --git a/worker/zstep_worker/models/deepseek_v41.py b/worker/zstep_worker/models/deepseek_v41.py\n"
+        "--- a/worker/zstep_worker/models/deepseek_v41.py\n"
+        "+++ b/worker/zstep_worker/models/deepseek_v41.py\n"
+        "@@ -5,1 +5,3 @@\n"
+        "         host_ids = self.out_tokens_cpu[:4].tolist()\n"
+        "+        n_acc = int(logits.argmax().item())\n"
+        "+        dist.broadcast(tok_gpu, src=0)\n"
+    ).encode("utf-8")
+    stats = PatchStats(
+        patch=patch,
+        changed_lines=2,
+        changed_files=("worker/zstep_worker/models/deepseek_v41.py",),
+    )
+    with pytest.raises(RedTeamRejectedError, match="execute"):
+        run_redteam_gate(cand_dir, stats, task, tmp_path / "ev-ast")
