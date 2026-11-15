@@ -17,7 +17,7 @@ class WorkerTimeout(RuntimeError):
 
 def execute_request(module: str, request: dict, directory: Path, timeout: float) -> dict:
     """Only these trusted worker entrypoints may run, never model source."""
-    if module not in ("evolith.lab.worker", "evolith.lab.autonomy_worker"):
+    if module not in ("evolith.lab.worker", "evolith.lab.autonomy_worker", "evolith.lab.engine_worker"):
         raise ValueError("Unknown worker entrypoint.")
     directory.mkdir(parents=True, exist_ok=False)
     write_json(directory / "request.json", request)
