@@ -45,6 +45,39 @@ def register(app: typer.Typer) -> None:
             emit(refusal(str(exc)))
             raise typer.Exit(2) from exc
 
+    @app.command("qwen-ultrafast")
+    def qwen_ultrafast(
+        remote: Annotated[str, typer.Option(help="SSH destination, for example user@host.")],
+        local_repo: Annotated[Path, typer.Option(exists=True, file_okay=False)],
+        remote_repo: Annotated[Path, typer.Option()],
+        nccl_library: Annotated[Path, typer.Option()],
+        output: Annotated[Path, typer.Option()] = Path("results"),
+        port: Annotated[int, typer.Option(min=1, max=65535)] = 22,
+        model: Annotated[str, typer.Option()] = "models/Qwen3.8-Flash-Next-NVFP4",
+        control_path: Annotated[Path | None, typer.Option()] = None,
+        candidates: Annotated[str, typer.Option(help="Comma-separated GEMV block sizes.")] = "64,256,512",
+        incumbent: Annotated[int, typer.Option()] = 128,
+        decode: Annotated[int, typer.Option(min=8, max=256)] = 64,
+        rounds: Annotated[int, typer.Option(min=5, max=101)] = 19,
+        iterations: Annotated[int, typer.Option(min=1, max=1000)] = 128,
+        model_pairs: Annotated[int, typer.Option(min=5, max=19)] = 5,
+        time_budget: Annotated[int, typer.Option(min=60, max=7200)] = 7200,
+    ):
+        """Search bounded Qwen Ultrafast GEMV configs and verify them on eight GPUs."""
+        try:
+            from evolith.lab.qwen_ultrafast import QwenAdapterConfig, QwenUltrafastAdapter
+            adapter = QwenUltrafastAdapter(QwenAdapterConfig(
+                remote=remote, port=port, local_repo=local_repo, remote_repo=remote_repo,
+                nccl_library=nccl_library, output=output, control_path=control_path,
+                model=model, decode=decode, rounds=rounds, iterations=iterations,
+                model_pairs=model_pairs, seconds=time_budget,
+            ))
+            result = adapter.run([int(value) for value in candidates.split(",")], incumbent)
+            emit(result)
+        except (ImportError, RuntimeError, ValueError, TypeError, OSError) as exc:
+            emit(refusal(str(exc)))
+            raise typer.Exit(2) from exc
+
     @app.command("doctor")
     def doctor(
         model_path: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,

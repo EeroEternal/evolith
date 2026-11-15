@@ -34,13 +34,16 @@ Correctness and measurement gates are not evolvable rewards. See
   avoids repeated configurations within a session, and continues within fixed
   time/evaluation/cycle budgets. A successor must beat the current approved
   incumbent, not merely the original native implementation.
+- **Qwen Ultrafast:** `qwen-ultrafast` adds a remote Rust/CUDA adapter with a
+  bounded BF16 GEMV block-size space, independent component checks, exact-token
+  full-model AB/BA verification and successor-versus-incumbent promotion.
 - **History:** unique run IDs, atomic JSON reports, source/environment metadata,
   and append-only SQLite records. No result is replaced by a later run.
 
-The first supported target is **Qwen3.5-27B BF16**. Qwen3.8-Flash-Next is not
-claimed supported by the currently tested vLLM 0.19 runtime. L2 runtime policy
-optimization, a calibrated trace simulator, arbitrary kernel generation and
-self-hosted acceleration remain future work.
+The first supported vLLM target is **Qwen3.5-27B BF16**. Qwen3.8-Flash-Next is
+supported only through the separate Qwen Ultrafast adapter, not the tested vLLM
+0.19 runtime. L2 runtime policy optimization, a calibrated trace simulator,
+arbitrary kernel generation and self-hosted acceleration remain future work.
 
 ## CPU tests
 
@@ -96,6 +99,34 @@ The initial observation capability covers GemmaRMSNorm only. It estimates
 per-contract cost from capped CUDA-event samples; **it is not a whole-engine
 profiler or arbitrary source evolution**. See
 [controller design and limits](docs/autonomous-evolution.md).
+
+### Qwen Ultrafast remote adapter
+
+`qwen-ultrafast` adds a separate bounded capability for the Rust/CUDA
+[Qwen Ultrafast](https://github.com/EeroEternal/qwen-ultrafast) runtime. It
+syncs a reviewed source tree over SSH, builds it on the remote SM120 machine,
+and searches only `bf16-gemv` block sizes `{64, 128, 256, 512}`. The component
+benchmark checks a CPU reference and retains alternating CUDA-event samples.
+Only candidates passing the paired microbenchmark gate proceed to full-model
+AB/BA trials. Every trial requires all 64 generated tokens to match the current
+incumbent. A successor must also pass the independent end-to-end timing gate;
+microbenchmark wins and faster-but-different outputs are rejected.
+
+```bash
+uv run evolith qwen-ultrafast \
+  --remote user@gpu-server --port 22 \
+  --local-repo /path/to/qwen-ultrafast \
+  --remote-repo /remote/path/to/qwen-ultrafast \
+  --nccl-library /remote/path/to/libnccl.so.2 \
+  --candidates 64,256,512 --model-pairs 5 --output results
+```
+
+The adapter refuses active remote GPU processes, bounds local and remote
+execution time, and writes candidates, raw timings, rejections and lineage to
+atomic JSON and append-only SQLite records. It does not deploy a winner or
+change the runtime default. This is not whole-engine observation or arbitrary
+Rust/CUDA source evolution; other operators require their own trusted
+benchmark and observation capability.
 
 ### Individual experimental stages
 
