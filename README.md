@@ -1,7 +1,7 @@
 # Evolith
 
-**Measurement-first GPU inference optimization.** Evolith searches a bounded,
-trusted Triton parameter space, verifies candidates against an independent
+**Measurement-first GPU inference optimization.** Evolith searches bounded,
+trusted Triton and engine configuration spaces, verifies candidates against an independent
 reference, and measures them against an optimized implementation before
 considering a runtime replacement. It does not claim recursive self-improvement
 from synthetic speedups.
@@ -36,10 +36,14 @@ Correctness and measurement gates are not evolvable rewards. See
   incumbent, not merely the original native implementation.
 - **History:** unique run IDs, atomic JSON reports, source/environment metadata,
   and append-only SQLite records. No result is replaced by a later run.
+- **Qwen inference runtime:** a vLLM-backed OpenAI-compatible API plus
+  `evolve-engine` for model-guided configuration search. It measures streamed
+  time-to-first-token and inter-token latency against native graph-mode vLLM,
+  not the earlier eager debugging path. See [engine operation](docs/qwen-engine.md).
 
 The first supported target is **Qwen3.5-27B BF16**. Qwen3.8-Flash-Next is not
-claimed supported by the currently tested vLLM 0.19 runtime. L2 runtime policy
-optimization, a calibrated trace simulator, arbitrary kernel generation and
+claimed supported by the currently tested vLLM 0.19 runtime. General L2 policy
+source evolution, a calibrated trace simulator, arbitrary kernel generation and
 self-hosted acceleration remain future work.
 
 ## CPU tests
@@ -161,9 +165,10 @@ then run `bash scripts/container.sh test -q /workspace/tests`.
   but does not prove memory safety; use Compute Sanitizer for broader coverage.
 - The reference explicitly checks output finiteness and bytewise input
   preservation. It does not establish model-wide quality equivalence.
-- End-to-end tests currently cover six serialized, short deterministic text
-  generations in eager mode, not production load, full logits, long contexts,
-  SLO goodput or energy.
+- Kernel-adapter regressions cover six serialized, short deterministic text
+  generations in eager mode. Engine-runtime experiments separately use graph
+  execution and HTTP streaming chat. Neither establishes production-load,
+  full-logit, long-context, SLO-goodput or energy performance.
 - Model fingerprints cover config, index and shard sizes, not full weight
   contents. Treat artifacts as local trusted records, not signed attestations.
 - Worker processes isolate crashes/timeouts, **not hostile code**. The trusted

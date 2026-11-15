@@ -15,6 +15,39 @@ def emit(value: dict) -> None:
 
 
 def register(app: typer.Typer) -> None:
+    @app.command("evolve-engine")
+    def evolve_engine(
+        model_path: Annotated[Path, typer.Option(exists=True, file_okay=False)],
+        output: Annotated[Path, typer.Option()] = Path("results"),
+        candidates: Annotated[int, typer.Option(min=1, max=4)] = 2,
+        time_budget: Annotated[int, typer.Option(min=600, max=14400)] = 7200,
+        rounds: Annotated[int, typer.Option(min=5, max=15)] = 5,
+        max_tokens: Annotated[int, typer.Option(min=16, max=128)] = 64,
+    ):
+        """Evolve a localhost chat engine against strong native graph-mode vLLM."""
+        try:
+            from evolith.lab.engine_evolution import run
+            emit(run(model_path, output, candidates=candidates, seconds=time_budget,
+                     rounds=rounds, max_tokens=max_tokens))
+        except (ImportError, RuntimeError, ValueError, TypeError, OSError) as exc:
+            emit(refusal(str(exc)))
+            raise typer.Exit(2) from exc
+
+    @app.command("serve-engine")
+    def serve_engine(
+        model_path: Annotated[Path, typer.Option(exists=True, file_okay=False)],
+        profile: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
+        port: Annotated[int, typer.Option(min=1024, max=65535)] = 18080,
+        container_loopback_publish: Annotated[bool, typer.Option(hidden=True)] = False,
+    ):
+        """Serve a validated Qwen engine on localhost (or the controlled container bridge)."""
+        try:
+            from evolith.lab.engine import serve
+            serve(profile, model_path, port, container_loopback_publish)
+        except (ImportError, RuntimeError, ValueError, TypeError, OSError) as exc:
+            emit(refusal(str(exc)))
+            raise typer.Exit(2) from exc
+
     @app.command("autoevolve")
     def autoevolve(
         model_path: Annotated[Path, typer.Option(exists=True, file_okay=False)],
