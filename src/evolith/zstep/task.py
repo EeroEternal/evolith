@@ -98,6 +98,8 @@ class ZStepRSITask(BaseModel):
     max_screen_latency_regression: float = 0.08
     keep_remote_stage: bool = False
     sandbox_root: Path | None = None
+    campaign: str = "none"
+    propose_only: bool = False
     premise_strike_limit: int = Field(default=2, ge=1)
     parity_prefill_chunk: int = Field(default=24, ge=1)
     max_cross_mode_logit_drift: float = Field(default=8.0, ge=0.0)

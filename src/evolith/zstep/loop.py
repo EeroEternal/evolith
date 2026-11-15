@@ -7,6 +7,12 @@ from typing import Any
 import uuid
 
 from evolith.zstep.archive import ZStepArchive
+from evolith.zstep.campaigns import (
+    CampaignSpec,
+    apply_campaign_to_task,
+    resolve_campaign,
+)
+from evolith.zstep.dispatch_verifier import run_dispatch_verification
 from evolith.zstep.gates import (
     evaluate_candidate,
     evaluate_screen,
@@ -62,13 +68,24 @@ class ZStepRSILoop:
         candidate_dir: Path,
         baseline_hash: str | None = None,
         blocked_niches: dict[str, list[str]] | None = None,
+        active_task: ZStepRSITask | None = None,
+        active_campaign: CampaignSpec | None = None,
     ) -> str:
+        task = active_task or self.task
         compressed_history = self.archive.compressed_lineage_memory(limit=8)
-        allowed_list = "\n".join(f"  - {root}" for root in self.task.allowed_roots)
+        allowed_list = "\n".join(f"  - {root}" for root in task.allowed_roots)
         reflection_card = build_sm120_reflection_card(
             candidate_dir,
             self._find_cached_baseline_screen(baseline_hash),
             blocked_niches=blocked_niches,
+        )
+        campaign_section = (
+            f"\n{active_campaign.blueprint}\n" if active_campaign is not None else ""
+        )
+        niche_example = (
+            active_campaign.primary_niche_key
+            if active_campaign is not None
+            else "(plane=<l1_kernel|l2_scheduler>,focus=<short_tag>)"
         )
         return f"""Parent: {parent_id or 'frozen-zstep-baseline'}
 Improve DeepSeek-V4.1-Flash (TP=8, SM120) serving throughput without weakening correctness or latency.
@@ -76,22 +93,22 @@ Improve DeepSeek-V4.1-Flash (TP=8, SM120) serving throughput without weakening c
 Strict Modification Contract:
 - Edit ONLY these allowlisted zstep source paths:
 {allowed_list}
-- Maximum changed lines (added + deleted): {self.task.max_changed_lines} LOC.
-- Occam's Razor Complexity Gate: patches exceeding {self.task.complexity_free_lines} LOC incur a net-gain penalty of {self.task.complexity_penalty_weight:.4f} per extra line; keep mutations surgical and high-leverage.
-- Attack the Premise (2-Strike Circuit Breaker): any explicit `niche_key` rejected {self.task.premise_strike_limit} consecutive times under the same parent is mechanically blocked; choose an unblocked bottleneck/niche.
+- Maximum changed lines (added + deleted): {task.max_changed_lines} LOC.
+- Occam's Razor Complexity Gate: patches exceeding {task.complexity_free_lines} LOC incur a net-gain penalty of {task.complexity_penalty_weight:.4f} per extra line; keep mutations surgical and high-leverage.
+- Attack the Premise (2-Strike Circuit Breaker): any explicit `niche_key` rejected {task.premise_strike_limit} consecutive times under the same parent is mechanically blocked; choose an unblocked bottleneck/niche.
 - Red-Team Boundary Safety: never introduce auxiliary CUDA streams without Event/wait_stream sync, transient pageable tensors with `non_blocking=True`, unguarded `@triton.autotune`, or unchecked Rust indexing.
-- Target acceptance bar: >= {self.task.min_geomean_gain:.1%} geomean output throughput gain, <= {self.task.max_tier_throughput_regression:.1%} per-tier throughput regression, <= {self.task.max_tpot_regression:.1%} latency regression, 0 Triton recompilations, 100% prime_squares_table exact greedy parity across single/batched/chunked modes.
+- Target acceptance bar: >= {task.min_geomean_gain:.1%} geomean output throughput gain, <= {task.max_tier_throughput_regression:.1%} per-tier throughput regression, <= {task.max_tpot_regression:.1%} latency regression, 0 Triton recompilations, 100% prime_squares_table exact greedy parity across single/batched/chunked modes.
 - Do not modify benchmark semantics, dependency manifests, model files, or verifier rules.
 - Do not access remote hosts, credentials, other workspaces, or hidden verification cases.
-- Run relevant local checks. The public screen tiers are {self.task.screen_tiers}.
-
+- Run relevant local checks. The public screen tiers are {task.screen_tiers}.
+{campaign_section}
 {reflection_card}
 
 AIDE^2 Compressed Lineage Memory (Previous Candidates — Do NOT Repeat Rejected Hypotheses):
 {compressed_history}
 
 At the end of your final response, include one single-line structured summary:
-EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields >=3% gain>", "niche_key": "(plane=<l1_kernel|l2_scheduler>,focus=<short_tag>)", "patch_summary": "<concise summary of code change>"}}
+EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields >=3% gain>", "niche_key": "{niche_example}", "patch_summary": "<concise summary of code change>"}}
 """
 
     def _write_failure(self, evidence_dir: Path, error: Exception) -> None:
@@ -102,18 +119,30 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         )
 
     def _propose_and_capture(
-        self, candidate_dir: Path, prompt: str, evidence_dir: Path
+        self,
+        candidate_dir: Path,
+        prompt: str,
+        evidence_dir: Path,
+        active_task: ZStepRSITask | None = None,
     ) -> tuple[str, PatchStats]:
+        task_override = active_task or self.task
         if (
             hasattr(self.workspace, "isolated_proposer_sandbox")
             and hasattr(self.workspace, "capture_patch_stats")
             and hasattr(self.workspace, "apply_patch")
         ):
-            with self.workspace.isolated_proposer_sandbox(candidate_dir) as sandbox_dir:
-                proposer_out = self.proposer.propose(sandbox_dir, prompt, evidence_dir)
-                patch_stats = self.workspace.capture_patch_stats(sandbox_dir)
-            self.workspace.apply_patch(candidate_dir, patch_stats.patch)
-            return proposer_out, patch_stats
+            prev_ws_task = getattr(self.workspace, "task", None)
+            if prev_ws_task is not None:
+                self.workspace.task = task_override
+            try:
+                with self.workspace.isolated_proposer_sandbox(candidate_dir) as sandbox_dir:
+                    proposer_out = self.proposer.propose(sandbox_dir, prompt, evidence_dir)
+                    patch_stats = self.workspace.capture_patch_stats(sandbox_dir)
+                self.workspace.apply_patch(candidate_dir, patch_stats.patch)
+                return proposer_out, patch_stats
+            finally:
+                if prev_ws_task is not None:
+                    self.workspace.task = prev_ws_task
 
         proposer_out = self.proposer.propose(candidate_dir, prompt, evidence_dir)
         raw_patch = self.workspace.capture_patch(candidate_dir)
@@ -172,6 +201,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         source_hash: str,
         changed_lines: int,
         evidence_dir: Path,
+        active_task: ZStepRSITask | None = None,
     ) -> CandidateStatus:
         candidate_json, baseline_json, parity_json = self.remote.verify(
             candidate_id, baseline_archive, candidate_archive, evidence_dir
@@ -182,7 +212,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
             load_benchmark(baseline_json),
             load_benchmark(candidate_json),
             parity_json,
-            self.task,
+            active_task or self.task,
             changed_lines=changed_lines,
         )
         (evidence_dir / "decision.json").write_text(
@@ -232,15 +262,41 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     parent_id=parent_id,
                     exclude_candidate_id=candidate_id,
                 )
-                spec_pins = compute_spec_pins(candidate_dir, self.task.pinned_spec_files)
+                active_campaign = resolve_campaign(self.task.campaign, blocked)
+                active_task = apply_campaign_to_task(self.task, active_campaign)
+                if active_campaign is not None:
+                    (evidence_dir / "campaign.json").write_text(
+                        json.dumps(
+                            {
+                                "campaign_id": active_campaign.campaign_id,
+                                "priority_rank": active_campaign.priority_rank,
+                                "title": active_campaign.title,
+                                "primary_niche_key": active_campaign.primary_niche_key,
+                                "allowed_roots": list(active_campaign.allowed_roots),
+                                "complexity_free_lines": active_campaign.complexity_free_lines,
+                                "max_changed_lines": active_campaign.max_changed_lines,
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                spec_pins = compute_spec_pins(candidate_dir, active_task.pinned_spec_files)
                 baseline_archive = self.workspace.freeze_source(
                     candidate_dir, evidence_dir / "baseline.tar.gz"
                 )
                 baseline_hash = hashlib.sha256(baseline_archive.read_bytes()).hexdigest()
                 proposer_out, patch_stats = self._propose_and_capture(
                     candidate_dir,
-                    self._prompt(parent_id, candidate_dir, baseline_hash, blocked),
+                    self._prompt(
+                        parent_id,
+                        candidate_dir,
+                        baseline_hash,
+                        blocked,
+                        active_task=active_task,
+                        active_campaign=active_campaign,
+                    ),
                     evidence_dir,
+                    active_task=active_task,
                 )
                 proposal_meta = parse_proposal_metadata(
                     proposer_out,
@@ -279,11 +335,16 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 run_redteam_gate(
                     candidate_dir,
                     patch_stats,
-                    self.task,
+                    active_task,
                     evidence_dir,
                     expected_pins=spec_pins,
                 )
-                run_local_gates(candidate_dir, self.task, evidence_dir)
+                run_dispatch_verification(candidate_dir, evidence_dir)
+                run_local_gates(candidate_dir, active_task, evidence_dir)
+                if self.task.propose_only:
+                    self.archive.update_stage(candidate_id, "preflight")
+                    statuses.append(CandidateStatus.PROPOSED)
+                    continue
                 stage = "preflight"
                 self.remote.preflight()
                 stage = "screen"
@@ -304,6 +365,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     source_hash,
                     patch_stats.changed_lines,
                     evidence_dir,
+                    active_task=active_task,
                 )
                 statuses.append(final_status)
             except Exception as error:
@@ -348,6 +410,18 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         if not expected_hash or actual_hash != expected_hash:
             raise RuntimeError("candidate source hash mismatch on resume")
 
+        campaign_selector = self.task.campaign
+        campaign_file = evidence_dir / "campaign.json"
+        if (not campaign_selector or campaign_selector == "none") and campaign_file.is_file():
+            try:
+                saved = json.loads(campaign_file.read_text(encoding="utf-8"))
+                if isinstance(saved, dict) and isinstance(saved.get("campaign_id"), str):
+                    campaign_selector = saved["campaign_id"]
+            except ValueError:
+                pass
+        active_campaign = resolve_campaign(campaign_selector)
+        active_task = apply_campaign_to_task(self.task, active_campaign)
+
         baseline_hash = hashlib.sha256(baseline_archive.read_bytes()).hexdigest()
         changed_lines = int(row.get("changed_lines") or 0)
         stage = "preflight"
@@ -368,7 +442,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 screen_decision = evaluate_screen(
                     screen_metrics,
                     parity_path if parity_path.is_file() else None,
-                    self.task,
+                    active_task,
                     self._find_cached_baseline_screen(baseline_hash),
                 )
                 if not screen_decision.passed:
@@ -383,6 +457,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 expected_hash,
                 changed_lines,
                 evidence_dir,
+                active_task=active_task,
             )
         except Exception as error:
             status = (

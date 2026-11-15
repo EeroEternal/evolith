@@ -232,6 +232,17 @@ def zstep_evolve_cmd(
     user: str = typer.Option("node-user", "--user"),
     generations: int = typer.Option(1, "--generations", min=1, max=100),
     local_timeout: int = typer.Option(1800, "--local-timeout", min=1),
+    campaign: str = typer.Option(
+        "auto",
+        "--campaign",
+        "-c",
+        help="Target campaign ('auto', 'none', 't1-1', 't1-2', 't1-3', 't2-1', 't2-2').",
+    ),
+    propose_only: bool = typer.Option(
+        False,
+        "--propose-only",
+        help="Run proposer + local/RedTeam/dispatch gates and freeze archives without remote SSH.",
+    ),
 ) -> None:
     """Run isolated zstep source evolution; no deployment or upstream commit occurs."""
     from evolith.zstep.archive import ZStepArchive
@@ -245,11 +256,63 @@ def zstep_evolve_cmd(
         remote_user=user,
         max_generations=generations,
         local_timeout_sec=local_timeout,
+        campaign=campaign,
+        propose_only=propose_only,
     )
     with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
         statuses = ZStepRSILoop(task, archive=archive).run()
     for status in statuses:
         console.print(f"zstep candidate: {status.value}")
+
+
+@app.command("zstep-campaigns")
+def zstep_campaigns_cmd() -> None:
+    """List ROI-ranked zstep optimization campaigns and their 2-Strike circuit breaker status."""
+    from evolith.zstep.archive import ZStepArchive
+    from evolith.zstep.campaigns import list_campaigns, resolve_campaign
+
+    db_path = Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3"
+    blocked: dict[str, list[str]] = {}
+    parent: str | None = None
+    if db_path.is_file():
+        with ZStepArchive(db_path) as archive:
+            parent = archive.current_parent()
+            blocked = archive.blocked_niches(strike_limit=2, parent_id=parent)
+
+    next_auto = resolve_campaign("auto", blocked)
+    table = Table(
+        title=(
+            f"zstep ROI-Ranked Optimization Campaigns "
+            f"(parent: {parent or 'frozen-zstep-baseline'}, "
+            f"auto -> {next_auto.priority_rank if next_auto else 'none'})"
+        ),
+        show_lines=True,
+    )
+    table.add_column("Rank", style="cyan", no_wrap=True)
+    table.add_column("Campaign ID", no_wrap=True)
+    table.add_column("Plane", no_wrap=True)
+    table.add_column("Expected Gain")
+    table.add_column("Status", justify="center", no_wrap=True)
+    table.add_column("Scoped Allowed Roots")
+
+    for spec in list_campaigns():
+        is_frozen = spec.primary_niche_key in blocked
+        if is_frozen:
+            status_cell = "[bold red]FROZEN (2-Strike)[/bold red]"
+        elif next_auto and spec.campaign_id == next_auto.campaign_id:
+            status_cell = "[bold green]NEXT (auto)[/bold green]"
+        else:
+            status_cell = "[green]READY[/green]"
+        plane_label = "L1 Kernel" if spec.plane == EvolutionPlane.L1_KERNEL else "L2 Scheduler"
+        table.add_row(
+            spec.priority_rank,
+            spec.campaign_id,
+            plane_label,
+            spec.expected_gain,
+            status_cell,
+            "\n".join(spec.allowed_roots),
+        )
+    console.print(table)
 
 
 @app.command("zstep-resume")

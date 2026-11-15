@@ -129,3 +129,37 @@ def test_redteam_records_non_blocking_warnings_for_views_and_slot_reset(tmp_path
     categories = {f.category for f in report.findings}
     assert "aliases_views" in categories
     assert "initial_values" in categories
+
+
+def test_redteam_blocks_tp8_device_tokens_when_shm_allreduce_only_writes_rank0(
+    tmp_path: Path,
+) -> None:
+    task = make_task(tmp_path)
+    cand_dir = tmp_path / "cand-tp8"
+    dsv41_file = cand_dir / "worker/zstep_worker/models/deepseek_v41.py"
+    shm_file = cand_dir / "worker/zstep_worker/kernels_sm120/shm_allreduce.py"
+    dsv41_file.parent.mkdir(parents=True)
+    shm_file.parent.mkdir(parents=True)
+
+    dsv41_file.write_text(
+        "if header.flags & STEP_FLAG_DEVICE_TOKENS:\n    ids = self.out_tokens_gpu[:num_seqs, 0]\n",
+        encoding="utf-8",
+    )
+    shm_file.write_text(
+        "if (rank == 0) {\n    out_top2_tokens[row * 2 + 0] = best_idx;\n}\n",
+        encoding="utf-8",
+    )
+    stats = _diff_for(
+        "worker/zstep_worker/models/deepseek_v41.py",
+        ["if header.flags & STEP_FLAG_DEVICE_TOKENS:"],
+    )
+    with pytest.raises(RedTeamRejectedError, match="agreement"):
+        run_redteam_gate(cand_dir, stats, task, tmp_path / "ev-tp8-bad")
+
+    # Once all 8 ranks populate out_top2_tokens (removing rank == 0 guard), Agreement gate passes!
+    shm_file.write_text(
+        "out_top2_tokens[row * 2 + 0] = best_idx;\nout_top2_tokens[row * 2 + 1] = second_idx;\n",
+        encoding="utf-8",
+    )
+    report = run_redteam_gate(cand_dir, stats, task, tmp_path / "ev-tp8-good")
+    assert report.passed is True

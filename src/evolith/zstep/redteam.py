@@ -200,6 +200,47 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
     return findings
 
 
+def _check_tp8_device_token_agreement(
+    candidate_dir: Path, patch_stats: PatchStats
+) -> list[RedTeamFinding]:
+    """
+    vstack Pillar 4 (Agreement): if `deepseek_v41.py` consumes `STEP_FLAG_DEVICE_TOKENS`
+    from `out_tokens_gpu`, all 8 TP ranks must hold identical sampled tokens — either by
+    removing the `if (rank == 0)` guard in `shm_allreduce.py`'s `tp8_argmax_gather_shm`
+    kernel or via an explicit cross-rank broadcast.
+    """
+    dsv41_rel = "worker/zstep_worker/models/deepseek_v41.py"
+    shm_rel = "worker/zstep_worker/kernels_sm120/shm_allreduce.py"
+    dsv41_path = candidate_dir / dsv41_rel
+    shm_path = candidate_dir / shm_rel
+    if not dsv41_path.is_file() or not shm_path.is_file():
+        return []
+    dsv41_src = dsv41_path.read_text(encoding="utf-8", errors="replace")
+    if "STEP_FLAG_DEVICE_TOKENS" not in dsv41_src:
+        return []
+    if "dist.broadcast" in dsv41_src or "all_gather" in dsv41_src:
+        return []
+    shm_src = shm_path.read_text(encoding="utf-8", errors="replace")
+    if re.search(
+        r"if\s*\(\s*rank\s*==\s*0\s*\)\s*\{[^}]*out_top2_tokens\[",
+        shm_src,
+        flags=re.DOTALL,
+    ):
+        return [
+            RedTeamFinding(
+                category="agreement",
+                severity="blocking",
+                file_path=dsv41_rel,
+                message=(
+                    "`deepseek_v41.py` enables `STEP_FLAG_DEVICE_TOKENS`, but "
+                    "`shm_allreduce.py` still gates `out_top2_tokens` behind `if (rank == 0)` "
+                    "without TP8 broadcast — ranks 1..7 would feed zero/stale token IDs"
+                ),
+            )
+        ]
+    return []
+
+
 def run_redteam_gate(
     candidate_dir: Path,
     patch_stats: PatchStats,
@@ -226,6 +267,7 @@ def run_redteam_gate(
             findings.extend(pin_findings)
 
     findings.extend(scan_patch_boundaries(patch_stats))
+    findings.extend(_check_tp8_device_token_agreement(candidate_dir, patch_stats))
     blocking = [f for f in findings if f.severity == "blocking"]
     report = RedTeamReport(
         passed=not blocking,

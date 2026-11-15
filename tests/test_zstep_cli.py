@@ -103,3 +103,34 @@ def test_zstep_resume_status_and_evidence(tmp_path: Path, monkeypatch) -> None:
     assert missing.exit_code == 1
     assert resumed.exit_code == 0
     assert "accepted" in resumed.stdout
+
+
+def test_zstep_campaigns_and_propose_only_flags(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    campaigns_out = runner.invoke(app, ["zstep-campaigns"])
+    assert campaigns_out.exit_code == 0, campaigns_out.stdout
+    assert "t1-1-device-decode" in campaigns_out.stdout
+    assert "t1-2-dispatch-buckets" in campaigns_out.stdout
+    assert "NEXT (auto)" in campaigns_out.stdout
+
+    captured_tasks = []
+
+    class FakeLoop:
+        def __init__(self, task, *, archive) -> None:
+            captured_tasks.append(task)
+
+        def run(self) -> list[object]:
+            from evolith.zstep.task import CandidateStatus
+
+            return [CandidateStatus.PROPOSED]
+
+    monkeypatch.setattr("evolith.zstep.loop.ZStepRSILoop", FakeLoop)
+    res = runner.invoke(
+        app,
+        ["zstep-evolve", "--campaign", "t1-2", "--propose-only"],
+    )
+    assert res.exit_code == 0, res.stdout
+    assert captured_tasks[0].campaign == "t1-2"
+    assert captured_tasks[0].propose_only is True
+    assert "proposed" in res.stdout

@@ -349,3 +349,116 @@ def test_redteam_gate_blocks_unsafe_stream_patch_in_loop_before_gpu(
     row = archive.list_candidates()[0]
     assert "Red-Team gate rejected patch" in str(row["failure_reason"])
     assert (Path(str(row["evidence_dir"])) / "redteam-report.json").is_file()
+
+
+def test_propose_only_campaign_freezes_candidate_and_resumes_with_campaign_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("evolith.zstep.loop.run_local_gates", lambda *args: None)
+    task = ZStepRSITask(
+        project_root=tmp_path,
+        source_repo=tmp_path / "source",
+        campaign="t1-1",
+        propose_only=True,
+    )
+    archive = ZStepArchive(task.state_dir / "archive.sqlite3")
+    proposer = FakeProposer()
+    remote = FakeRemote(candidate_throughputs=[103.5])
+    preflight_called = False
+
+    def fail_if_called_in_propose_only() -> None:
+        nonlocal preflight_called
+        preflight_called = True
+        raise AssertionError("remote.preflight() must not be called in propose_only mode")
+
+    class LargeCampaignWorkspace(FakeWorkspace):
+        def capture_patch(self, candidate_dir: Path) -> bytes:
+            # 160-line patch: under default 120 free LOC a +3.5% gain drops to ~2.67% net
+            # and is rejected, whereas under T1-1 campaign (180 free LOC) it passes!
+            return ("\n".join(f"+line_{i}" for i in range(160))).encode("utf-8")
+
+    monkeypatch.setattr(remote, "preflight", fail_if_called_in_propose_only)
+    loop = ZStepRSILoop(
+        task,
+        workspace=LargeCampaignWorkspace(task),
+        archive=archive,
+        proposer=proposer,
+        remote=remote,
+    )
+
+    statuses = loop.run()
+    assert statuses == [CandidateStatus.PROPOSED]
+    assert preflight_called is False
+    assert remote.screen_calls == 0
+    assert "[Active Campaign T1-1 Blueprint" in proposer.prompts[0]
+    assert "Maximum changed lines (added + deleted): 320 LOC" in proposer.prompts[0]
+
+    row = archive.list_candidates()[0]
+    candidate_id = str(row["candidate_id"])
+    evidence_dir = Path(str(row["evidence_dir"]))
+    assert row["stage"] == "preflight"
+    assert row["changed_lines"] == 160
+    assert (evidence_dir / "campaign.json").is_file()
+    assert (evidence_dir / "dispatch-verification.json").is_file()
+    assert (evidence_dir / "candidate.tar.gz").is_file()
+
+    resume_task = ZStepRSITask(project_root=tmp_path, source_repo=tmp_path / "source")
+    resume_remote = FakeRemote(candidate_throughputs=[103.5])
+    resumed_loop = ZStepRSILoop(
+        resume_task,
+        workspace=FakeWorkspace(resume_task),
+        archive=archive,
+        proposer=proposer,
+        remote=resume_remote,
+    )
+    final_status = resumed_loop.resume(candidate_id)
+    assert final_status == CandidateStatus.ACCEPTED
+    assert archive.current_parent() == candidate_id
+
+
+def test_auto_campaign_rotates_from_t1_1_to_t1_2_after_two_strikes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("evolith.zstep.loop.run_local_gates", lambda *args: None)
+    task = ZStepRSITask(
+        project_root=tmp_path,
+        source_repo=tmp_path / "source",
+        campaign="auto",
+        max_generations=3,
+    )
+    archive = ZStepArchive(task.state_dir / "archive.sqlite3")
+
+    class CampaignAwareProposer:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def propose(self, candidate_dir: Path, prompt: str, evidence_dir: Path) -> str:
+            self.prompts.append(prompt)
+            if "T1-1 Blueprint" in prompt:
+                niche = "(plane=l2_scheduler,focus=dsv41_device_token_overlap)"
+            else:
+                niche = "(plane=l1_kernel,focus=sm120_dispatch_buckets)"
+            return (
+                f'EVOLITH_PROPOSAL_JSON: {{"hypothesis": "Campaign step", '
+                f'"niche_key": "{niche}", "patch_summary": "Focused mutation"}}'
+            )
+
+    proposer = CampaignAwareProposer()
+    remote = FakeRemote(candidate_throughputs=[100.5, 100.5, 105.0])
+    loop = ZStepRSILoop(
+        task,
+        workspace=FakeWorkspace(task),
+        archive=archive,
+        proposer=proposer,
+        remote=remote,
+    )
+
+    statuses = loop.run()
+    assert statuses == [
+        CandidateStatus.VERIFY_REJECTED,
+        CandidateStatus.VERIFY_REJECTED,
+        CandidateStatus.ACCEPTED,
+    ]
+    assert "T1-1 Blueprint" in proposer.prompts[0]
+    assert "T1-1 Blueprint" in proposer.prompts[1]
+    assert "T1-2 Blueprint" in proposer.prompts[2]
