@@ -69,8 +69,23 @@ class ZStepWorkspace:
             check=False,
             capture_output=True,
         )
-        for patch in accepted_patches:
+        for idx, patch in enumerate(accepted_patches, start=1):
             self.apply_patch(destination, patch)
+            _run(["git", "add", "-A"], destination)
+            _run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Evolith Coordinator",
+                    "-c",
+                    "user.email=evolith@local.invalid",
+                    "commit",
+                    "--no-gpg-sign",
+                    "-qm",
+                    f"evolith accepted layer {idx}",
+                ],
+                destination,
+            )
         return destination
 
     @staticmethod
@@ -137,7 +152,9 @@ class ZStepWorkspace:
         for line in numstat.splitlines():
             if not line.strip():
                 continue
-            added, deleted, _ = line.split("\t", 2)
+            added, deleted, file_path = line.split("\t", 2)
+            if file_path.startswith("worker/tests/"):
+                continue
             changed_lines += (0 if added == "-" else int(added)) + (
                 0 if deleted == "-" else int(deleted)
             )

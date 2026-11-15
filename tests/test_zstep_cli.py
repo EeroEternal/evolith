@@ -134,3 +134,47 @@ def test_zstep_campaigns_and_propose_only_flags(tmp_path: Path, monkeypatch) -> 
     assert captured_tasks[0].campaign == "t1-2"
     assert captured_tasks[0].propose_only is True
     assert "proposed" in res.stdout
+
+
+def test_zstep_submit_injects_patch_proposer(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    patch_file = tmp_path / "candidate.patch"
+    patch_file.write_text("diff --git a/x b/x\n", encoding="utf-8")
+
+    captured = {}
+
+    class FakeLoop:
+        def __init__(self, task, *, archive, proposer=None) -> None:
+            captured["task"] = task
+            captured["proposer"] = proposer
+
+        def run(self) -> list[object]:
+            from evolith.zstep.task import CandidateStatus
+
+            return [CandidateStatus.PROPOSED]
+
+    monkeypatch.setattr("evolith.zstep.loop.ZStepRSILoop", FakeLoop)
+    res = runner.invoke(
+        app,
+        [
+            "zstep-submit",
+            "--patch",
+            str(patch_file),
+            "--hypothesis",
+            "Device-resident decode + intermediate buckets",
+            "--niche-key",
+            "(plane=l2_scheduler,focus=dsv41_device_token_overlap)",
+            "--summary",
+            "int64 index_copy_ + buckets",
+            "--campaign",
+            "t1-1",
+            "--propose-only",
+        ],
+    )
+    assert res.exit_code == 0, res.stdout
+    assert captured["task"].max_generations == 1
+    assert captured["task"].campaign == "t1-1"
+    assert captured["task"].propose_only is True
+    assert captured["proposer"].patch_path == patch_file.resolve()
+    assert captured["proposer"].niche_key == "(plane=l2_scheduler,focus=dsv41_device_token_overlap)"
+    assert "proposed" in res.stdout

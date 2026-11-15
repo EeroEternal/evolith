@@ -265,6 +265,68 @@ def zstep_evolve_cmd(
         console.print(f"zstep candidate: {status.value}")
 
 
+@app.command("zstep-submit")
+def zstep_submit_cmd(
+    patch: str = typer.Option(..., "--patch", "-p", help="Path to unified git diff patch file."),
+    hypothesis: str = typer.Option(
+        ...,
+        "--hypothesis",
+        help="Mechanistic bottleneck & speedup hypothesis for lineage memory.",
+    ),
+    niche_key: str = typer.Option(
+        "(plane=auto,target=deepseek_v41)",
+        "--niche-key",
+        help="MAP-Elites / 2-Strike circuit breaker niche key.",
+    ),
+    summary: str = typer.Option(
+        "",
+        "--summary",
+        help="Concise summary of the code mutation.",
+    ),
+    source: str = typer.Option("~/github/zstep", "--source"),
+    host: str = typer.Option("10.23.51.33", "--host"),
+    user: str = typer.Option("node-user", "--user"),
+    local_timeout: int = typer.Option(1800, "--local-timeout", min=1),
+    campaign: str = typer.Option(
+        "none",
+        "--campaign",
+        "-c",
+        help="Target campaign ('none', 'auto', 't1-1', 't1-2', 't1-3', 't2-1', 't2-2').",
+    ),
+    propose_only: bool = typer.Option(
+        False,
+        "--propose-only",
+        help="Run Coordinator local/RedTeam/dispatch gates and freeze archives without remote SSH.",
+    ),
+) -> None:
+    """Submit a unified diff directly through Evolith's full Coordinator gates, screen, and 3-round verify."""
+    from evolith.zstep.archive import ZStepArchive
+    from evolith.zstep.loop import ZStepRSILoop
+    from evolith.zstep.proposer import PatchProposer
+    from evolith.zstep.task import ZStepRSITask
+
+    task = ZStepRSITask(
+        project_root=Path.cwd(),
+        source_repo=Path(source).expanduser().resolve(),
+        remote_host=host,
+        remote_user=user,
+        max_generations=1,
+        local_timeout_sec=local_timeout,
+        campaign=campaign,
+        propose_only=propose_only,
+    )
+    proposer = PatchProposer(
+        Path(patch),
+        hypothesis=hypothesis,
+        niche_key=niche_key,
+        patch_summary=summary,
+    )
+    with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
+        statuses = ZStepRSILoop(task, archive=archive, proposer=proposer).run()
+    for status in statuses:
+        console.print(f"zstep candidate: {status.value}")
+
+
 @app.command("zstep-campaigns")
 def zstep_campaigns_cmd() -> None:
     """List ROI-ranked zstep optimization campaigns and their 2-Strike circuit breaker status."""

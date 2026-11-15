@@ -22,6 +22,29 @@ _EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _summarize_failure_reason(raw: str, max_chars: int = 360) -> str:
+    """
+    Distills multi-kilobyte remote compiler/progress logs into a concise single-line
+    root cause preserving the exception/tail lines (full log stays in `failure.json`).
+    """
+    text = raw.strip()
+    if not text:
+        return "None"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) <= 2 and len(text) <= max_chars:
+        return " | ".join(lines)
+    head = lines[0].split(":", 1)[0].strip() if lines[0].startswith("Remote benchmark") else lines[0][:100]
+    tail_candidates: list[str] = []
+    for line in reversed(lines[1:]):
+        if line not in tail_candidates:
+            tail_candidates.append(line)
+        if len(tail_candidates) >= 3:
+            break
+    tail = " ; ".join(reversed(tail_candidates))
+    combined = f"{head}: {tail}" if tail and tail != head else head
+    return combined[:max_chars]
+
+
 class ZStepArchive:
     """
     Persistent zstep candidate archive integrated directly with Evolith's
@@ -216,7 +239,7 @@ class ZStepArchive:
         metric_delta = str(row["metric_delta"] or "").strip() or (
             f"geomean={gain:+.2%}" if gain else status.value
         )
-        failure_reason = str(row["failure_reason"] or "").strip() or "None"
+        failure_reason = _summarize_failure_reason(str(row["failure_reason"] or ""))
 
         node = LineageNode(
             node_id=str(row["candidate_id"]),
@@ -255,8 +278,11 @@ class ZStepArchive:
         net_gate_ratio: float | None = None,
         metric_delta: str | None = None,
     ) -> None:
+        compact_reason = (
+            _summarize_failure_reason(failure_reason) if failure_reason.strip() else ""
+        )
         fields = ["status = ?", "evidence_dir = ?", "failure_reason = ?"]
-        params: list[object] = [status.value, evidence_dir, failure_reason]
+        params: list[object] = [status.value, evidence_dir, compact_reason]
         if geomean_gain is not None:
             fields.append("geomean_gain = ?")
             params.append(geomean_gain)

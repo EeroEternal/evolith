@@ -6,7 +6,7 @@ import subprocess
 
 import pytest
 
-from evolith.zstep.proposer import KimiCodeProposer, parse_proposal_metadata
+from evolith.zstep.proposer import KimiCodeProposer, PatchProposer, parse_proposal_metadata
 from evolith.zstep.task import ZStepRSITask
 
 
@@ -115,3 +115,39 @@ def test_proposer_enforces_timeout(tmp_path: Path) -> None:
         KimiCodeProposer(make_task(tmp_path, local_timeout_sec=1), str(executable)).propose(
             candidate, "prompt", tmp_path / "evidence"
         )
+
+
+def test_patch_proposer_applies_unified_diff_and_emits_metadata(tmp_path: Path) -> None:
+    repo = tmp_path / "candidate"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    target = repo / "worker/zstep_worker/runtime_loop.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+
+    target.write_text("x = 2\n", encoding="utf-8")
+    diff_bytes = subprocess.run(
+        ["git", "diff"], cwd=repo, check=True, capture_output=True
+    ).stdout
+    subprocess.run(["git", "checkout", "--", "."], cwd=repo, check=True)
+
+    patch_file = tmp_path / "opt.patch"
+    patch_file.write_bytes(diff_bytes)
+
+    out = PatchProposer(
+        patch_file,
+        hypothesis="Overlap device tokens",
+        niche_key="(plane=l2_scheduler,focus=dsv41_device_token_overlap)",
+        patch_summary="Enable overlap",
+    ).propose(repo, "prompt body", tmp_path / "evidence")
+
+    assert target.read_text(encoding="utf-8") == "x = 2\n"
+    meta = parse_proposal_metadata(out)
+    assert meta.hypothesis == "Overlap device tokens"
+    assert meta.niche_key == "(plane=l2_scheduler,focus=dsv41_device_token_overlap)"
+    assert meta.patch_summary == "Enable overlap"
+    assert (tmp_path / "evidence/prompt.txt").read_text(encoding="utf-8") == "prompt body"

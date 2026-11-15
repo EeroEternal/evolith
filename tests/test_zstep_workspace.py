@@ -60,6 +60,15 @@ def test_candidate_is_isolated_and_patch_stack_is_replayed(tmp_path: Path) -> No
     assert (second / "worker/zstep_worker/runtime_loop.py").read_text() == "# candidate one\n"
     assert (source / "worker/zstep_worker/runtime_loop.py").read_text() == "# original\n"
 
+    # Verify incremental patch capture + sandbox replay on top of an accepted patch layer
+    with manager.isolated_proposer_sandbox(second) as sandbox2:
+        write(sandbox2 / "worker/zstep_worker/kernels_sm120/op.py", "# kernel two\n")
+        stats2 = manager.capture_patch_stats(sandbox2)
+    manager.apply_patch(second, stats2.patch)
+    assert stats2.changed_files == ("worker/zstep_worker/kernels_sm120/op.py",)
+    assert stats2.changed_lines == 2
+    assert (second / "worker/zstep_worker/kernels_sm120/op.py").read_text() == "# kernel two\n"
+
 
 def test_isolated_proposer_sandbox_lives_outside_project_root_and_classifies_l1(
     tmp_path: Path,

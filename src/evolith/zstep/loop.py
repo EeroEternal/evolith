@@ -154,14 +154,10 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
     def _run_screen_and_gate(
         self,
         candidate_id: str,
-        baseline_hash: str,
-        baseline_archive: Path,
+        baseline_screen: Path | None,
         candidate_archive: Path,
         evidence_dir: Path,
     ) -> None:
-        baseline_screen: Path | None = None
-        if hasattr(self.remote, "screen_baseline"):
-            baseline_screen = self.remote.screen_baseline(baseline_hash, baseline_archive)
         screen_metrics = self.remote.screen(candidate_id, candidate_archive, evidence_dir)
         screen_parity = evidence_dir / "screen-parity.json"
         has_parity = screen_parity.is_file()
@@ -347,12 +343,17 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     continue
                 stage = "preflight"
                 self.remote.preflight()
+                baseline_screen: Path | None = None
+                if hasattr(self.remote, "screen_baseline"):
+                    stage = "baseline_screen"
+                    baseline_screen = self.remote.screen_baseline(
+                        baseline_hash, baseline_archive
+                    )
                 stage = "screen"
                 self.archive.update_stage(candidate_id, "screen")
                 self._run_screen_and_gate(
                     candidate_id,
-                    baseline_hash,
-                    baseline_archive,
+                    baseline_screen,
                     candidate_archive,
                     evidence_dir,
                 )
@@ -379,7 +380,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     candidate_id, status, str(evidence_dir), str(error)
                 )
                 statuses.append(status)
-                if stage == "preflight":
+                if stage in {"preflight", "baseline_screen"}:
                     break
         return statuses
 
@@ -428,12 +429,17 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         try:
             self.remote.preflight()
             screen_metrics = evidence_dir / "screen-metrics.json"
-            stage = "screen"
             if not screen_metrics.is_file():
+                baseline_screen: Path | None = None
+                if hasattr(self.remote, "screen_baseline"):
+                    stage = "baseline_screen"
+                    baseline_screen = self.remote.screen_baseline(
+                        baseline_hash, baseline_archive
+                    )
+                stage = "screen"
                 self._run_screen_and_gate(
                     candidate_id,
-                    baseline_hash,
-                    baseline_archive,
+                    baseline_screen,
                     candidate_archive,
                     evidence_dir,
                 )

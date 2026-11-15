@@ -150,8 +150,14 @@ class ZStepRemoteRunner:
             f"--repeats {repeats} --bench-tiers \"{tiers}\" "
             f"--metrics-output /workspace/results/{metrics_name}\n"
         )
+        inner_cmd = (
+            'set -euo pipefail\n'
+            'trap \'chown -R "${HOST_UID}:${HOST_GID}" /workspace /fi-cache >/dev/null 2>&1 || true\' EXIT\n'
+            + greedy
+            + benchmark
+        )
         return f"""set -euo pipefail
-trap 'rm -rf {shlex.quote(overlay_dir)}' EXIT
+trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
 cd {shlex.quote(source_dir)}
 mkdir -p results
 if [ ! -x ./target/release/zstep ]; then
@@ -160,10 +166,11 @@ if [ ! -x ./target/release/zstep ]; then
 fi
 ./scripts/prepare_sm120_overlay.sh {shlex.quote(overlay_dir)}
 DOCKER_OVERLAY_ARGS=($(./scripts/prepare_sm120_overlay.sh --print-docker-args {shlex.quote(overlay_dir)}))
-docker run --rm --name {container_name} --gpus all --ipc=host --network=host --entrypoint bash \
-  -v "$PWD:/workspace" -v "{self.task.model_dir}:{self.task.model_dir}:ro" -w /workspace \
-  -e OMP_NUM_THREADS=1 -e NCCL_P2P_DISABLE=1 -e NCCL_P2P_LEVEL=LOC \
-  "${{DOCKER_OVERLAY_ARGS[@]}}" {self.task.image} -lc {shlex.quote(greedy + benchmark)}
+docker run --rm --name {container_name} --gpus all --ipc=host --network=host --entrypoint bash \\
+  -v "$PWD:/workspace" -v "{self.task.model_dir}:{self.task.model_dir}:ro" -w /workspace \\
+  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \\
+  -e OMP_NUM_THREADS=1 -e NCCL_P2P_DISABLE=1 -e NCCL_P2P_LEVEL=LOC \\
+  "${{DOCKER_OVERLAY_ARGS[@]}}" {self.task.image} -lc {shlex.quote(inner_cmd)}
 """
 
     def _remote_run(self, candidate_id: str, stage: str) -> str:

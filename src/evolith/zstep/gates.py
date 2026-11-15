@@ -39,6 +39,11 @@ def _discover_local_python_tests(candidate_dir: Path) -> list[str]:
     tests_root = candidate_dir / "worker/tests"
     if not tests_root.is_dir():
         return []
+    discovered = sorted(
+        f"worker/tests/{p.name}" for p in tests_root.glob("test_*.py") if p.is_file()
+    )
+    if discovered:
+        return discovered
     candidates = [
         "worker/tests/test_b12x_dsv41_lifecycle.py",
         "worker/tests/test_shm_layout_parity.py",
