@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import numpy as np
+import pytest
 
 from evolith.controller.archive import SteppingStonesArchive
 from evolith.controller.engine import EvolithRSIEngine
@@ -118,3 +118,47 @@ def test_full_dual_plane_evolution_and_ignition_report() -> None:
     text, ratio = archive.format_compressed_memory()
     assert "Hyp:" in text
     assert ratio > 2.0
+
+
+def test_sandbox_blocks_attribute_calls_unauthorized_imports_dunders_and_hangs() -> None:
+    from evolith.verifiers.kernel_sandbox import run_isolated_subprocess_probe
+
+    verifier = HardenedKernelVerifier()
+    spec = L1_KERNEL_TARGETS["fused_add_rmsnorm_fp8_quant"]
+
+    escape_attempts = [
+        # Dotted attribute chain (`os.system`) + unauthorized import
+        "import os\ndef kernel_fn(x, r, w, eps=1e-6):\n    os.system('echo pwned')\n    return x\n",
+        # Builtin `__import__` bypass
+        "def kernel_fn(x, r, w, eps=1e-6):\n    __import__('os').popen('id')\n    return x\n",
+        # Dunder class-hierarchy sandbox escape
+        "def kernel_fn(x, r, w, eps=1e-6):\n    cls = ().__class__.__bases__[0]\n    return x\n",
+        # NumPy filesystem I/O (`np.load` / `np.memmap`)
+        "import numpy as np\ndef kernel_fn(x, r, w, eps=1e-6):\n    np.save('/tmp/leak.npy', x)\n    return x\n",
+    ]
+    for bad_code in escape_attempts:
+        res = verifier.evaluate(
+            op_name="fused_add_rmsnorm_fp8_quant",
+            candidate_code=bad_code,
+            baseline_code=spec.baseline_code,
+        )
+        assert not res.is_valid
+        assert not res.passed_ast_gate
+        assert "Anti-Cheat Gate" in res.rejection_reason
+
+    sim = DreamTraceSimulator()
+    with pytest.raises(ValueError, match="Anti-Cheat Gate"):
+        sim.simulate(
+            "import subprocess\n"
+            "def propose_speculative_config(s, c, n): return (4, 0)\n"
+            "def compute_chunked_prefill_budget(s): return 2048\n"
+            "def score_kv_block_retention(*args, **kwargs): return 0.0\n"
+        )
+
+    ok_hang, hang_reason = run_isolated_subprocess_probe(
+        "def kernel_fn(x, r, w, eps=1e-6):\n    while True:\n        pass\n",
+        mode="l1_kernel",
+        timeout_sec=0.3,
+    )
+    assert not ok_hang
+    assert "timed out" in hang_reason

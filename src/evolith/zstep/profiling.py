@@ -299,8 +299,9 @@ def build_sm120_reflection_card(
             "with explicit cross-stream event synchronization is a major L2 lever.",
             "    3. Target real hot paths (>3% impact): device-resident decode + Engram window, "
             "segmented speculative draft/verify CUDAGraphs (`dspark`/`mtp`), "
-            "SM120 shape-bucket/AllReduce dispatch thresholds (note `shm_v5` beats `NCCL_LOC` by 1.19x-3.93x "
-            "across M=1..128 decode while `NCCL_LOC` beats `shm_v5` at M>256 large prefill), "
+            "SM120 shape-bucket/AllReduce dispatch thresholds (`shm_v5` with Stage-1 self-slice "
+            "direct HBM write covers <=3.75 MiB / M<=384 @ H=5120, while M>384 eager prefill/mixed "
+            "steps route to `NCCL_SHM_USE_CUDA_MEMCPY=1` + `NCCL_SHM_MEMCPY_MODE=3` + 6chx4MiB Xeon DDIO), "
             "or adaptive chunked-prefill token budgets.",
         ]
     )

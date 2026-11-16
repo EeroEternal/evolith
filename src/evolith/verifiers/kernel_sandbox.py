@@ -1,32 +1,358 @@
 from __future__ import annotations
 
 import ast
+import importlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 import time
-from typing import Callable
+from typing import Any, Callable
 import numpy as np
 
 from evolith.models import BottleneckClass, HardwareProfile, KernelEvalResult
 
 
-FORBIDDEN_IDENTIFIERS = {
-    "cudaStreamCreate",
-    "cudaStreamCreateWithFlags",
-    "subprocess",
-    "os.system",
-    "eval",
-    "exec",
-    "_STATIC_TENSOR_CACHE",
+FORBIDDEN_NAMES: frozenset[str] = frozenset(
+    {
+        "__import__",
+        "_STATIC_TENSOR_CACHE",
+        "breakpoint",
+        "builtins",
+        "compile",
+        "ctypes",
+        "cudaStreamCreate",
+        "cudaStreamCreateWithFlags",
+        "delattr",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "importlib",
+        "input",
+        "locals",
+        "open",
+        "os",
+        "pathlib",
+        "setattr",
+        "shutil",
+        "socket",
+        "subprocess",
+        "sys",
+        "vars",
+    }
+)
+
+FORBIDDEN_ATTRS: frozenset[str] = frozenset(
+    {
+        "cudaStreamCreate",
+        "cudaStreamCreateWithFlags",
+        "fork",
+        "fromfile",
+        "kill",
+        "load",
+        "loadtxt",
+        "memmap",
+        "open",
+        "popen",
+        "Popen",
+        "remove",
+        "rmdir",
+        "rmtree",
+        "run",
+        "save",
+        "savez",
+        "savez_compressed",
+        "savetxt",
+        "spawn",
+        "system",
+        "tofile",
+        "unlink",
+        "urlopen",
+    }
+)
+
+FORBIDDEN_DOTTED_CHAINS: frozenset[str] = frozenset(
+    {
+        "os.system",
+        "os.popen",
+        "subprocess.Popen",
+        "subprocess.run",
+        "subprocess.call",
+        "subprocess.check_output",
+    }
+)
+
+_SAFE_BUILTIN_SYMBOLS: dict[str, object] = {
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "bool": bool,
+    "dict": dict,
+    "enumerate": enumerate,
+    "Exception": Exception,
+    "float": float,
+    "int": int,
+    "isinstance": isinstance,
+    "len": len,
+    "list": list,
+    "max": max,
+    "min": min,
+    "pow": pow,
+    "range": range,
+    "round": round,
+    "RuntimeError": RuntimeError,
+    "set": set,
+    "sorted": sorted,
+    "str": str,
+    "sum": sum,
+    "tuple": tuple,
+    "TypeError": TypeError,
+    "ValueError": ValueError,
+    "zip": zip,
 }
+
+
+def _dotted_attr_chain(node: ast.AST) -> str | None:
+    parts: list[str] = []
+    cur: ast.AST = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def audit_sandboxed_python(
+    source_code: str,
+    *,
+    allowed_modules: frozenset[str],
+) -> tuple[bool, str]:
+    """
+    Static AST & anti-escape gate for untrusted candidate Python snippets.
+    Blocks module-level mutable state (memoization reward hacking), unauthorized
+    imports, forbidden names, dangerous attribute/dotted chains (`os.system`,
+    `np.load`/`np.memmap`), and dunder attribute introspection (`__subclasses__`).
+    """
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError as exc:
+        return False, f"SyntaxError: {exc}"
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and isinstance(
+                    node.value, (ast.Dict, ast.List, ast.Set, ast.Call)
+                ):
+                    return (
+                        False,
+                        f"Anti-Cheat Gate: Module-level mutable state '{target.id}' forbidden (Memoization Hack).",
+                    )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            return (
+                False,
+                f"Anti-Cheat Gate: Module-level mutable state '{node.target.id}' forbidden (Memoization Hack).",
+            )
+        elif isinstance(node, ast.Expr):
+            if not (isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+                return (
+                    False,
+                    "Anti-Cheat Gate: Top-level executable expressions are forbidden.",
+                )
+        elif not isinstance(node, (ast.FunctionDef, ast.Import, ast.ImportFrom)):
+            return (
+                False,
+                f"Anti-Cheat Gate: Disallowed top-level statement '{type(node).__name__}'.",
+            )
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            return False, "Anti-Cheat Gate: 'global'/'nonlocal' statement forbidden inside kernel."
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name not in allowed_modules:
+                    return (
+                        False,
+                        f"Anti-Cheat Gate: Import '{alias.name}' is not in sandbox allowlist {sorted(allowed_modules)}.",
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if node.level != 0 or mod not in allowed_modules:
+                return (
+                    False,
+                    f"Anti-Cheat Gate: Import from '{mod}' is not in sandbox allowlist {sorted(allowed_modules)}.",
+                )
+            for alias in node.names:
+                if alias.name == "*" or alias.name.startswith("_"):
+                    return (
+                        False,
+                        f"Anti-Cheat Gate: Disallowed symbol import '{alias.name}' from '{mod}'.",
+                    )
+        elif isinstance(node, ast.Name):
+            if node.id in FORBIDDEN_NAMES or (
+                node.id.startswith("__") and node.id.endswith("__")
+            ):
+                return False, f"Anti-Cheat Gate: Forbidden identifier '{node.id}'."
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("__") and node.attr.endswith("__"):
+                return (
+                    False,
+                    f"Anti-Cheat Gate: Dunder attribute access '{node.attr}' forbidden.",
+                )
+            chain = _dotted_attr_chain(node)
+            if chain and chain in FORBIDDEN_DOTTED_CHAINS:
+                return (
+                    False,
+                    f"Anti-Cheat Gate: Forbidden attribute call '{chain}'.",
+                )
+            if node.attr in FORBIDDEN_ATTRS:
+                return (
+                    False,
+                    f"Anti-Cheat Gate: Forbidden attribute '{node.attr}'.",
+                )
+
+    return True, "OK"
+
+
+def make_safe_builtins(allowed_modules: frozenset[str]) -> dict[str, object]:
+    def _safe_import(
+        name: str,
+        globals_: dict[str, Any] | None = None,
+        locals_: dict[str, Any] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> Any:
+        if level != 0 or name not in allowed_modules:
+            raise ImportError(f"Sandbox blocked import of '{name}'")
+        mod = importlib.import_module(name)
+        if not fromlist and "." in name:
+            return importlib.import_module(name.split(".", 1)[0])
+        return mod
+
+    return {**_SAFE_BUILTIN_SYMBOLS, "__import__": _safe_import}
+
+
+def run_isolated_subprocess_probe(
+    source_code: str,
+    *,
+    mode: str,
+    op_name: str = "",
+    timeout_sec: float = 5.0,
+) -> tuple[bool, str]:
+    """
+    Executes untrusted candidate source inside an isolated `-I` child Python process
+    with restricted `__builtins__` and a wall-clock timeout before any parent-process
+    evaluation occurs.
+    """
+    src_root = str(Path(__file__).resolve().parents[2])
+    payload = json.dumps({"source": source_code, "mode": mode, "op_name": op_name})
+    runner_script = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {src_root!r})\n"
+        "import numpy as np\n"
+        "from evolith.verifiers.kernel_sandbox import _subprocess_entry\n"
+        "_subprocess_entry(json.loads(sys.stdin.read()))\n"
+    )
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+    }
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-I", "-c", runner_script],
+            input=payload,
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Sandbox subprocess timed out after {timeout_sec:.1f}s"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        msg = detail[-1] if detail else f"exit code {proc.returncode}"
+        return False, f"Sandbox subprocess rejected candidate: {msg}"
+    return True, "OK"
+
+
+def _subprocess_entry(spec: dict[str, str]) -> None:
+    source = spec["source"]
+    mode = spec["mode"]
+    if mode == "l1_kernel":
+        allowed = frozenset({"numpy", "math"})
+        ok, reason = audit_sandboxed_python(source, allowed_modules=allowed)
+        if not ok:
+            raise RuntimeError(reason)
+        ns: dict[str, object] = {"__builtins__": make_safe_builtins(allowed)}
+        exec(compile(source, "<sandboxed_kernel>", "exec"), ns)
+        fn = ns.get("kernel_fn")
+        if not callable(fn):
+            raise ValueError("Source code must define a callable 'kernel_fn(...)'.")
+        rng = np.random.default_rng(0)
+        if spec.get("op_name") == "triattention_prerope_score":
+            args: tuple[np.ndarray, ...] = (
+                rng.standard_normal((2, 16, 64), dtype=np.float32),
+                rng.standard_normal((2, 64), dtype=np.float32),
+                rng.uniform(-0.1, 0.1, size=(128,)).astype(np.float32),
+            )
+        else:
+            args = (
+                rng.standard_normal((2, 64), dtype=np.float32),
+                rng.standard_normal((2, 64), dtype=np.float32),
+                rng.uniform(0.5, 1.5, size=(64,)).astype(np.float32),
+            )
+        _ = fn(*args)
+    elif mode == "l2_policy":
+        from evolith.planes.l2_policies import EngineStepState
+
+        allowed = frozenset({"math", "evolith.planes.l2_policies"})
+        ok, reason = audit_sandboxed_python(source, allowed_modules=allowed)
+        if not ok:
+            raise RuntimeError(reason)
+        ns = {"__builtins__": make_safe_builtins(allowed)}
+        exec(compile(source, "<sandboxed_l2_policy>", "exec"), ns)
+        state = EngineStepState(
+            running_decode_reqs=4,
+            waiting_prefill_tokens=512,
+            free_gpu_kv_blocks=1024,
+            total_gpu_kv_blocks=2048,
+            ema_draft_accept_len=3.5,
+            ema_tpot_ms=12.0,
+        )
+        for req_fn in (
+            "propose_speculative_config",
+            "compute_chunked_prefill_budget",
+            "score_kv_block_retention",
+        ):
+            if not callable(ns.get(req_fn)):
+                raise ValueError(f"Policy code missing callable '{req_fn}'.")
+        _ = ns["propose_speculative_config"](state, 2048, 4)  # type: ignore[operator]
+        _ = ns["compute_chunked_prefill_budget"](state)  # type: ignore[operator]
+        _ = ns["score_kv_block_retention"](1.0, 1024, 0.5, False, 0.0, 10.0)  # type: ignore[operator]
+    else:
+        raise ValueError(f"Unknown sandbox mode: {mode}")
 
 
 class HardenedKernelVerifier:
     """
-    4-Stage Hardened Micro-Kernel Verifier for Plane L1:
-      Stage 1: Static AST & Anti-Memoization Audit
+    Offline CPU Pedagogical & Unit-Test Micro-Kernel Verifier for Plane L1:
+      Stage 1: Static AST, Import Allowlist & Subprocess Isolation Audit
       Stage 2: Multi-Shape (Standard + Adversarial Prime Shapes) & Read-Only Input Checksum Gate
-      Stage 3: 32-Slot Ring-Buffer Memory Allocation + L2 Cache Flush Timing
-      Stage 4: Roofline / Nsight Hardware Counter Classification & Reflection Card Generation
+      Stage 3: Ring-Buffer Memory Allocation + Cache Scrub Timing
+      Stage 4: Analytic Roofline Cost-Model Classification & Reflection Card Generation
+
+    Note: Stage 4 uses an analytic byte/FLOP cost model for GPU-free demonstrations;
+    real GPU CUDA-Event / hardware-counter verification lives in `evolith.zstep`.
     """
+
+    ALLOWED_MODULES: frozenset[str] = frozenset({"numpy", "math"})
 
     def __init__(self, ring_buffer_slots: int = 16, timed_iters: int = 24) -> None:
         self.ring_buffer_slots = ring_buffer_slots
@@ -34,41 +360,24 @@ class HardenedKernelVerifier:
         self._l2_flush_buf = np.zeros((4 * 1024 * 1024,), dtype=np.uint8)
 
     def stage1_static_ast_gate(self, source_code: str) -> tuple[bool, str]:
-        try:
-            tree = ast.parse(source_code)
-        except SyntaxError as exc:
-            return False, f"SyntaxError: {exc}"
+        return audit_sandboxed_python(
+            source_code, allowed_modules=self.ALLOWED_MODULES
+        )
 
-        # Block module-level mutable caches (Memoization Reward Hacking)
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and isinstance(
-                        node.value, (ast.Dict, ast.List, ast.Set, ast.Call)
-                    ):
-                        return (
-                            False,
-                            f"Anti-Cheat Gate: Module-level mutable state '{target.id}' forbidden (Memoization Hack).",
-                        )
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Global):
-                return False, "Anti-Cheat Gate: 'global' statement forbidden inside kernel."
-            if isinstance(node, ast.Name) and node.id in FORBIDDEN_IDENTIFIERS:
-                return False, f"Anti-Cheat Gate: Forbidden identifier '{node.id}'."
-
-        return True, "OK"
-
-    @staticmethod
-    def _compile_kernel_fn(source_code: str) -> Callable:
-        namespace: dict[str, object] = {}
+    @classmethod
+    def _compile_kernel_fn(cls, source_code: str) -> Callable:
+        namespace: dict[str, object] = {
+            "__builtins__": make_safe_builtins(cls.ALLOWED_MODULES)
+        }
         exec(compile(source_code, "<evolved_kernel>", "exec"), namespace)
         fn = namespace.get("kernel_fn")
         if not callable(fn):
             raise ValueError("Source code must define a callable 'kernel_fn(...)'.")
         return fn
 
-    def _make_inputs(self, op_name: str, batch: int, dim: int, rng: np.random.Generator) -> tuple[np.ndarray, ...]:
+    def _make_inputs(
+        self, op_name: str, batch: int, dim: int, rng: np.random.Generator
+    ) -> tuple[np.ndarray, ...]:
         if op_name == "triattention_prerope_score":
             seq_len = dim
             head_dim = 64
@@ -76,11 +385,10 @@ class HardenedKernelVerifier:
             q = rng.standard_normal((batch, head_dim), dtype=np.float32)
             bias = rng.uniform(-0.1, 0.1, size=(128,)).astype(np.float32)
             return (k, q, bias)
-        else:
-            x = rng.standard_normal((batch, dim), dtype=np.float32)
-            res = rng.standard_normal((batch, dim), dtype=np.float32)
-            w = rng.uniform(0.5, 1.5, size=(dim,)).astype(np.float32)
-            return (x, res, w)
+        x = rng.standard_normal((batch, dim), dtype=np.float32)
+        res = rng.standard_normal((batch, dim), dtype=np.float32)
+        w = rng.uniform(0.5, 1.5, size=(dim,)).astype(np.float32)
+        return (x, res, w)
 
     def evaluate(
         self,
@@ -88,9 +396,15 @@ class HardenedKernelVerifier:
         candidate_code: str,
         baseline_code: str,
     ) -> KernelEvalResult:
-        loc = len([ln for ln in candidate_code.splitlines() if ln.strip() and not ln.strip().startswith("#")])
+        loc = len(
+            [
+                ln
+                for ln in candidate_code.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+        )
 
-        # Stage 1: Static AST & Anti-Cheat Gate
+        # Stage 1: Static AST + Isolated Subprocess Gate
         ok_ast, reason = self.stage1_static_ast_gate(candidate_code)
         if not ok_ast:
             return KernelEvalResult(
@@ -100,6 +414,19 @@ class HardenedKernelVerifier:
                 passed_anti_cheat_gate=False,
                 loc=loc,
                 rejection_reason=reason,
+            )
+
+        ok_sub, sub_reason = run_isolated_subprocess_probe(
+            candidate_code, mode="l1_kernel", op_name=op_name
+        )
+        if not ok_sub:
+            return KernelEvalResult(
+                op_name=op_name,
+                passed_ast_gate=True,
+                passed_correctness_gate=False,
+                passed_anti_cheat_gate=False,
+                loc=loc,
+                rejection_reason=sub_reason,
             )
 
         try:
@@ -158,7 +485,9 @@ class HardenedKernelVerifier:
                     rejection_reason=f"Shape mismatch: got {cand_out.shape}, expected {ref_out.shape}",
                 )
 
-            diff = float(np.max(np.abs(cand_out.astype(np.float64) - ref_out.astype(np.float64))))
+            diff = float(
+                np.max(np.abs(cand_out.astype(np.float64) - ref_out.astype(np.float64)))
+            )
             max_diff_overall = max(max_diff_overall, diff)
             flat_c = cand_out.astype(np.float64).ravel()
             flat_r = ref_out.astype(np.float64).ravel()
@@ -180,27 +509,27 @@ class HardenedKernelVerifier:
                     rejection_reason=f"Numerical mismatch on shape {(b, d)}: max_diff={diff:.4e}, cos={cos:.6f}",
                 )
 
-        # Stage 3 & 4: Ring-Buffer Timing & Hardware Bottleneck Profiling across buckets
+        # Stage 3 & 4: Ring-Buffer Timing & Analytic Roofline Classification across buckets
         buckets = [("batch_1", 1, 512), ("batch_4", 4, 512), ("batch_16", 16, 512)]
         profiles: dict[str, HardwareProfile] = {}
         cand_latencies = []
         base_latencies = []
 
         for label, b, d in buckets:
-            ring_inputs = [self._make_inputs(op_name, b, d, rng) for _ in range(self.ring_buffer_slots)]
-            # Warmup
+            ring_inputs = [
+                self._make_inputs(op_name, b, d, rng)
+                for _ in range(self.ring_buffer_slots)
+            ]
             for i in range(3):
                 _ = base_fn(*ring_inputs[i % self.ring_buffer_slots])
                 _ = cand_fn(*ring_inputs[i % self.ring_buffer_slots])
 
-            # Measure baseline with ring buffer + L2 cache scrub
             t0 = time.perf_counter_ns()
             for i in range(self.timed_iters):
                 self._l2_flush_buf[i % 1024] ^= 1
                 _ = base_fn(*ring_inputs[i % self.ring_buffer_slots])
             base_us = (time.perf_counter_ns() - t0) / (self.timed_iters * 1000.0)
 
-            # Measure candidate with ring buffer + L2 cache scrub
             t1 = time.perf_counter_ns()
             for i in range(self.timed_iters):
                 self._l2_flush_buf[i % 1024] ^= 1

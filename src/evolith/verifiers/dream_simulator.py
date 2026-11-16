@@ -6,6 +6,11 @@ import numpy as np
 
 from evolith.models import SimMetrics, WorstWindowEvent
 from evolith.planes.l2_policies import EngineStepState
+from evolith.verifiers.kernel_sandbox import (
+    audit_sandboxed_python,
+    make_safe_builtins,
+    run_isolated_subprocess_probe,
+)
 
 
 @dataclass
@@ -23,10 +28,16 @@ class AgentRequestTrace:
 
 class DreamTraceSimulator:
     """
-    L2/L3 Trace-Driven Discrete-Event Dream Simulator (inspired by Google Dream-RSI).
-    Replays multi-turn Coding Agent & RAG traces thousands of times faster than real-time
-    to evaluate candidate scheduler, speculative decoding, and KV retention policies.
+    Offline Analytic Trace-Driven L2 Pedagogical Simulator.
+    Replays synthetic multi-turn Coding Agent & RAG traces via an analytic queuing model
+    to unit-test GEPA AST crossover, Occam's Razor complexity gating, and MAP-Elites
+    archive behavior without requiring GPUs. Real GPU scheduler/kernel verification
+    lives in `evolith.zstep`.
     """
+
+    ALLOWED_MODULES: frozenset[str] = frozenset(
+        {"math", "evolith.planes.l2_policies"}
+    )
 
     def __init__(self, num_requests: int = 320, seed: int = 2026) -> None:
         self.num_requests = num_requests
@@ -67,9 +78,21 @@ class DreamTraceSimulator:
             )
         return traces
 
-    @staticmethod
-    def _compile_policy_module(source_code: str) -> dict[str, Callable]:
-        namespace: dict[str, object] = {}
+    @classmethod
+    def _compile_policy_module(cls, source_code: str) -> dict[str, Callable]:
+        ok_ast, reason = audit_sandboxed_python(
+            source_code, allowed_modules=cls.ALLOWED_MODULES
+        )
+        if not ok_ast:
+            raise ValueError(reason)
+        ok_sub, sub_reason = run_isolated_subprocess_probe(
+            source_code, mode="l2_policy"
+        )
+        if not ok_sub:
+            raise ValueError(sub_reason)
+        namespace: dict[str, object] = {
+            "__builtins__": make_safe_builtins(cls.ALLOWED_MODULES)
+        }
         exec(compile(source_code, "<evolved_l2_policy>", "exec"), namespace)
         required = (
             "propose_speculative_config",

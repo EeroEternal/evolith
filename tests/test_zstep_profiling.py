@@ -152,7 +152,7 @@ def test_reflection_card_extracts_full_subsystem_microbenches_overlap_and_frozen
     assert "T6:shm=5.23ms vs nccl=4.20ms" in card
     assert "overlap=450/500(90%)" in card
     assert "BLOCKED `(plane=l2_scheduler,focus=decode_h2d_pack)`" in card
-    assert "`shm_v5` beats `NCCL_LOC`" in card
+    assert "NCCL_SHM_MEMCPY_MODE=3" in card
 
 
 def test_reflection_card_diagnoses_high_tau_wallclock_divergence(

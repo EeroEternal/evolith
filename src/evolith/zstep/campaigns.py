@@ -230,7 +230,7 @@ def resolve_campaign(
         for spec in CAMPAIGNS:
             if spec.primary_niche_key not in blocked:
                 return spec
-        return CAMPAIGNS[0]
+        return None
     if key not in _CAMPAIGN_LOOKUP:
         valid = ", ".join(["auto", "none", *[c.campaign_id for c in CAMPAIGNS]])
         raise ValueError(f"Unknown campaign `{campaign_selector}`; valid options: {valid}")

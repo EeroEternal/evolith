@@ -45,6 +45,9 @@ def test_auto_campaign_fails_over_when_primary_niche_is_frozen() -> None:
     }
     assert resolve_campaign("auto", blocked_niches=blocked_t1_1_and_2) == campaigns[2]
 
+    all_blocked = {c.primary_niche_key: ["strike-1", "strike-2"] for c in campaigns}
+    assert resolve_campaign("auto", blocked_niches=all_blocked) is None
+
 
 def test_apply_campaign_to_task_narrows_allowed_roots_and_complexity_budget(
     tmp_path: Path,
