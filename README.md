@@ -243,10 +243,11 @@ then run `bash scripts/container.sh test -q /workspace/tests`.
   generations in eager mode, not production load, full logits, long contexts,
   SLO goodput or energy.
 - In `evolith.zstep`, `repeats=3` interleaved medians with `max_tier_cv <= 0.10`
-  bound run-to-run dispersion on idle GPUs, but `n=3` provides no formal
-  non-parametric confidence interval, synthetic fixed-length tiers (`in512_*`,
-  `in1024_*`) do not exercise multi-turn agent prefix eviction, and `accepted`
-  promotes an archive parent rather than approving production deployment.
+  bound run-to-run dispersion on idle GPUs (with paired per-round SE lower
+  confidence bounds via `compute_paired_round_stats`), `agent_replay` and
+  `perf_model` provide deterministic offline cache/NNLS step-time simulators
+  that do not replace live GPU verification, and `accepted` promotes an archive
+  parent rather than approving production deployment.
 - Model fingerprints cover config, index and shard sizes, not full weight
   contents. Treat artifacts as local trusted records, not signed attestations.
 - Worker processes isolate crashes/timeouts, **not hostile code**. The trusted

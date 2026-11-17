@@ -20,6 +20,7 @@ def test_campaigns_are_ordered_by_roi_priority_and_resolve_aliases() -> None:
         "T2-1",
         "T2-2",
         "T2-3",
+        "T2-4",
     ]
     assert resolve_campaign("none") is None
     assert resolve_campaign("t1-1") == campaigns[0]
@@ -27,6 +28,7 @@ def test_campaigns_are_ordered_by_roi_priority_and_resolve_aliases() -> None:
     assert resolve_campaign("T1-2") == campaigns[1]
     assert resolve_campaign("chunked-prefill") == campaigns[2]
     assert resolve_campaign("spec-decode") == campaigns[5]
+    assert resolve_campaign("agent-adaptive") == campaigns[6]
 
     with pytest.raises(ValueError, match="Unknown campaign"):
         resolve_campaign("t9-unknown")

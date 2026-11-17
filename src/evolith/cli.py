@@ -432,6 +432,22 @@ def zstep_submit_cmd(
         console.print(f"zstep candidate: {status.value}")
 
 
+def _detect_local_upstream_sha() -> str:
+    import subprocess
+
+    upstream_dir = Path.cwd() / "targets/zstep/upstream"
+    if not (upstream_dir / ".git").exists():
+        return ""
+    res = subprocess.run(
+        ["git", "rev-parse", "--short=7", "HEAD"],
+        cwd=upstream_dir,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
 @app.command("zstep-campaigns")
 def zstep_campaigns_cmd() -> None:
     """List ROI-ranked zstep optimization campaigns and their 2-Strike circuit breaker status."""
@@ -439,18 +455,20 @@ def zstep_campaigns_cmd() -> None:
     from evolith.zstep.campaigns import list_campaigns, resolve_campaign
 
     db_path = Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3"
+    upstream_sha = _detect_local_upstream_sha()
     blocked: dict[str, list[str]] = {}
     parent: str | None = None
     if db_path.is_file():
         with ZStepArchive(db_path) as archive:
-            parent = archive.current_parent()
+            parent = archive.current_parent(upstream_sha=upstream_sha)
             blocked = archive.blocked_niches(strike_limit=2, parent_id=parent)
 
+    parent_label = parent or (f"frozen@{upstream_sha}" if upstream_sha else "frozen-zstep-baseline")
     next_auto = resolve_campaign("auto", blocked)
     table = Table(
         title=(
             f"zstep ROI-Ranked Optimization Campaigns "
-            f"(parent: {markup_escape(str(parent or 'frozen-zstep-baseline'))}, "
+            f"(parent: {markup_escape(str(parent_label))}, "
             f"auto -> {next_auto.priority_rank if next_auto else 'exhausted'})"
         ),
         show_lines=True,
@@ -535,14 +553,16 @@ def zstep_status_cmd() -> None:
     """Show isolated zstep candidate lineage and the best verified baseline."""
     from evolith.zstep.archive import ZStepArchive
 
+    upstream_sha = _detect_local_upstream_sha()
     with ZStepArchive(Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3") as archive:
         entries = archive.list_candidates()
-        parent = archive.current_parent()
+        parent = archive.current_parent(upstream_sha=upstream_sha)
     if not entries:
         console.print("No zstep candidates recorded.")
         return
+    parent_label = parent or (f"frozen baseline ({upstream_sha})" if upstream_sha else "frozen baseline")
     table = Table(
-        title=f"zstep RSI (best verified parent: {markup_escape(str(parent or 'frozen baseline'))})"
+        title=f"zstep RSI (best verified parent: {markup_escape(str(parent_label))})"
     )
     table.add_column("Candidate", no_wrap=True)
     table.add_column("Parent", no_wrap=True)
@@ -592,6 +612,63 @@ def zstep_evidence_cmd(
     for ev in event_rows:
         line = f"[{ev['event_type']}] stage={ev['stage']} status={ev['status']} {ev['detail']}".rstrip()
         console.print(markup_escape(line))
+
+
+@app.command("zstep-probe")
+def zstep_probe_cmd(
+    script: str = typer.Option(..., "--script", "-s", help="Python operator/collective probe script."),
+    patch: str | None = typer.Option(None, "--patch", "-p", help="Optional unified git diff to apply before probing."),
+    output: str = typer.Option(
+        ".evolith/zstep-rsi/probes/latest-probe.json",
+        "--output",
+        "-o",
+        help="Local path to save downloaded JSON probe telemetry.",
+    ),
+    source: str = typer.Option("~/github/zstep", "--source"),
+    host: str | None = typer.Option(None, "--host", envvar="EVOLITH_ZSTEP_HOST"),
+    user: str | None = typer.Option(None, "--user", envvar="EVOLITH_ZSTEP_USER"),
+    baseline_sha: str | None = typer.Option(None, "--baseline-sha"),
+) -> None:
+    """Run a fast isolated 8-GPU microbenchmark probe without loading full 475 GiB model weights."""
+    import shutil
+    import subprocess
+    import tempfile
+    import uuid
+
+    from evolith.zstep.remote import ZStepRemoteRunner
+    from evolith.zstep.workspace import ZStepWorkspace
+
+    script_path = Path(script).expanduser().resolve()
+    if not script_path.is_file():
+        raise typer.BadParameter(f"Probe script not found: {script_path}")
+
+    task = _build_zstep_task(
+        source=source,
+        host=host,
+        user=user,
+        model_dir=None,
+        rustup_root=None,
+        baseline_sha=baseline_sha,
+        propose_only=False,
+        extra_fields={},
+    )
+    ws = ZStepWorkspace(task)
+    ws.prepare_upstream()
+    probe_id = f"probe-{uuid.uuid4().hex[:8]}"
+    with tempfile.TemporaryDirectory() as td:
+        tmp_dir = Path(td)
+        cand_dir = ws.create_candidate(probe_id, [])
+        try:
+            if patch:
+                patch_bytes = Path(patch).expanduser().resolve().read_bytes()
+                subprocess.run(["git", "apply", "-"], input=patch_bytes, cwd=cand_dir, check=True)
+            tar_path = ws.freeze_source(cand_dir, tmp_dir / "probe-src.tar.gz")
+        finally:
+            shutil.rmtree(cand_dir, ignore_errors=True)
+        out_path = ZStepRemoteRunner(task).run_probe(
+            probe_id, tar_path, script_path, Path(output).expanduser().resolve()
+        )
+    console.print(markup_escape(str(out_path)))
 
 
 register(app)

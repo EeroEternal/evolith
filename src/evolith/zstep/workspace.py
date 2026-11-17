@@ -50,6 +50,14 @@ class ZStepWorkspace:
             self.task.upstream_dir,
         )
 
+    def upstream_head_sha(self) -> str:
+        self.prepare_upstream()
+        return (
+            _run(["git", "rev-parse", "--short=7", "HEAD"], self.task.upstream_dir)
+            .stdout.decode("utf-8")
+            .strip()
+        )
+
     def create_candidate(self, candidate_id: str, accepted_patches: list[bytes]) -> Path:
         self.prepare_upstream()
         destination = self.task.candidates_dir / candidate_id
