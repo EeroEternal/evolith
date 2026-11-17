@@ -243,10 +243,12 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         ):
             raise RuntimeError("baseline source hash changed before verification")
         cand_row = self.archive.get_candidate(candidate_id)
-        if (cand_row.get("parent_id") or None) != self.archive.current_parent():
+        row_upstream = str(cand_row.get("upstream_sha") or "") or self._upstream_sha()
+        actual_parent = self.archive.current_parent(upstream_sha=row_upstream)
+        if (cand_row.get("parent_id") or None) != actual_parent:
             raise RuntimeError(
                 f"lineage parent advanced before accepting {candidate_id} "
-                f"(expected {cand_row.get('parent_id')}, got {self.archive.current_parent()})"
+                f"(expected {cand_row.get('parent_id')}, got {actual_parent})"
             )
         decision = evaluate_candidate(
             load_benchmark(baseline_json),
