@@ -1,10 +1,10 @@
 # Evolith
 
-**Measurement-first GPU inference optimization.** Evolith searches a bounded,
-trusted Triton parameter space, verifies candidates against an independent
-reference, and measures them against an optimized implementation before
-considering a runtime replacement. It does not claim recursive self-improvement
-from synthetic speedups.
+**Measurement-first GPU inference optimization.** Evolith searches bounded
+parameter and scoped source-mutation spaces, verifies candidates against
+independent references, and measures them against the current approved incumbent
+before considering a runtime replacement. It does not claim recursive
+self-improvement from synthetic speedups.
 
 The governing principle is **self-directed improvement**, not a permanent,
 human-chosen hotspot: observe the workload, choose a supported target, propose
@@ -28,7 +28,8 @@ Correctness and measurement gates are not evolvable rewards. See
   deterministic generated-token/logprob comparison, repeated AB/BA trials,
   observed fallback counters, and a separate end-to-end deployment gate.
 - **Model-guided iteration:** the local model can propose strict parameter JSON
-  for another search round. Model-generated Python is never executed.
+  for another search round. Model-generated Python is never executed in the
+  coordinator process.
 - **Autonomous controller:** `autoevolve` re-observes the running workload,
   chooses an exact contract by sampled cumulative cost and archived experience,
   avoids repeated configurations within a session, and continues within fixed
@@ -37,33 +38,42 @@ Correctness and measurement gates are not evolvable rewards. See
 - **Qwen Ultrafast:** `qwen-ultrafast` adds a remote Rust/CUDA adapter with a
   bounded BF16 GEMV block-size space, independent component checks, exact-token
   full-model AB/BA verification and successor-versus-incumbent promotion.
+- **zstep SM120 source adapter (`evolith.zstep`):** an isolated source-patch
+  adapter for [`zstep`](https://github.com/EeroEternal/zstep) (`DeepSeek-V4.1-Flash`
+  `TP=8` on `8× NVIDIA RTX 6000D` SM120) with SHA-256 spec-pinning, Red-Team and
+  isolated-subprocess dispatch checks, deterministic frozen tarballs, 2-tier
+  screen gating, and 3-round interleaved candidate-vs-incumbent verification
+  with per-tier CV (`<= 10%`), latency, and Occam complexity bounds.
 - **History:** unique run IDs, atomic JSON reports, source/environment metadata,
-  and append-only SQLite records. No result is replaced by a later run.
+  and append-only SQLite records (`candidate_events`). No result is silently
+  replaced by a later run.
 
 The first supported vLLM target is **Qwen3.5-27B BF16**. Qwen3.8-Flash-Next is
 supported only through the separate Qwen Ultrafast adapter, not the tested vLLM
-0.19 runtime. L2 runtime policy optimization, a calibrated trace simulator,
-arbitrary kernel generation and self-hosted acceleration remain future work.
+0.19 runtime. `DeepSeek-V4.1-Flash` (`TP=8` SM120) is supported through the
+`zstep-*` remote source adapter. Online L2 policy calibration and trace-replay
+benchmarks remain future work.
 
 ## CPU tests
 
 ```bash
 uv sync --extra dev
 uv run pytest -q
+uv run ruff check src tests
 ```
 
 GPU tests skip without CUDA/Triton. The old NumPy prototype remains available
 only through `demo-evolve`, `demo-verify-kernel`, `demo-dream-sim` and
 `demo-archive`. Its inferred hardware counters, synthetic goodput and ignition
-estimates are **not measured results** and cannot authorize the new adapter.
+estimates are **not measured results** and cannot authorize any GPU adapter.
 
 ## GPU runtime
 
-Use a CUDA runtime supporting RTX 5090 (SM120), PyTorch 2.10, Triton 3.6 and
-vLLM 0.19 on Linux Python 3.10–3.13 (tested: 3.12). Install into an isolated
-environment with `uv sync --extra gpu --python 3.12`, or
-use the container helper. The helper requires an existing compatible image and
-complete local model weights. It intentionally disables networking and downloads.
+Use a CUDA runtime supporting RTX 5090 / RTX 6000D (SM120), PyTorch 2.10,
+Triton 3.6 and vLLM 0.19 on Linux Python 3.10–3.13 (tested: 3.12). Install into
+an isolated environment with `uv sync --extra gpu --python 3.12`, or use the
+container helper. The helper requires an existing compatible image and complete
+local model weights. It intentionally disables networking and downloads.
 
 ```bash
 export EVOLITH_IMAGE=vllm/vllm-openai:v0.19.0
@@ -127,6 +137,43 @@ atomic JSON and append-only SQLite records. It does not deploy a winner or
 change the runtime default. This is not whole-engine observation or arbitrary
 Rust/CUDA source evolution; other operators require their own trusted
 benchmark and observation capability.
+
+### zstep remote source adapter
+
+`zstep-submit`, `zstep-evolve`, `zstep-resume`, `zstep-status`,
+`zstep-campaigns`, and `zstep-evidence` evaluate scoped Rust/CUDA/Python patches
+against [`zstep`](https://github.com/EeroEternal/zstep) (`DeepSeek-V4.1-Flash`
+`TP=8` on `8× NVIDIA RTX 6000D` SM120, container `vllm/vllm-openai:v0.31.0` with
+`--network=none --shm-size=32g`). Benchmark harnesses, wire structs, overlays,
+and reference fixtures are SHA-256 pinned (`spec-pins.json`) and excluded from
+`allowed_roots`.
+
+```bash
+uv run evolith zstep-submit \
+  --source /path/to/zstep \
+  --host gpu-server --user ubuntu \
+  --model-dir /models/DeepSeek-V4.1-Flash \
+  --baseline-sha 2bea5a1 --gpu-smoke \
+  --patch path/to/candidate.patch \
+  --niche-key "(plane=l1_kernel,focus=pxb_2slot_dualgrid)" \
+  --hypothesis "..." --summary "..."
+```
+
+Two recorded 8× RTX 6000D evaluation campaigns (3-round round-major interleaved
+medians, `max_tier_cv <= 0.10`, `prime_squares_table` `128/128` greedy parity at
+`chunk=24`, `triton_recompilations = 0`, no automatic upstream deployment):
+
+- **`g0008-67b2dd20` vs `zstep@596d4ef`** (non-P2P baseline, `182` LOC):
+  `+5.67%` 4-tier geomean (`net_gate = 1.0563`; `in512_c16 +7.37%`,
+  `in512_c128 +5.05%`, `in1024_c32 +6.01%`, `in1024_c128 +4.27%`).
+- **`g0003-b96b840f` vs `zstep@2bea5a1`** (CX8 PXB P2P baseline, `112` LOC,
+  ported in [`zstep#32`](https://github.com/EeroEternal/zstep/pull/32)):
+  `+3.72%` 4-tier geomean (`net_gate = 1.0372`; `in512_c16 +0.15%`,
+  `in1024_c32 +2.05%`, `in512_c128 +6.20%`, `in1024_c128 +6.64%`, `c32`/`c128`
+  median TTFT and P99 ITL `-11.4% ~ -11.7%`, per-tier CV `0.14%–1.03%`).
+
+See [zstep session lessons](docs/zstep-session-lessons.md) for failure modes and
+postmortems.
 
 ### Individual experimental stages
 
@@ -195,6 +242,11 @@ then run `bash scripts/container.sh test -q /workspace/tests`.
 - End-to-end tests currently cover six serialized, short deterministic text
   generations in eager mode, not production load, full logits, long contexts,
   SLO goodput or energy.
+- In `evolith.zstep`, `repeats=3` interleaved medians with `max_tier_cv <= 0.10`
+  bound run-to-run dispersion on idle GPUs, but `n=3` provides no formal
+  non-parametric confidence interval, synthetic fixed-length tiers (`in512_*`,
+  `in1024_*`) do not exercise multi-turn agent prefix eviction, and `accepted`
+  promotes an archive parent rather than approving production deployment.
 - Model fingerprints cover config, index and shard sizes, not full weight
   contents. Treat artifacts as local trusted records, not signed attestations.
 - Worker processes isolate crashes/timeouts, **not hostile code**. The trusted
@@ -205,4 +257,5 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the original research blueprint.
 That blueprint is aspirational, not a list of implemented capabilities.
 
 Actual first-machine results and reproduction commands:
-[2026-11-04 validation](docs/validation-2026-11-04.md).
+[2026-11-04 validation](docs/validation-2026-11-04.md) and
+[zstep SM120 lessons](docs/zstep-session-lessons.md).

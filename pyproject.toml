@@ -23,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "ruff>=0.8.0",
 ]
 gpu = [
     "torch==2.10.0; sys_platform == 'linux' and python_version < '3.14'",
@@ -39,3 +40,11 @@ packages = ["src/evolith"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+per-file-ignores = { "tests/*" = ["E402"] }

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 from rich.console import Console
+from rich.markup import escape as markup_escape
 from rich.panel import Panel
 from rich.table import Table
 
 from evolith.controller.archive import SteppingStonesArchive
 from evolith.controller.engine import EvolithRSIEngine
 from evolith.lab.cli import register
+from evolith.models import EvolutionPlane
 from evolith.planes.l1_kernels import L1_KERNEL_TARGETS
 from evolith.planes.l2_policies import BASELINE_L2_POLICY_CODE, L2_POLICY_MUTATIONS
 from evolith.verifiers.dream_simulator import DreamTraceSimulator
@@ -222,6 +226,372 @@ def archive_cmd(
             border_style="cyan",
         )
     )
+
+
+def _build_zstep_task(
+    *,
+    source: str,
+    host: str | None,
+    user: str | None,
+    model_dir: str | None,
+    rustup_root: str | None,
+    baseline_sha: str | None,
+    propose_only: bool,
+    extra_fields: dict[str, object],
+):
+    from evolith.zstep.task import ZStepRSITask
+
+    values: dict[str, object] = {
+        "project_root": Path.cwd(),
+        "source_repo": Path(source).expanduser().resolve(),
+        "propose_only": propose_only,
+    }
+    if host is not None:
+        values["remote_host"] = host
+    if user is not None:
+        values["remote_user"] = user
+    if model_dir is not None:
+        values["model_dir"] = model_dir
+    if rustup_root is not None:
+        values["remote_rustup_root"] = rustup_root
+    if baseline_sha is not None:
+        values["baseline_sha"] = baseline_sha
+    for key, val in extra_fields.items():
+        if val is not None:
+            values[key] = val
+    task = ZStepRSITask(**values)  # type: ignore[arg-type]
+    if not propose_only and not task.remote_host.strip():
+        raise typer.BadParameter(
+            "Remote GPU host is required unless --propose-only is set; "
+            "pass --host or set EVOLITH_ZSTEP_HOST."
+        )
+    return task
+
+
+@app.command("zstep-evolve")
+def zstep_evolve_cmd(
+    source: str = typer.Option("~/github/zstep", "--source"),
+    host: str | None = typer.Option(None, "--host", envvar="EVOLITH_ZSTEP_HOST"),
+    user: str | None = typer.Option(None, "--user", envvar="EVOLITH_ZSTEP_USER"),
+    model_dir: str | None = typer.Option(
+        None,
+        "--model-dir",
+        envvar="EVOLITH_ZSTEP_MODEL_DIR",
+        help="Remote model weights directory mounted read-only into benchmark containers.",
+    ),
+    rustup_root: str | None = typer.Option(
+        None,
+        "--rustup-root",
+        envvar="EVOLITH_ZSTEP_RUSTUP_ROOT",
+        help="Optional remote rustup installation prefix containing cargo/ and rustup/.",
+    ),
+    baseline_sha: str | None = typer.Option(None, "--baseline-sha"),
+    generations: int = typer.Option(1, "--generations", min=1, max=100),
+    local_timeout: int | None = typer.Option(None, "--local-timeout", min=1),
+    campaign: str = typer.Option(
+        "auto",
+        "--campaign",
+        "-c",
+        help="Target campaign ('auto', 'none', 't1-1', 't1-2', 't1-3', 't2-1', 't2-2', 't2-3').",
+    ),
+    propose_only: bool = typer.Option(
+        False,
+        "--propose-only",
+        help="Run proposer + local/RedTeam/dispatch gates and freeze archives without remote SSH.",
+    ),
+    proposer: str = typer.Option(
+        "kimi",
+        "--proposer",
+        help="Proposer backend: 'kimi' (CLI agent) or 'openai' (self-hosted zstep/Nebula OpenAI endpoint).",
+    ),
+    proposer_api_base: str | None = typer.Option(
+        None,
+        "--proposer-api-base",
+        help="OpenAI-compatible `/v1` base URL when `--proposer openai` is selected.",
+    ),
+    proposer_model: str | None = typer.Option(
+        None,
+        "--proposer-model",
+        help="Served model ID for `--proposer openai`.",
+    ),
+    gpu_smoke: bool = typer.Option(
+        False,
+        "--gpu-smoke",
+        help="Run fast container GPU smoke tests before full 475 GiB benchmark sweeps.",
+    ),
+) -> None:
+    """Run isolated zstep source evolution; no deployment or upstream commit occurs."""
+    from evolith.zstep.archive import ZStepArchive
+    from evolith.zstep.loop import ZStepRSILoop
+
+    task = _build_zstep_task(
+        source=source,
+        host=host,
+        user=user,
+        model_dir=model_dir,
+        rustup_root=rustup_root,
+        baseline_sha=baseline_sha,
+        propose_only=propose_only,
+        extra_fields={
+            "max_generations": generations,
+            "local_timeout_sec": local_timeout,
+            "campaign": campaign,
+            "proposer_backend": proposer,
+            "proposer_api_base": proposer_api_base,
+            "proposer_model": proposer_model,
+            "enable_gpu_smoke": gpu_smoke,
+        },
+    )
+    with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
+        statuses = ZStepRSILoop(task, archive=archive).run()
+    for status in statuses:
+        console.print(f"zstep candidate: {status.value}")
+
+
+@app.command("zstep-submit")
+def zstep_submit_cmd(
+    patch: str = typer.Option(..., "--patch", "-p", help="Path to unified git diff patch file."),
+    hypothesis: str = typer.Option(
+        ...,
+        "--hypothesis",
+        help="Mechanistic bottleneck & speedup hypothesis for lineage memory.",
+    ),
+    niche_key: str = typer.Option(
+        "(plane=auto,target=deepseek_v41)",
+        "--niche-key",
+        help="MAP-Elites / 2-Strike circuit breaker niche key.",
+    ),
+    summary: str = typer.Option(
+        "",
+        "--summary",
+        help="Concise summary of the code mutation.",
+    ),
+    source: str = typer.Option("~/github/zstep", "--source"),
+    host: str | None = typer.Option(None, "--host", envvar="EVOLITH_ZSTEP_HOST"),
+    user: str | None = typer.Option(None, "--user", envvar="EVOLITH_ZSTEP_USER"),
+    model_dir: str | None = typer.Option(
+        None,
+        "--model-dir",
+        envvar="EVOLITH_ZSTEP_MODEL_DIR",
+        help="Remote model weights directory mounted read-only into benchmark containers.",
+    ),
+    rustup_root: str | None = typer.Option(
+        None,
+        "--rustup-root",
+        envvar="EVOLITH_ZSTEP_RUSTUP_ROOT",
+        help="Optional remote rustup installation prefix containing cargo/ and rustup/.",
+    ),
+    baseline_sha: str | None = typer.Option(None, "--baseline-sha"),
+    local_timeout: int | None = typer.Option(None, "--local-timeout", min=1),
+    campaign: str = typer.Option(
+        "none",
+        "--campaign",
+        "-c",
+        help="Target campaign ('none', 'auto', 't1-1', 't1-2', 't1-3', 't2-1', 't2-2', 't2-3').",
+    ),
+    propose_only: bool = typer.Option(
+        False,
+        "--propose-only",
+        help="Run Coordinator local/RedTeam/dispatch gates and freeze archives without remote SSH.",
+    ),
+    gpu_smoke: bool = typer.Option(
+        False,
+        "--gpu-smoke",
+        help="Run fast container GPU smoke tests before full 475 GiB benchmark sweeps.",
+    ),
+) -> None:
+    """Submit a unified diff directly through Evolith's full Coordinator gates, screen, and 3-round verify."""
+    from evolith.zstep.archive import ZStepArchive
+    from evolith.zstep.loop import ZStepRSILoop
+    from evolith.zstep.proposer import PatchProposer
+
+    task = _build_zstep_task(
+        source=source,
+        host=host,
+        user=user,
+        model_dir=model_dir,
+        rustup_root=rustup_root,
+        baseline_sha=baseline_sha,
+        propose_only=propose_only,
+        extra_fields={
+            "max_generations": 1,
+            "local_timeout_sec": local_timeout,
+            "campaign": campaign,
+            "enable_gpu_smoke": gpu_smoke,
+        },
+    )
+    proposer = PatchProposer(
+        Path(patch),
+        hypothesis=hypothesis,
+        niche_key=niche_key,
+        patch_summary=summary,
+    )
+    with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
+        statuses = ZStepRSILoop(task, archive=archive, proposer=proposer).run()
+    for status in statuses:
+        console.print(f"zstep candidate: {status.value}")
+
+
+@app.command("zstep-campaigns")
+def zstep_campaigns_cmd() -> None:
+    """List ROI-ranked zstep optimization campaigns and their 2-Strike circuit breaker status."""
+    from evolith.zstep.archive import ZStepArchive
+    from evolith.zstep.campaigns import list_campaigns, resolve_campaign
+
+    db_path = Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3"
+    blocked: dict[str, list[str]] = {}
+    parent: str | None = None
+    if db_path.is_file():
+        with ZStepArchive(db_path) as archive:
+            parent = archive.current_parent()
+            blocked = archive.blocked_niches(strike_limit=2, parent_id=parent)
+
+    next_auto = resolve_campaign("auto", blocked)
+    table = Table(
+        title=(
+            f"zstep ROI-Ranked Optimization Campaigns "
+            f"(parent: {markup_escape(str(parent or 'frozen-zstep-baseline'))}, "
+            f"auto -> {next_auto.priority_rank if next_auto else 'exhausted'})"
+        ),
+        show_lines=True,
+    )
+    table.add_column("Rank", style="cyan", no_wrap=True)
+    table.add_column("Campaign ID", no_wrap=True)
+    table.add_column("Plane", no_wrap=True)
+    table.add_column("Expected Gain")
+    table.add_column("Status", justify="center", no_wrap=True)
+    table.add_column("Scoped Allowed Roots")
+
+    for spec in list_campaigns():
+        is_frozen = spec.primary_niche_key in blocked
+        if is_frozen:
+            status_cell = "[bold red]FROZEN (2-Strike)[/bold red]"
+        elif next_auto and spec.campaign_id == next_auto.campaign_id:
+            status_cell = "[bold green]NEXT (auto)[/bold green]"
+        else:
+            status_cell = "[green]READY[/green]"
+        plane_label = "L1 Kernel" if spec.plane == EvolutionPlane.L1_KERNEL else "L2 Scheduler"
+        table.add_row(
+            spec.priority_rank,
+            spec.campaign_id,
+            plane_label,
+            spec.expected_gain,
+            status_cell,
+            "\n".join(spec.allowed_roots),
+        )
+    console.print(table)
+
+
+@app.command("zstep-resume")
+def zstep_resume_cmd(
+    candidate_id: str,
+    source: str = typer.Option("~/github/zstep", "--source"),
+    host: str | None = typer.Option(None, "--host", envvar="EVOLITH_ZSTEP_HOST"),
+    user: str | None = typer.Option(None, "--user", envvar="EVOLITH_ZSTEP_USER"),
+    model_dir: str | None = typer.Option(
+        None,
+        "--model-dir",
+        envvar="EVOLITH_ZSTEP_MODEL_DIR",
+        help="Remote model weights directory mounted read-only into benchmark containers.",
+    ),
+    rustup_root: str | None = typer.Option(
+        None,
+        "--rustup-root",
+        envvar="EVOLITH_ZSTEP_RUSTUP_ROOT",
+        help="Optional remote rustup installation prefix containing cargo/ and rustup/.",
+    ),
+    baseline_sha: str | None = typer.Option(None, "--baseline-sha"),
+    gpu_smoke: bool = typer.Option(
+        False,
+        "--gpu-smoke",
+        help="Run fast container GPU smoke tests when resuming pre-screen candidates.",
+    ),
+) -> None:
+    """Resume an interrupted zstep candidate from frozen source archives and round checkpoints."""
+    from evolith.zstep.archive import ZStepArchive
+    from evolith.zstep.loop import ZStepRSILoop
+
+    task = _build_zstep_task(
+        source=source,
+        host=host,
+        user=user,
+        model_dir=model_dir,
+        rustup_root=rustup_root,
+        baseline_sha=baseline_sha,
+        propose_only=False,
+        extra_fields={"enable_gpu_smoke": gpu_smoke},
+    )
+    with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
+        try:
+            status = ZStepRSILoop(task, archive=archive).resume(candidate_id)
+        except KeyError:
+            console.print(f"Unknown zstep candidate: {markup_escape(candidate_id)}")
+            raise typer.Exit(code=1) from None
+    console.print(f"zstep candidate {markup_escape(candidate_id)}: {status.value}")
+
+
+@app.command("zstep-status")
+def zstep_status_cmd() -> None:
+    """Show isolated zstep candidate lineage and the best verified baseline."""
+    from evolith.zstep.archive import ZStepArchive
+
+    with ZStepArchive(Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3") as archive:
+        entries = archive.list_candidates()
+        parent = archive.current_parent()
+    if not entries:
+        console.print("No zstep candidates recorded.")
+        return
+    table = Table(
+        title=f"zstep RSI (best verified parent: {markup_escape(str(parent or 'frozen baseline'))})"
+    )
+    table.add_column("Candidate", no_wrap=True)
+    table.add_column("Parent", no_wrap=True)
+    table.add_column("LOC", justify="right", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Gain", justify="right", no_wrap=True)
+    table.add_column("Summary")
+    for entry in entries:
+        hyp = str(entry.get("hypothesis") or entry.get("patch_summary") or "")
+        detail = str(entry.get("failure_reason") or entry.get("metric_delta") or "")
+        plane_short = (
+            str(entry.get("plane") or "")
+            .replace("l1_kernel", "L1")
+            .replace("l2_scheduler", "L2")
+        )
+        prefix = f"[{plane_short}] " if plane_short else ""
+        summary = prefix + (f"{hyp} | {detail}".strip(" |") or "-")
+        table.add_row(
+            markup_escape(str(entry["candidate_id"])),
+            markup_escape(str(entry["parent_id"] or "-")),
+            str(entry.get("changed_lines") or 0),
+            markup_escape(str(entry["status"])),
+            f"{float(entry['geomean_gain']):.2%}",
+            markup_escape(summary[:120]),
+        )
+    console.print(table)
+
+
+@app.command("zstep-evidence")
+def zstep_evidence_cmd(
+    candidate_id: str,
+    events: bool = typer.Option(
+        False, "--events", help="Also print recorded lifecycle events for this candidate."
+    ),
+) -> None:
+    """Print the evidence directory (and optional event trail) for a zstep candidate."""
+    from evolith.zstep.archive import ZStepArchive
+
+    with ZStepArchive(Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3") as archive:
+        try:
+            evidence = archive.evidence_dir(candidate_id)
+        except KeyError:
+            console.print(f"Unknown zstep candidate: {markup_escape(candidate_id)}")
+            raise typer.Exit(code=1) from None
+        event_rows = archive.list_events(candidate_id) if events else []
+    console.print(markup_escape(str(evidence)))
+    for ev in event_rows:
+        line = f"[{ev['event_type']}] stage={ev['stage']} status={ev['status']} {ev['detail']}".rstrip()
+        console.print(markup_escape(line))
 
 
 register(app)

@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 from typing import Callable
 import numpy as np
 
 from evolith.models import SimMetrics, WorstWindowEvent
 from evolith.planes.l2_policies import EngineStepState
+from evolith.verifiers.kernel_sandbox import (
+    audit_sandboxed_python,
+    make_safe_builtins,
+)
 
 
 @dataclass
@@ -23,10 +32,16 @@ class AgentRequestTrace:
 
 class DreamTraceSimulator:
     """
-    L2/L3 Trace-Driven Discrete-Event Dream Simulator (inspired by Google Dream-RSI).
-    Replays multi-turn Coding Agent & RAG traces thousands of times faster than real-time
-    to evaluate candidate scheduler, speculative decoding, and KV retention policies.
+    Offline Analytic Trace-Driven L2 Pedagogical Simulator.
+    Replays synthetic multi-turn Coding Agent & RAG traces via an analytic queuing model
+    to unit-test GEPA AST crossover, Occam's Razor complexity gating, and MAP-Elites
+    archive behavior without requiring GPUs. Real GPU scheduler/kernel verification
+    lives in `evolith.zstep`.
     """
+
+    ALLOWED_MODULES: frozenset[str] = frozenset(
+        {"math", "evolith.planes.l2_policies"}
+    )
 
     def __init__(self, num_requests: int = 320, seed: int = 2026) -> None:
         self.num_requests = num_requests
@@ -67,9 +82,16 @@ class DreamTraceSimulator:
             )
         return traces
 
-    @staticmethod
-    def _compile_policy_module(source_code: str) -> dict[str, Callable]:
-        namespace: dict[str, object] = {}
+    @classmethod
+    def _compile_policy_module(cls, source_code: str) -> dict[str, Callable]:
+        ok_ast, reason = audit_sandboxed_python(
+            source_code, allowed_modules=cls.ALLOWED_MODULES
+        )
+        if not ok_ast:
+            raise ValueError(reason)
+        namespace: dict[str, object] = {
+            "__builtins__": make_safe_builtins(cls.ALLOWED_MODULES)
+        }
         exec(compile(source_code, "<evolved_l2_policy>", "exec"), namespace)
         required = (
             "propose_speculative_config",
@@ -84,7 +106,58 @@ class DreamTraceSimulator:
             funcs[name] = fn
         return funcs
 
-    def simulate(self, policy_source_code: str) -> SimMetrics:
+    def simulate(
+        self, policy_source_code: str, *, timeout_sec: float = 10.0
+    ) -> SimMetrics:
+        ok_ast, reason = audit_sandboxed_python(
+            policy_source_code, allowed_modules=self.ALLOWED_MODULES
+        )
+        if not ok_ast:
+            raise ValueError(reason)
+        src_root = str(Path(__file__).resolve().parents[2])
+        payload = json.dumps(
+            {
+                "source": policy_source_code,
+                "num_requests": self.num_requests,
+                "seed": self.seed,
+            }
+        )
+        runner_script = (
+            "import json, sys\n"
+            f"sys.path.insert(0, {src_root!r})\n"
+            "from evolith.verifiers.dream_simulator import DreamTraceSimulator\n"
+            "cfg = json.loads(sys.stdin.read())\n"
+            "sim = DreamTraceSimulator(num_requests=cfg['num_requests'], seed=cfg['seed'])\n"
+            "res = sim._simulate_in_process(cfg['source'])\n"
+            "sys.stdout.write(res.model_dump_json())\n"
+        )
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+        }
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-I", "-c", runner_script],
+                input=payload,
+                text=True,
+                capture_output=True,
+                timeout=timeout_sec,
+                env=env,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError(
+                f"Policy simulation timed out after {timeout_sec:.1f}s"
+            ) from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip().splitlines()
+            msg = detail[-1] if detail else f"exit code {proc.returncode}"
+            raise ValueError(f"Policy simulation failed in isolated subprocess: {msg}")
+        return SimMetrics.model_validate_json(proc.stdout)
+
+    def _simulate_in_process(self, policy_source_code: str) -> SimMetrics:
         funcs = self._compile_policy_module(policy_source_code)
         propose_spec = funcs["propose_speculative_config"]
         chunk_budget_fn = funcs["compute_chunked_prefill_budget"]

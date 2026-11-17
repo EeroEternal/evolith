@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import numpy as np
+import pytest
 
 from evolith.controller.archive import SteppingStonesArchive
 from evolith.controller.engine import EvolithRSIEngine
@@ -118,3 +118,84 @@ def test_full_dual_plane_evolution_and_ignition_report() -> None:
     text, ratio = archive.format_compressed_memory()
     assert "Hyp:" in text
     assert ratio > 2.0
+
+
+def test_sandbox_blocks_attribute_calls_unauthorized_imports_dunders_and_hangs() -> None:
+    verifier = HardenedKernelVerifier()
+    spec = L1_KERNEL_TARGETS["fused_add_rmsnorm_fp8_quant"]
+
+    escape_attempts = [
+        # Dotted attribute chain (`os.system`) + unauthorized import
+        "import os\ndef kernel_fn(x, r, w, eps=1e-6):\n    os.system('echo pwned')\n    return x\n",
+        # Builtin `__import__` bypass
+        "def kernel_fn(x, r, w, eps=1e-6):\n    __import__('os').popen('id')\n    return x\n",
+        # Dunder class-hierarchy sandbox escape
+        "def kernel_fn(x, r, w, eps=1e-6):\n    cls = ().__class__.__bases__[0]\n    return x\n",
+        # NumPy filesystem I/O (`np.save`)
+        "import numpy as np\ndef kernel_fn(x, r, w, eps=1e-6):\n    np.save('/tmp/leak.npy', x)\n    return x\n",
+    ]
+    for bad_code in escape_attempts:
+        res = verifier.evaluate(
+            op_name="fused_add_rmsnorm_fp8_quant",
+            candidate_code=bad_code,
+            baseline_code=spec.baseline_code,
+        )
+        assert not res.is_valid
+        assert not res.passed_ast_gate
+        assert "Anti-Cheat Gate" in res.rejection_reason
+
+    # `_SafeModuleProxy` runtime block on `from numpy import save`
+    res_from_np = verifier.evaluate(
+        op_name="fused_add_rmsnorm_fp8_quant",
+        candidate_code="from numpy import save\ndef kernel_fn(x, r, w, eps=1e-6):\n    save('/tmp/leak.npy', x)\n    return x\n",
+        baseline_code=spec.baseline_code,
+    )
+    assert not res_from_np.is_valid
+    assert "save" in res_from_np.rejection_reason
+
+    # Zero-sum input row swap mutation (`x[0], x[1] = x[1].copy(), x[0].copy()`) caught by exact array equality
+    swap_code = (
+        "import numpy as np\n"
+        + spec.baseline_code
+        + "\n_orig = kernel_fn\n"
+        "def kernel_fn(x, r, w, eps=1e-6):\n"
+        "    out = _orig(x, r, w, eps)\n"
+        "    if x.shape[0] >= 2:\n"
+        "        tmp = x[0].copy(); x[0] = x[1]; x[1] = tmp\n"
+        "    return out\n"
+    )
+    res_swap = verifier.evaluate(
+        op_name="fused_add_rmsnorm_fp8_quant",
+        candidate_code=swap_code,
+        baseline_code=spec.baseline_code,
+    )
+    assert not res_swap.is_valid
+    assert "in-place mutation of read-only input" in res_swap.rejection_reason.lower()
+
+    # Subprocess timeout via production `verifier.evaluate(..., timeout_sec=0.3)`
+    res_hang = verifier.evaluate(
+        op_name="fused_add_rmsnorm_fp8_quant",
+        candidate_code="def kernel_fn(x, r, w, eps=1e-6):\n    while True:\n        pass\n",
+        baseline_code=spec.baseline_code,
+        timeout_sec=0.3,
+    )
+    assert not res_hang.is_valid
+    assert "timed out" in res_hang.rejection_reason.lower()
+
+    sim = DreamTraceSimulator()
+    with pytest.raises(ValueError, match="Anti-Cheat Gate"):
+        sim.simulate(
+            "import subprocess\n"
+            "def propose_speculative_config(s, c, n): return (4, 0)\n"
+            "def compute_chunked_prefill_budget(s): return 2048\n"
+            "def score_kv_block_retention(*args, **kwargs): return 0.0\n"
+        )
+    with pytest.raises(ValueError, match="timed out"):
+        sim.simulate(
+            "def propose_speculative_config(s, c, n):\n"
+            "    while True:\n"
+            "        pass\n"
+            "def compute_chunked_prefill_budget(s): return 2048\n"
+            "def score_kv_block_retention(*args, **kwargs): return 0.0\n",
+            timeout_sec=0.3,
+        )
