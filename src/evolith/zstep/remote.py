@@ -38,7 +38,14 @@ class ZStepRemoteRunner:
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=timeout)
 
+    def _require_host(self) -> None:
+        if not self.task.remote_host.strip():
+            raise RemotePreflightError(
+                "remote_host is required for remote execution; pass --host or set EVOLITH_ZSTEP_HOST"
+            )
+
     def _ssh(self, args: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+        self._require_host()
         command = ["sshpass", "-e", "ssh"] if os.environ.get("SSHPASS") else ["ssh"]
         command.extend(["-o", "StrictHostKeyChecking=accept-new"])
         if not os.environ.get("SSHPASS"):
@@ -52,6 +59,7 @@ class ZStepRemoteRunner:
             raise RemoteInfraError(f"SSH transport failed: {exc}") from exc
 
     def _scp(self, source: str, destination: str) -> subprocess.CompletedProcess[str]:
+        self._require_host()
         command = ["sshpass", "-e", "scp"] if os.environ.get("SSHPASS") else ["scp"]
         command.extend(["-o", "StrictHostKeyChecking=accept-new"])
         if not os.environ.get("SSHPASS"):
@@ -163,11 +171,12 @@ class ZStepRemoteRunner:
         )
         inner_cmd = (
             'set -euo pipefail\n'
-            'trap \'chown -R "${HOST_UID}:${HOST_GID}" /workspace /fi-cache >/dev/null 2>&1 || true\' EXIT\n'
+            'trap \'rm -rf /dev/shm/zstep* >/dev/null 2>&1 || true; chown -R "${HOST_UID}:${HOST_GID}" /workspace /fi-cache >/dev/null 2>&1 || true\' EXIT\n'
             + greedy
             + benchmark
         )
         rustup_prefix = shlex.quote(self.task.remote_rustup_root.strip())
+        gpus_spec = shlex.quote(f"device={self.task.gpu_devices}")
         return f"""set -euo pipefail
 trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
 CUSTOM_RUSTUP_ROOT={rustup_prefix}
@@ -197,10 +206,11 @@ if [ ! -x ./target/release/zstep ]; then
 fi
 ./scripts/prepare_sm120_overlay.sh {shlex.quote(overlay_dir)}
 DOCKER_OVERLAY_ARGS=($(./scripts/prepare_sm120_overlay.sh --print-docker-args {shlex.quote(overlay_dir)}))
-docker run --rm --name {container_name} --gpus all --ipc=host --network=host --entrypoint bash \\
+docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
   -v "$PWD:/workspace" -v {quoted_model_mount} -w /workspace \\
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \\
-  -e OMP_NUM_THREADS=1 \\
+  -e OMP_NUM_THREADS=1 -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
+  -e VLLM_HOST_IP=127.0.0.1 -e NCCL_SOCKET_IFNAME=lo -e GLOO_SOCKET_IFNAME=lo \\
   "${{DOCKER_OVERLAY_ARGS[@]}}" {self.task.image} -lc {shlex.quote(inner_cmd)}
 """
 
@@ -227,7 +237,7 @@ docker run --rm --name {container_name} --gpus all --ipc=host --network=host --e
                     "bash",
                     "-lc",
                     f"docker rm -f {shlex.quote(container_name)} >/dev/null 2>&1 || true; "
-                    f"rm -rf {shlex.quote(f'/tmp/{container_name}-overlay')} /dev/shm/zstep* >/dev/null 2>&1 || true",
+                    f"rm -rf {shlex.quote(f'/tmp/{container_name}-overlay')} >/dev/null 2>&1 || true",
                 ],
                 timeout=30,
             )
@@ -238,21 +248,23 @@ docker run --rm --name {container_name} --gpus all --ipc=host --network=host --e
         container_name = self._container_name(source_dir, "gpu-smoke")
         overlay_dir = f"/tmp/{container_name}-overlay"
         test_args = " ".join(shlex.quote(t) for t in tests)
+        gpus_spec = shlex.quote(f"device={self.task.gpu_devices}")
         inner_cmd = (
             "set -euo pipefail\n"
-            'trap \'chown -R "${HOST_UID}:${HOST_GID}" /workspace >/dev/null 2>&1 || true\' EXIT\n'
+            'trap \'rm -rf /dev/shm/zstep* >/dev/null 2>&1 || true; chown -R "${HOST_UID}:${HOST_GID}" /workspace >/dev/null 2>&1 || true\' EXIT\n'
             "PYTHONPATH=/workspace/worker /usr/bin/python3 -m pytest -q -p no:cacheprovider "
             f"{test_args}\n"
         )
         return f"""set -euo pipefail
-trap 'rm -rf {shlex.quote(overlay_dir)} /dev/shm/zstep* >/dev/null 2>&1 || true' EXIT
+trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
 cd {shlex.quote(source_dir)}
 ./scripts/prepare_sm120_overlay.sh {shlex.quote(overlay_dir)}
 DOCKER_OVERLAY_ARGS=($(./scripts/prepare_sm120_overlay.sh --print-docker-args {shlex.quote(overlay_dir)}))
-docker run --rm --name {container_name} --gpus all --ipc=host --network=host --entrypoint bash \\
+docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
   -v "$PWD:/workspace" -w /workspace \\
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -e PYTHONDONTWRITEBYTECODE=1 \\
-  -e OMP_NUM_THREADS=1 \\
+  -e OMP_NUM_THREADS=1 -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
+  -e VLLM_HOST_IP=127.0.0.1 -e NCCL_SOCKET_IFNAME=lo -e GLOO_SOCKET_IFNAME=lo \\
   "${{DOCKER_OVERLAY_ARGS[@]}}" {self.task.image} -lc {shlex.quote(inner_cmd)}
 """
 
@@ -279,7 +291,7 @@ docker run --rm --name {container_name} --gpus all --ipc=host --network=host --e
                 raise
             if result.returncode:
                 self._cleanup_orphan_container(container_name)
-                detail = (result.stderr + result.stdout).strip()
+                detail = (result.stderr + result.stdout).strip()[-4000:]
                 err_cls = RemoteInfraError if result.returncode == 255 else RuntimeError
                 raise err_cls(f"Remote GPU smoke exited {result.returncode}: {detail}")
         finally:
@@ -303,7 +315,7 @@ docker run --rm --name {container_name} --gpus all --ipc=host --network=host --e
             raise
         if result.returncode:
             self._cleanup_orphan_container(container_name)
-            detail = (result.stderr + result.stdout).strip()
+            detail = (result.stderr + result.stdout).strip()[-4000:]
             err_cls = RemoteInfraError if result.returncode == 255 else RuntimeError
             raise err_cls(f"Remote benchmark exited {result.returncode}: {detail}")
 
@@ -316,10 +328,13 @@ docker run --rm --name {container_name} --gpus all --ipc=host --network=host --e
         return local_path
 
     def _cleanup_remote_stage(self, remote_stage: str, lock: str) -> None:
-        if self.task.keep_remote_stage:
-            self._ssh(["rmdir", lock], timeout=30)
-        else:
-            self._ssh(["rm", "-rf", remote_stage], timeout=60)
+        try:
+            if self.task.keep_remote_stage:
+                self._ssh(["rmdir", lock], timeout=30)
+            else:
+                self._ssh(["rm", "-rf", remote_stage], timeout=60)
+        except Exception:
+            pass
 
     def _cache_has_all_screen_tiers(self, path: Path) -> bool:
         expected = {
@@ -345,7 +360,6 @@ docker run --rm --name {container_name} --gpus all --ipc=host --network=host --e
         lock = f"{stage}/.lock"
         self._require_success(self._ssh(["mkdir", "-p", stage]), "create baseline screen stage")
         self._require_success(self._ssh(["mkdir", lock]), "acquire baseline screen lock")
-        succeeded = False
         try:
             source_dir = self._upload_and_extract(baseline_archive, stage)
             metrics_remote = f"{stage}/metrics.json"
@@ -353,20 +367,15 @@ docker run --rm --name {container_name} --gpus all --ipc=host --network=host --e
                 source_dir, metrics_remote, self.task.screen_tiers, 1, None
             )
             self._download(f"{source_dir}/results/metrics.json", cached)
-            succeeded = True
             return cached
         finally:
-            if succeeded:
-                self._cleanup_remote_stage(stage, lock)
-            else:
-                self._ssh(["rmdir", lock], timeout=30)
+            self._cleanup_remote_stage(stage, lock)
 
     def screen(self, candidate_id: str, source: Path, evidence: Path) -> Path:
         stage = self._remote_run(candidate_id, "screen")
         lock = f"{stage}/.lock"
         self._require_success(self._ssh(["mkdir", "-p", stage]), "create screen stage")
         self._require_success(self._ssh(["mkdir", lock]), "acquire screen lock")
-        succeeded = False
         try:
             source_dir = self._upload_and_extract(source, stage)
             metrics_remote = f"{stage}/metrics.json"
@@ -378,13 +387,9 @@ docker run --rm --name {container_name} --gpus all --ipc=host --network=host --e
             out = self._download(
                 f"{source_dir}/results/metrics.json", evidence / "screen-metrics.json"
             )
-            succeeded = True
             return out
         finally:
-            if succeeded:
-                self._cleanup_remote_stage(stage, lock)
-            else:
-                self._ssh(["rmdir", lock], timeout=30)
+            self._cleanup_remote_stage(stage, lock)
 
     @staticmethod
     def _load_valid_checkpoint(path: Path) -> list[dict[str, object]] | None:
@@ -411,7 +416,6 @@ docker run --rm --name {container_name} --gpus all --ipc=host --network=host --e
         self._require_success(self._ssh(["mkdir", "-p", stage]), "create verify stage")
         self._require_success(self._ssh(["mkdir", lock]), "acquire verify lock")
         parity_local = evidence / "verify-parity.json"
-        succeeded = False
         try:
             baseline_dir: str | None = None
             candidate_dir: str | None = None
@@ -479,10 +483,6 @@ docker run --rm --name {container_name} --gpus all --ipc=host --network=host --e
                 ),
                 encoding="utf-8",
             )
-            succeeded = True
             return candidate_metrics, baseline_metrics, parity_local
         finally:
-            if succeeded:
-                self._cleanup_remote_stage(stage, lock)
-            else:
-                self._ssh(["rmdir", lock], timeout=30)
+            self._cleanup_remote_stage(stage, lock)

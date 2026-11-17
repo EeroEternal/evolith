@@ -17,6 +17,7 @@ def make_task(tmp_path: Path, **overrides: object) -> ZStepRSITask:
     values: dict[str, object] = {
         "project_root": tmp_path,
         "source_repo": tmp_path / "source",
+        "remote_host": "gpu-test-host",
     }
     values.update(overrides)
     return ZStepRSITask(**values)  # type: ignore[arg-type]
@@ -344,3 +345,68 @@ def test_gpu_smoke_runs_fast_pytest_and_cleans_shm_on_failure(tmp_path: Path) ->
         runner.gpu_smoke("g0007-smoke", cand_tar)
 
     assert any("/dev/shm/zstep*" in c for c in calls)
+    assert any("--network=none" in c and "--shm-size=32g" in c for c in calls)
+
+
+def test_remote_runner_rejects_empty_host_and_cleans_stage_on_failed_screen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("EVOLITH_ZSTEP_HOST", raising=False)
+    empty_task = ZStepRSITask(project_root=tmp_path, source_repo=tmp_path / "source")
+    with pytest.raises(RemotePreflightError, match="remote_host is required"):
+        ZStepRemoteRunner(empty_task).preflight()
+
+    cand_tar = tmp_path / "cand.tar.gz"
+    cand_tar.write_bytes(b"tar")
+    calls: list[str] = []
+
+    def fail_bench(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        joined = " ".join(args)
+        calls.append(joined)
+        if "nvidia-smi" in joined:
+            return subprocess.CompletedProcess(
+                args, 0, "\n".join(f"{i}, 0 MiB" for i in range(8)) + "\n", ""
+            )
+        if "docker run" in joined:
+            return subprocess.CompletedProcess(args, 2, "", "cargo build failed" * 400)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    runner = ZStepRemoteRunner(make_task(tmp_path), executor=fail_bench)
+    with pytest.raises(RuntimeError) as exc_info:
+        runner.screen("g0009-fail", cand_tar, tmp_path / "ev")
+    assert len(str(exc_info.value)) <= 4100
+    assert any("rm -rf evolith-rsi/runs/g0009-fail/screen" in c for c in calls)
+
+
+def test_cli_zstep_status_escapes_rich_markup_and_requires_host_without_propose_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from typer.testing import CliRunner
+
+    from evolith.cli import app
+    from evolith.zstep.archive import ZStepArchive
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("EVOLITH_ZSTEP_HOST", raising=False)
+    cli_runner = CliRunner()
+
+    no_host = cli_runner.invoke(app, ["zstep-evolve", "--source", str(tmp_path)])
+    assert no_host.exit_code != 0
+    assert "EVOLITH_ZSTEP_HOST" in no_host.output
+
+    db_dir = tmp_path / ".evolith/zstep-rsi"
+    db_dir.mkdir(parents=True)
+    with ZStepArchive(db_dir / "archive.sqlite3") as archive:
+        archive.start_candidate(
+            "g0001-markup",
+            1,
+            None,
+            b"diff",
+            "a" * 64,
+            hypothesis="Crash on [/workspace] or [/] markup",
+            patch_summary="list[int]",
+            evidence_dir=str(tmp_path / "ev"),
+        )
+    ok = cli_runner.invoke(app, ["zstep-status"])
+    assert ok.exit_code == 0
+    assert "g0001-markup" in ok.output

@@ -83,9 +83,14 @@ class ZStepRSITask(BaseModel):
         default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_USER", "ubuntu")
     )
     remote_host: str = Field(
-        default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_HOST", "127.0.0.1")
+        default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_HOST", "")
     )
     remote_root: str = "evolith-rsi"
+    gpu_devices: str = Field(
+        default_factory=lambda: os.environ.get(
+            "EVOLITH_ZSTEP_GPUS", "0,1,2,3,4,5,6,7"
+        )
+    )
     remote_rustup_root: str = Field(
         default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_RUSTUP_ROOT", "")
     )

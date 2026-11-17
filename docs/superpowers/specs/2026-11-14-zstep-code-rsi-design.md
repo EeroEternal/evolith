@@ -4,14 +4,14 @@
 
 ## 目标
 
-为 Evolith 增加一个面向 `DeepSeek-V4.1-Flash`（`deepseek_v41`、TP=8、SM120）的源码级递归自我改进循环：Kimi CLI 在隔离的 zstep 候选源码中生成补丁，Evolith 在 `10.23.51.33` 的 8 × RTX 6000D 上执行真实筛选和独立复验，只有全部护栏通过的候选才能成为下一轮基线。
+为 Evolith 增加一个面向 `DeepSeek-V4.1-Flash`（`deepseek_v41`、TP=8、SM120）的源码级递归自我改进循环：Kimi CLI 在隔离的 zstep 候选源码中生成补丁，Evolith 在 `gpu-server` 的 8 × RTX 6000D 上执行真实筛选和独立复验，只有全部护栏通过的候选才能成为下一轮基线。
 
 本功能只生成实验结果、补丁和证据，不自动部署、不向上游推送、不修改模型权重。
 
 ## 已确认环境
 
 - 本地源仓库：`~/github/zstep`，当前 HEAD 为 `596d4ef`，工作区已有与本任务无关的文档改动，必须保持不动。
-- 远端：`node-user@10.23.51.33`，8 × RTX 6000D；开始设计时 8 卡均已空闲。
+- 远端：`ubuntu@gpu-server`，8 × RTX 6000D；开始设计时 8 卡均已空闲。
 - 模型 ID 为 `DeepSeek-V4.1-Flash`，宿主机模型目录为 `/data02/DeepSeek-V4.1-Flash-1017`（指向 `/data01/ds41/models/DeepSeek-V4.1-Flash`），已确认 `model_type=deepseek_v41`；先前 `:8000` 的 vLLM 服务已停止，不作为代码生成器或必需依赖。
 - 本机存在 `kimi -p`，用作非交互源码候选生成器。
 - zstep 已有真实权重 benchmark、`prime_squares_table` 贪心一致性审计和 Triton 零重编译检查，优先复用。

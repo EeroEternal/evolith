@@ -83,9 +83,9 @@ _TRANSIENT_ASYNC_H2D_RE = re.compile(
 _COPY_TRANSIENT_ASYNC_RE = re.compile(
     r"\.copy_\(\s*torch\.(?:tensor|as_tensor)\([^)]*\)\s*,\s*non_blocking\s*=\s*True"
 )
-_STREAM_CTOR_RE = re.compile(r"\b(?:torch\.)?cuda\.Stream\s*\(")
+_STREAM_CTOR_RE = re.compile(r"\b(?:torch\.cuda\.|cuda\.)?Stream\s*\(")
 _STREAM_SYNC_RE = re.compile(
-    r"\b(?:wait_stream|record_event|wait_event|cuda\.Event|torch\.cuda\.Event|synchronize)\b"
+    r"(?:\.\s*(?:wait_stream|record_event|wait_event|synchronize)\s*\(|\b(?:torch\.)?cuda\.(?:Event|synchronize)\s*\()"
 )
 _RUST_UNCHECKED_RE = re.compile(
     r"\b(?:get_unchecked|get_unchecked_mut|unreachable_unchecked|from_raw_parts|from_raw_parts_mut)\b"
@@ -94,17 +94,35 @@ _SPOOF_RECOMP_RE = re.compile(
     r"triton_recompilations\s*[:=]\s*(?:Some\(\s*0\s*\)|0\b)"
 )
 _DISABLE_GRAPH_SABOTAGE_RE = re.compile(
-    r"\b(?:use_cuda_graph\s*=\s*False|disable_cuda_graph\s*=\s*True|max_graph_bucket\s*=\s*0)\b"
+    r"\b(?:"
+    r"use_cuda_graph(?:\s*:\s*[^=\n]+)?\s*=\s*False\b|"
+    r"disable_cuda_graph(?:\s*:\s*[^=\n]+)?\s*=\s*True\b|"
+    r"max_graph_bucket(?:\s*:\s*[^=\n]+)?\s*=\s*(?:0\b|min\s*\(\s*0\b)"
+    r")"
 )
 _TORCH_WHERE_SCALAR_OUT_RE = re.compile(
     r"\bwhere\s*\([^;\n,]+,\s*(?:-?\d+(?:\.\d+)?\s*,\s*[^,\n]+|[^,\n]+,\s*-?\d+(?:\.\d+)?)\s*,\s*out\s*="
 )
-_INT32_INDEX_TENSORS_RE = re.compile(
-    r"\.(?:index_copy_|index_select)\s*\(\s*\d+\s*,\s*"
-    r"(?:self\.)?(?:comp_bt_gpu|out_tokens_gpu|slot_ids_gpu|input_ids_gpu)\b"
+_INT32_INDEX_COPY_RE = re.compile(
+    r"(?:\.index_copy_|\btorch\.index_copy_?)\s*\("
+    r"[^)\n]*\b(?:self\.)?(?:comp_bt_gpu|out_tokens_gpu|slot_ids_gpu|input_ids_gpu)\b"
     r"(?:\s*\[[^\]]*\])*"
     r"(?!\s*\[|\s*\.\s*(?:to\s*\(\s*(?:dtype\s*=\s*)?torch\.(?:int64|long)|long\s*\(\s*\)))"
 )
+
+
+def _strip_code_comments(lines: list[str], *, is_python: bool) -> str:
+    cleaned: list[str] = []
+    for line in lines:
+        if is_python:
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            line = re.sub(r"\s+#.*$", "", line)
+        else:
+            line = re.sub(r"//.*$", "", line)
+        cleaned.append(line)
+    return "\n".join(cleaned)
 _HOTPATH_FN_PREFIXES: tuple[str, ...] = (
     "execute",
     "_execute_step",
@@ -169,7 +187,8 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
     for file_path, added_lines in sorted(added_by_file.items()):
         if not added_lines or file_path.startswith("worker/tests/"):
             continue
-        joined = "\n".join(added_lines)
+        is_py = file_path.endswith(".py")
+        joined = _strip_code_comments(added_lines, is_python=is_py)
 
         # Anti-cheat: spoofing Triton recompilation counters or skipping greedy gates
         if _SPOOF_RECOMP_RE.search(joined) and (
@@ -209,19 +228,19 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
                 )
             )
 
-        # Category 1b: indices_offsets (PyTorch int32 index tensor passed to index_copy_/index_select, g0004)
-        if file_path.endswith(".py") and _INT32_INDEX_TENSORS_RE.search(joined):
+        # Category 1b: indices_offsets (PyTorch int32 index tensor passed to index_copy_, g0004)
+        if is_py and _INT32_INDEX_COPY_RE.search(joined):
             findings.append(
                 RedTeamFinding(
                     category="indices_offsets",
                     severity="blocking",
                     file_path=file_path,
-                    message="`index_copy_`/`index_select` called with `int32` device buffer without `.to(torch.int64)` / `.long()` cast (raises CUDA RuntimeError)",
+                    message="`index_copy_` called with `int32` device buffer without `.to(torch.int64)` / `.long()` cast (raises CUDA RuntimeError)",
                 )
             )
 
         # Category 2: value_ranges (PyTorch torch.where(..., out=...) scalar overload crash, g0005)
-        if file_path.endswith(".py") and _TORCH_WHERE_SCALAR_OUT_RE.search(joined):
+        if is_py and _TORCH_WHERE_SCALAR_OUT_RE.search(joined):
             findings.append(
                 RedTeamFinding(
                     category="value_ranges",
@@ -256,7 +275,7 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
                 )
 
         # Category 5: async_lifetime (ephemeral pageable tensor with non_blocking=True)
-        if file_path.endswith(".py") and (
+        if is_py and (
             _TRANSIENT_ASYNC_H2D_RE.search(joined)
             or _COPY_TRANSIENT_ASYNC_RE.search(joined)
         ):
@@ -270,7 +289,7 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
             )
 
         # Category 6: aliases_views (audit warning on raw stride views)
-        if file_path.endswith(".py") and "as_strided(" in joined:
+        if is_py and "as_strided(" in joined:
             findings.append(
                 RedTeamFinding(
                     category="aliases_views",
@@ -311,6 +330,39 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
     return findings
 
 
+def _python_ast_has_token_sync(src: str) -> tuple[bool, bool]:
+    """Return `(uses_device_tokens_flag, calls_cross_rank_sync)` via AST (ignoring comments)."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return ("STEP_FLAG_DEVICE_TOKENS" in src, False)
+    uses_flag = False
+    has_sync_call = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "STEP_FLAG_DEVICE_TOKENS":
+            uses_flag = True
+        elif isinstance(node, ast.Attribute) and node.attr == "STEP_FLAG_DEVICE_TOKENS":
+            uses_flag = True
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            attr_name = (
+                fn.attr
+                if isinstance(fn, ast.Attribute)
+                else (fn.id if isinstance(fn, ast.Name) else "")
+            )
+            if attr_name in {
+                "broadcast",
+                "all_gather",
+                "all_gather_into_tensor",
+                "all_reduce",
+            }:
+                for arg in [*node.args, *(kw.value for kw in node.keywords)]:
+                    arg_txt = ast.unparse(arg)
+                    if "out_tokens" in arg_txt or "token" in arg_txt:
+                        has_sync_call = True
+    return uses_flag, has_sync_call
+
+
 def _check_tp8_device_token_agreement(
     candidate_dir: Path, patch_stats: PatchStats
 ) -> list[RedTeamFinding]:
@@ -318,7 +370,7 @@ def _check_tp8_device_token_agreement(
     vstack Pillar 4 (Agreement): if `deepseek_v41.py` consumes `STEP_FLAG_DEVICE_TOKENS`
     from `out_tokens_gpu`, all 8 TP ranks must hold identical sampled tokens — either by
     removing the `if (rank == 0)` guard in `shm_allreduce.py`'s `tp8_argmax_gather_shm`
-    kernel or via an explicit cross-rank broadcast.
+    kernel or via an explicit cross-rank broadcast call on the token tensor.
     """
     dsv41_rel = "worker/zstep_worker/models/deepseek_v41.py"
     shm_rel = "worker/zstep_worker/kernels_sm120/shm_allreduce.py"
@@ -327,14 +379,15 @@ def _check_tp8_device_token_agreement(
     if not dsv41_path.is_file() or not shm_path.is_file():
         return []
     dsv41_src = dsv41_path.read_text(encoding="utf-8", errors="replace")
-    if "STEP_FLAG_DEVICE_TOKENS" not in dsv41_src:
-        return []
-    if "dist.broadcast" in dsv41_src or "all_gather" in dsv41_src:
+    uses_flag, has_sync_call = _python_ast_has_token_sync(dsv41_src)
+    if not uses_flag or has_sync_call:
         return []
     shm_src = shm_path.read_text(encoding="utf-8", errors="replace")
+    shm_no_comments = re.sub(r"//[^\n]*", "", shm_src)
+    shm_no_comments = re.sub(r"/\*.*?\*/", "", shm_no_comments, flags=re.DOTALL)
     if re.search(
         r"if\s*\(\s*rank\s*==\s*0\s*\)\s*\{[^}]*out_top2_tokens\[",
-        shm_src,
+        shm_no_comments,
         flags=re.DOTALL,
     ):
         return [

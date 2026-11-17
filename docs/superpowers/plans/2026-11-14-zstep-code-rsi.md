@@ -114,8 +114,8 @@ class ZStepRSITask(BaseModel):
     project_root: Path
     source_repo: Path
     baseline_sha: str = "596d4ef"
-    remote_user: str = "node-user"
-    remote_host: str = "10.23.51.33"
+    remote_user: str = "ubuntu"
+    remote_host: str = "gpu-server"
     remote_root: str = "evolith-rsi"
     model_dir: str = "/data02/DeepSeek-V4.1-Flash-1017"
     model_id: str = "DeepSeek-V4.1-Flash"
@@ -429,7 +429,7 @@ Expected: all parser and acceptance tests PASS.
 
 Assert that:
 
-- the SSH destination is `node-user@10.23.51.33`;
+- the SSH destination is `ubuntu@gpu-server`;
 - preflight runs `nvidia-smi --query-gpu=index,memory.used --format=csv,noheader` and rejects any row whose memory is nonzero;
 - `docker info` permission denial becomes a clear `RemotePreflightError` and does not invoke sudo;
 - screen and verify roots differ and include the candidate ID;
@@ -458,7 +458,7 @@ Run: `uv run pytest tests/test_zstep_remote.py -v`
 Expected: all unit tests PASS.
 
 Then invoke only `preflight()` through the new CLI or a short Python call.
-Expected at present: eight GPUs free, followed by explicit failure that `node-user` cannot access `/var/run/docker.sock`; no benchmark starts and sudo is not used.
+Expected at present: eight GPUs free, followed by explicit failure that `ubuntu` cannot access `/var/run/docker.sock`; no benchmark starts and sudo is not used.
 
 ### Task 7: RSI state machine
 
@@ -558,7 +558,7 @@ Expected: FAIL because the commands are missing.
 Add:
 
 ```text
-evolith zstep-evolve --source ~/github/zstep --host 10.23.51.33 --user node-user --generations 1
+evolith zstep-evolve --source ~/github/zstep --host gpu-server --user ubuntu --generations 1
 evolith zstep-status
 evolith zstep-evidence g0001-<suffix>
 ```

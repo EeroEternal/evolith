@@ -49,7 +49,8 @@ Path("invocation.json").write_text(json.dumps({
     "git_prompt": os.environ.get("GIT_TERMINAL_PROMPT"),
     "credentials": [key for key in os.environ if key in {
         "SSHPASS", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GIT_SSH_COMMAND",
-        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MY_TOKEN", "MY_SECRET"
+        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MY_TOKEN", "MY_SECRET",
+        "AWS_SECRET_ACCESS_KEY", "PGPASSWORD", "MYSQL_PWD", "DATABASE_URL",
     }],
 }))
 Path("worker/zstep_worker").mkdir(parents=True)
@@ -68,6 +69,10 @@ print("candidate ready")
         "ANTHROPIC_API_KEY",
         "MY_TOKEN",
         "MY_SECRET",
+        "AWS_SECRET_ACCESS_KEY",
+        "PGPASSWORD",
+        "MYSQL_PWD",
+        "DATABASE_URL",
     ):
         monkeypatch.setenv(name, "do-not-forward")
 
@@ -236,3 +241,34 @@ def test_openai_compatible_proposer_sends_apc_prefix_and_applies_diff(
     meta = parse_proposal_metadata(out)
     assert meta.hypothesis == "Self-hosted zstep proposal"
     assert extract_unified_diff(out).startswith(b"diff --git ")
+
+
+def test_extract_unified_diff_concatenates_multiple_blocks_and_preserves_inner_fences() -> None:
+    response = (
+        "Updating two files:\n"
+        "```diff\n"
+        "diff --git a/crates/zs-scheduler/src/lib.rs b/crates/zs-scheduler/src/lib.rs\n"
+        "--- a/crates/zs-scheduler/src/lib.rs\n"
+        "+++ b/crates/zs-scheduler/src/lib.rs\n"
+        "@@ -1,3 +1,5 @@\n"
+        " /// Example:\n"
+        "+/// ```rust\n"
+        "+/// let x = 1;\n"
+        " /// ```\n"
+        " pub fn f() {}\n"
+        "```\n"
+        "And worker:\n"
+        "```diff\n"
+        "diff --git a/worker/zstep_worker/runtime_loop.py b/worker/zstep_worker/runtime_loop.py\n"
+        "--- a/worker/zstep_worker/runtime_loop.py\n"
+        "+++ b/worker/zstep_worker/runtime_loop.py\n"
+        "@@ -1 +1 @@\n"
+        "-X = 1\n"
+        "+X = 2\n"
+        "```\n"
+    )
+    extracted = extract_unified_diff(response).decode("utf-8")
+    assert "diff --git a/crates/zs-scheduler/src/lib.rs" in extracted
+    assert "/// ```" in extracted
+    assert "diff --git a/worker/zstep_worker/runtime_loop.py" in extracted
+    assert "+X = 2" in extracted

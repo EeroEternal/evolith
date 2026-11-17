@@ -17,3 +17,7 @@ build/
 .evolith_archive.db
 targets/
 .worktrees/
+results/
+.ruff_cache/
+workloads/
+cache/

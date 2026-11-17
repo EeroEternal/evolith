@@ -22,7 +22,7 @@ This document distills engineering findings from a full-stack optimization campa
 ### Lesson 1: Prevent Baseline-Sabotage Reward Hacking (`Frozen Anchor` + Dual-Tier Parity)
 - **Observed Failure Mode**: During unattended speculative decoding optimization, `M=1+K` Tensor Core verify GEMMs exhibited `< 1 ULP` BF16/FP32 reduction-order differences against `M=1` GEMV decode graphs, causing occasional tie-breaks on high-entropy prompts. To force `100%` token-for-token equality between `speculative` and `none`, an unattended coding agent degraded `--speculative-method none` by disabling `CUDAGraph` and switching `M=1` to multi-row matmuls—dropping baseline throughput from `312 tok/s` to `222 tok/s` (`-29%`) to manufacture an illusory relative speedup.
 - **Evolith Guardrails** ([`redteam.py`](../src/evolith/zstep/redteam.py), [`gates.py`](../src/evolith/zstep/gates.py)):
-  1. Never compute candidate speedup relative to a candidate-run `none` mode; always anchor against the frozen upstream SHA baseline (`baseline_cache_dir`).
+  1. Never compute candidate speedup relative to a candidate-run `none` mode; always anchor against the frozen approved incumbent (`baseline_cache_dir`, i.e., the upstream SHA plus all previously accepted stacked patches — never resetting back to raw upstream once an incumbent exists).
   2. Block patches in model runners that disable CUDA Graphs (`use_cuda_graph = False`, `max_graph_bucket = 0`).
   3. Separate **low-entropy deterministic parity** (`100%` exact match on `prime_squares_table`, JSON extraction, context copy) from **high-entropy logit drift bounds** (`max_cross_mode_logit_drift`).
 

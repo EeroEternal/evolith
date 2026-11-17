@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "evolith"
 version = "0.1.0"
-description = "Recursive Self-Improvement (RSI) Engine for LLM Inference Kernels, Runtime Schedulers & Cluster Routing"
+description = "Measured GPU inference optimization with independent correctness and promotion gates"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -23,6 +23,12 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "ruff>=0.8.0",
+]
+gpu = [
+    "torch==2.10.0; sys_platform == 'linux' and python_version < '3.14'",
+    "triton==3.6.0; sys_platform == 'linux' and python_version < '3.14'",
+    "vllm==0.19.0; sys_platform == 'linux' and python_version < '3.14'",
 ]
 
 [project.scripts]
@@ -34,3 +40,11 @@ packages = ["src/evolith"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+per-file-ignores = { "tests/*" = ["E402"] }

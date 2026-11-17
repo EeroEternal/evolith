@@ -57,7 +57,7 @@ def test_reflection_card_extracts_sm120_operator_and_screen_telemetry(
     assert "NVIDIA RTX 6000D" in card
     assert "fused_wqa_wkv" in card
     assert "in512_c1: out=88.7 tok/s" in card
-    assert "CUDA Graph replay" in card
+    assert "Coordinator Contract Reminders" in card
 
 
 def test_reflection_card_extracts_full_subsystem_microbenches_overlap_and_frozen_niches(
@@ -152,7 +152,7 @@ def test_reflection_card_extracts_full_subsystem_microbenches_overlap_and_frozen
     assert "T6:shm=5.23ms vs nccl=4.20ms" in card
     assert "overlap=450/500(90%)" in card
     assert "BLOCKED `(plane=l2_scheduler,focus=decode_h2d_pack)`" in card
-    assert "NCCL_SHM_MEMCPY_MODE=3" in card
+    assert "measured telemetry above" in card
 
 
 def test_reflection_card_diagnoses_high_tau_wallclock_divergence(

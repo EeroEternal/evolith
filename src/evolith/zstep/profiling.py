@@ -290,19 +290,11 @@ def build_sm120_reflection_card(
 
     lines.extend(
         [
-            "  - Architectural Reality Check (Avoid Dead-End Mutations):",
-            "    1. Decode steps<=max_graph_bucket execute via captured CUDA Graph replay; "
-            "packing tiny host H2D/D2H metadata copies or changing Python object allocations "
-            "inside capture-only paths yields <0.2% end-to-end gain.",
-            "    2. `crates/zs-server/src/lib.rs` (pinned) already enables `device_token_overlap`; "
-            "keep decode token/Engram state device-resident inside `deepseek_v41.py` with explicit "
-            "cross-stream event synchronization and never edit pinned `lib.rs`.",
-            "    3. Target real hot paths (>3% impact): hybrid CX8 PXB-IPC + Host-SHM collectives "
-            "(`shm_v5_pxb` in `shm_allreduce.py` + `NCCL_SHM_MEMCPY_MODE=3` on large transfers), "
-            "segmented speculative draft/verify CUDAGraphs (`dspark`), "
-            "SM120 shape-bucket/AllReduce/AllGather dispatch thresholds (`ZSTEP_SHM_MAX_AR_NUMEL`, "
-            "`ZSTEP_SHM_MAX_AG_NUMEL`, `DEFAULT_MEGA_GATE_MIN_TOKENS`), "
-            "or adaptive chunked-prefill token budgets.",
+            "  - Coordinator Contract Reminders:",
+            "    1. Let measured telemetry above choose optimization targets rather than assuming a static shape hotspot.",
+            "    2. Never modify coordinator-pinned files (`crates/zs-server/src/lib.rs`, `crates/zs-wire/src/lib.rs`, "
+            "`worker/zstep_worker/shm_bridge.py`, `worker/tests/test_shm_layout_parity.py`, reference JSONs).",
+            "    3. Keep GPU tensor operations free of host `.item()`/`.cpu()`/`.tolist()` syncs on hot execution paths.",
         ]
     )
     return "\n".join(lines)

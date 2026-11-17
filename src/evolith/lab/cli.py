@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Annotated
+
+import typer
+
+from evolith.lab.contracts import refusal
+from evolith.lab.store import RunStore
+
+
+def emit(value: dict) -> None:
+    typer.echo(json.dumps(value, indent=2, allow_nan=False))
+
+
+def register(app: typer.Typer) -> None:
+    @app.command("autoevolve")
+    def autoevolve(
+        model_path: Annotated[Path, typer.Option(exists=True, file_okay=False)],
+        output: Annotated[Path, typer.Option()] = Path("results"),
+        workload: Annotated[Path | None, typer.Option(exists=True, dir_okay=False)] = None,
+        cycles: Annotated[int, typer.Option(min=1, max=8)] = 3,
+        evaluation_budget: Annotated[int, typer.Option(min=2, max=128)] = 32,
+        time_budget: Annotated[int, typer.Option(min=30, max=7200)] = 1800,
+        candidates_per_cycle: Annotated[int, typer.Option(min=1, max=12)] = 4,
+        tensor_parallel: Annotated[int, typer.Option(min=1, max=8)] = 4,
+        max_tokens: Annotated[int, typer.Option(min=1, max=256)] = 16,
+        rounds: Annotated[int, typer.Option(min=5, max=101)] = 19,
+        iterations: Annotated[int, typer.Option(min=1, max=1000)] = 128,
+        seed: Annotated[int, typer.Option(min=0)] = 2026,
+    ):
+        """Observe, choose targets, propose, verify and iterate within immutable budgets."""
+        try:
+            from evolith.lab.autonomy import Budget, run
+            result = run(
+                model_path, output, budget=Budget(
+                    cycles=cycles, evaluations=evaluation_budget, seconds=time_budget,
+                    candidates_per_cycle=candidates_per_cycle,
+                ), tensor_parallel=tensor_parallel, max_tokens=max_tokens, workload=workload,
+                rounds=rounds, iterations=iterations, seed=seed,
+            )
+            emit(result)
+        except (ImportError, RuntimeError, ValueError, TypeError, OSError) as exc:
+            emit(refusal(str(exc)))
+            raise typer.Exit(2) from exc
+
+    @app.command("qwen-ultrafast")
+    def qwen_ultrafast(
+        remote: Annotated[str, typer.Option(help="SSH destination, for example user@host.")],
+        local_repo: Annotated[Path, typer.Option(exists=True, file_okay=False)],
+        remote_repo: Annotated[Path, typer.Option()],
+        nccl_library: Annotated[Path, typer.Option()],
+        output: Annotated[Path, typer.Option()] = Path("results"),
+        port: Annotated[int, typer.Option(min=1, max=65535)] = 22,
+        model: Annotated[str, typer.Option()] = "models/Qwen3.8-Flash-Next-NVFP4",
+        control_path: Annotated[Path | None, typer.Option()] = None,
+        candidates: Annotated[str, typer.Option(help="Comma-separated GEMV block sizes.")] = "64,256,512",
+        incumbent: Annotated[int, typer.Option()] = 128,
+        decode: Annotated[int, typer.Option(min=8, max=256)] = 64,
+        rounds: Annotated[int, typer.Option(min=5, max=101)] = 19,
+        iterations: Annotated[int, typer.Option(min=1, max=1000)] = 128,
+        model_pairs: Annotated[int, typer.Option(min=5, max=19)] = 5,
+        time_budget: Annotated[int, typer.Option(min=60, max=7200)] = 7200,
+    ):
+        """Search bounded Qwen Ultrafast GEMV configs and verify them on eight GPUs."""
+        try:
+            from evolith.lab.qwen_ultrafast import QwenAdapterConfig, QwenUltrafastAdapter
+            adapter = QwenUltrafastAdapter(QwenAdapterConfig(
+                remote=remote, port=port, local_repo=local_repo, remote_repo=remote_repo,
+                nccl_library=nccl_library, output=output, control_path=control_path,
+                model=model, decode=decode, rounds=rounds, iterations=iterations,
+                model_pairs=model_pairs, seconds=time_budget,
+            ))
+            result = adapter.run([int(value) for value in candidates.split(",")], incumbent)
+            emit(result)
+        except (ImportError, RuntimeError, ValueError, TypeError, OSError) as exc:
+            emit(refusal(str(exc)))
+            raise typer.Exit(2) from exc
+
+    @app.command("doctor")
+    def doctor(
+        model_path: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
+    ):
+        """Inspect actual CUDA hardware/runtime and optional local model compatibility."""
+        try:
+            from evolith.lab.gpu import environment, model_info
+            report = environment()
+            if model_path is not None:
+                report["model"] = model_info(model_path)
+            emit(report)
+            if not report["cuda_available"]:
+                raise typer.Exit(2)
+        except typer.Exit:
+            raise
+        except (ImportError, RuntimeError, ValueError, TypeError, OSError) as exc:
+            emit(refusal(str(exc)))
+            raise typer.Exit(2) from exc
+
+    @app.command("evolve")
+    def evolve(
+        model_path: Annotated[Path, typer.Option(exists=True, file_okay=False)],
+        output: Annotated[Path, typer.Option()] = Path("results"),
+        rows: Annotated[str, typer.Option(help="Exact row counts; no implicit bucket widening.")] = "1,4,16,64",
+        proposals: Annotated[Path | None, typer.Option(exists=True, dir_okay=False)] = None,
+        rounds: Annotated[int, typer.Option(min=5, max=101)] = 11,
+        iterations: Annotated[int, typer.Option(min=1, max=1000)] = 32,
+        seed: Annotated[int, typer.Option(min=0)] = 2026,
+        min_gain: Annotated[float, typer.Option(min=0, max=0.99)] = 0.03,
+        worker_timeout: Annotated[int, typer.Option(min=5)] = 300,
+    ):
+        """Search trusted Triton parameters, independently verify and measure each finalist."""
+        try:
+            from evolith.lab.search import search
+            result = search(
+                model_path, output, [int(n) for n in rows.split(",")],
+                proposals=proposals, rounds=rounds, iterations=iterations,
+                seed=seed, min_gain=min_gain, worker_timeout=worker_timeout,
+            )
+            emit(result)
+            if result["status"] == "failed":
+                raise typer.Exit(2)
+        except typer.Exit:
+            raise
+        except (ImportError, RuntimeError, ValueError, TypeError, OSError) as exc:
+            emit(refusal(str(exc)))
+            raise typer.Exit(2) from exc
+
+    @app.command("verify-model")
+    def verify_model(
+        model_path: Annotated[Path, typer.Option(exists=True, file_okay=False)],
+        manifest: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
+        output: Annotated[Path, typer.Option()] = Path("results"),
+        tensor_parallel: Annotated[int, typer.Option(min=1, max=8)] = 4,
+        max_tokens: Annotated[int, typer.Option(min=1, max=256)] = 32,
+        proposals: Annotated[Path | None, typer.Option(help="Write local-model parameter proposals.")] = None,
+        baseline_only: Annotated[bool, typer.Option(help="Measure only the baseline; never install a candidate.")] = False,
+    ):
+        """Compare real Qwen3.5 generation before/after an opt-in measured kernel adapter."""
+        try:
+            from evolith.lab.serving import verify_model as verify
+            result = verify(
+                model_path, manifest, output, tensor_parallel=tensor_parallel,
+                max_tokens=max_tokens, proposals=proposals,
+                baseline_only=baseline_only,
+            )
+            emit(result)
+            if result["status"] not in ("verified", "baseline_measured"):
+                raise typer.Exit(2)
+        except typer.Exit:
+            raise
+        except (ImportError, RuntimeError, ValueError, TypeError, OSError) as exc:
+            emit(refusal(str(exc)))
+            raise typer.Exit(2) from exc
+
+    @app.command("archive")
+    def archive(
+        db: Annotated[Path, typer.Option(exists=True, dir_okay=False)] = Path("results/runs.sqlite3"),
+    ):
+        """Read append-only measured experiment records without triggering work."""
+        emit({"runs": RunStore(db).list()})

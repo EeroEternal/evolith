@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import shutil
 from typing import Any
 import uuid
 
@@ -297,6 +298,13 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     exclude_candidate_id=candidate_id,
                 )
                 active_campaign = resolve_campaign(self.task.campaign, blocked)
+                if (
+                    self.task.campaign.strip().lower() == "auto"
+                    and active_campaign is None
+                ):
+                    shutil.rmtree(candidate_dir, ignore_errors=True)
+                    shutil.rmtree(evidence_dir, ignore_errors=True)
+                    break
                 active_task = apply_campaign_to_task(self.task, active_campaign)
                 if active_campaign is not None:
                     (evidence_dir / "campaign.json").write_text(

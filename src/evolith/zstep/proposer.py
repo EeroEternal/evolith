@@ -10,32 +10,38 @@ import httpx
 
 from evolith.zstep.task import ProposalMetadata, ZStepRSITask
 
-_BLOCKED_EXACT_ENV = frozenset(
+_ALLOWED_PROPOSER_ENV: frozenset[str] = frozenset(
     {
-        "SSHPASS",
-        "SSH_AUTH_SOCK",
-        "SSH_AGENT_PID",
-        "SSH_CONNECTION",
-        "GIT_SSH",
-        "GIT_SSH_COMMAND",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "TMPDIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "UV_CACHE_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "KIMI_BASE_URL",
+        "KIMI_MODEL_NAME",
     }
-)
-_BLOCKED_SUFFIXES = (
-    "_PASSWORD",
-    "_TOKEN",
-    "_API_KEY",
-    "_SECRET",
-    "_CREDENTIAL",
-    "_CREDENTIALS",
 )
 _PROPOSAL_JSON_RE = re.compile(r"EVOLITH_PROPOSAL_JSON\s*:\s*(\{.*\})")
 
 
-def _is_credential(name: str) -> bool:
-    upper = name.upper()
-    return upper in _BLOCKED_EXACT_ENV or upper.endswith(_BLOCKED_SUFFIXES)
+def _build_safe_proposer_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k in _ALLOWED_PROPOSER_ENV}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
 
 
 def parse_proposal_metadata(
@@ -90,8 +96,7 @@ class KimiCodeProposer:
     def propose(self, candidate_dir: Path, prompt: str, evidence_dir: Path) -> str:
         import signal
 
-        env = {key: value for key, value in os.environ.items() if not _is_credential(key)}
-        env["GIT_TERMINAL_PROMPT"] = "0"
+        env = _build_safe_proposer_env()
         evidence_dir.mkdir(parents=True, exist_ok=True)
         log_path = evidence_dir / "proposer.log"
         # Write directly to proposer.log instead of a pipe so backgrounded hook helpers
@@ -188,8 +193,8 @@ class PatchProposer:
 
 
 _FENCED_DIFF_RE = re.compile(
-    r"```(?:diff|patch)?\s*\n(diff --git .*?)```",
-    flags=re.DOTALL,
+    r"^```(?:diff|patch)?[ \t]*\r?\n(diff --git .*?)(?:\r?\n)^```[ \t]*$",
+    flags=re.DOTALL | re.MULTILINE,
 )
 _RAW_DIFF_RE = re.compile(
     r"(^diff --git .*?)(?=^EVOLITH_PROPOSAL_JSON\s*:|\Z)",
@@ -208,7 +213,7 @@ _SELF_HOSTED_SYSTEM_PROMPT = (
 def extract_unified_diff(response_text: str) -> bytes:
     """Extracts a `git apply`-ready unified diff without stripping blank context spaces."""
     fenced = _FENCED_DIFF_RE.findall(response_text)
-    raw_diff = fenced[-1] if fenced else ""
+    raw_diff = "\n".join(block.lstrip("\r\n").rstrip("\r\n") for block in fenced if block.strip())
     if not raw_diff:
         raw_match = _RAW_DIFF_RE.search(response_text)
         if raw_match:

@@ -32,6 +32,8 @@ def test_zstep_evolve_constructs_isolated_task(
         app,
         [
             "zstep-evolve",
+            "--host",
+            "gpu-server",
             "--source",
             str(tmp_path / "zstep"),
             "--generations",
@@ -67,9 +69,10 @@ def test_zstep_evolve_defaults_to_one_generation(tmp_path: Path, monkeypatch) ->
     assert result.exit_code == 0
     assert "deployment" in result.stdout
 
-    result = runner.invoke(app, ["zstep-evolve"])
+    result = runner.invoke(app, ["zstep-evolve", "--host", "gpu-server"])
     assert result.exit_code == 0
     assert tasks[0].max_generations == 1
+    assert tasks[0].local_timeout_sec == 600
 
 
 def test_zstep_resume_status_and_evidence(tmp_path: Path, monkeypatch) -> None:
@@ -94,7 +97,7 @@ def test_zstep_resume_status_and_evidence(tmp_path: Path, monkeypatch) -> None:
     status = runner.invoke(app, ["zstep-status"])
     evidence = runner.invoke(app, ["zstep-evidence", "g0001-test"])
     missing = runner.invoke(app, ["zstep-evidence", "missing"])
-    resumed = runner.invoke(app, ["zstep-resume", "g0001-test"])
+    resumed = runner.invoke(app, ["zstep-resume", "g0001-test", "--host", "gpu-server"])
 
     assert "g0001-test" in status.stdout
     assert "accepted" in status.stdout

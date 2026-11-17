@@ -164,22 +164,62 @@ def test_redteam_blocks_tp8_device_tokens_when_shm_allreduce_only_writes_rank0(
     report = run_redteam_gate(cand_dir, stats, task, tmp_path / "ev-tp8-good")
     assert report.passed is True
 
-
-def test_redteam_blocks_pytorch_dtype_overload_traps_and_graph_sabotage() -> None:
-    # g0004: int32 index buffer (including sliced arena) passed to index_copy_ without int64 cast
-    bad_idx = _diff_for(
+    # Comments mentioning `synchronize` or `dist.broadcast` never bypass stream-sync or TP8 agreement
+    comment_bypass_stream = _diff_for(
         "worker/zstep_worker/models/deepseek_v41.py",
-        ["self.last_token_gpu.index_copy_(0, self.comp_bt_gpu[:n], sampled)"],
+        [
+            "from torch.cuda import Stream",
+            "self.aux_stream = Stream()  # no need to synchronize",
+        ],
     )
     assert any(
-        f.category == "indices_offsets" and f.severity == "blocking"
-        for f in scan_patch_boundaries(bad_idx)
+        f.category == "overwrite_war" and f.severity == "blocking"
+        for f in scan_patch_boundaries(comment_bypass_stream)
     )
+
+    cand_comment = tmp_path / "cand-tp8-comment"
+    dsv = cand_comment / "worker/zstep_worker/models/deepseek_v41.py"
+    shm = cand_comment / "worker/zstep_worker/kernels_sm120/shm_allreduce.py"
+    dsv.parent.mkdir(parents=True)
+    shm.parent.mkdir(parents=True)
+    dsv.write_text(
+        "# NOTE: no dist.broadcast needed\nif flags & STEP_FLAG_DEVICE_TOKENS:\n    pass\n",
+        encoding="utf-8",
+    )
+    shm.write_text(
+        "if (rank == 0) {\n    out_top2_tokens[0] = best;\n}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RedTeamRejectedError, match="agreement"):
+        run_redteam_gate(
+            cand_comment,
+            _diff_for("worker/zstep_worker/models/deepseek_v41.py", ["x = 1"]),
+            task,
+            tmp_path / "ev-tp8-comment",
+        )
+
+
+def test_redteam_blocks_pytorch_dtype_overload_traps_and_graph_sabotage() -> None:
+    # g0004: int32 index buffer (including sliced arena, torch.index_copy, or keyword form) passed to index_copy_ without int64 cast
+    for bad_line in (
+        "self.last_token_gpu.index_copy_(0, self.comp_bt_gpu[:n], sampled)",
+        "torch.index_copy(self.last_token_gpu, 0, self.slot_ids_gpu[:n], sampled)",
+        "x.index_copy_(dim=0, index=self.comp_bt_gpu[:n], source=s)",
+    ):
+        bad_idx = _diff_for(
+            "worker/zstep_worker/models/deepseek_v41.py",
+            [bad_line],
+        )
+        assert any(
+            f.category == "indices_offsets" and f.severity == "blocking"
+            for f in scan_patch_boundaries(bad_idx)
+        )
+    # index_select supports IntTensor on CUDA and must not be falsely blocked
     good_idx = _diff_for(
         "worker/zstep_worker/models/deepseek_v41.py",
         [
             "self.last_token_gpu.index_copy_(0, self.comp_bt_gpu[:n].to(torch.int64), sampled)",
-            "rows = table.index_select(0, self.slot_ids_gpu[:bs].long())",
+            "rows = table.index_select(0, self.slot_ids_gpu[:bs])",
         ],
     )
     assert not any(
@@ -201,15 +241,20 @@ def test_redteam_blocks_pytorch_dtype_overload_traps_and_graph_sabotage() -> Non
             for f in scan_patch_boundaries(bad_where)
         )
 
-    # Baseline-sabotage reward hack: disabling CUDA Graphs on model runner
-    sabotage = _diff_for(
-        "worker/zstep_worker/models/qwen35_moe.py",
-        ["self.max_graph_bucket = 0"],
-    )
-    assert any(
-        f.category == "anti_cheat" and f.severity == "blocking"
-        for f in scan_patch_boundaries(sabotage)
-    )
+    # Baseline-sabotage reward hack: disabling CUDA Graphs (including annotated & min(0, n) forms)
+    for sab_line in (
+        "self.max_graph_bucket = 0",
+        "use_cuda_graph: bool = False",
+        "self.max_graph_bucket = min(0, n)",
+    ):
+        sabotage = _diff_for(
+            "worker/zstep_worker/models/qwen35_moe.py",
+            [sab_line],
+        )
+        assert any(
+            f.category == "anti_cheat" and f.severity == "blocking"
+            for f in scan_patch_boundaries(sabotage)
+        )
 
     # Zero-initialized SHM recurrent slot sentinel warning
     sentinel_warn = _diff_for(
