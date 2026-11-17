@@ -21,6 +21,7 @@ _EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("net_gate_ratio", "REAL NOT NULL DEFAULT 1"),
     ("stage", "TEXT NOT NULL DEFAULT 'propose'"),
     ("baseline_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("upstream_sha", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -264,6 +265,7 @@ class ZStepArchive:
         patch_summary: str = "",
         evidence_dir: str = "",
         baseline_hash: str = "",
+        upstream_sha: str = "",
     ) -> None:
         files_json = json.dumps(list(changed_files))
         self._conn.execute(
@@ -271,8 +273,8 @@ class ZStepArchive:
             INSERT INTO candidates (
                 candidate_id, generation, parent_id, patch, source_hash, status,
                 evidence_dir, plane, niche_key, changed_lines, changed_files,
-                hypothesis, patch_summary, stage, baseline_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local', ?)
+                hypothesis, patch_summary, stage, baseline_hash, upstream_sha
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local', ?, ?)
             ON CONFLICT(candidate_id) DO UPDATE SET
                 patch = excluded.patch,
                 source_hash = excluded.source_hash,
@@ -285,7 +287,8 @@ class ZStepArchive:
                 hypothesis = excluded.hypothesis,
                 patch_summary = excluded.patch_summary,
                 stage = 'local',
-                baseline_hash = CASE WHEN excluded.baseline_hash != '' THEN excluded.baseline_hash ELSE candidates.baseline_hash END
+                baseline_hash = CASE WHEN excluded.baseline_hash != '' THEN excluded.baseline_hash ELSE candidates.baseline_hash END,
+                upstream_sha = CASE WHEN excluded.upstream_sha != '' THEN excluded.upstream_sha ELSE candidates.upstream_sha END
             """,
             (
                 candidate_id,
@@ -302,6 +305,7 @@ class ZStepArchive:
                 hypothesis,
                 patch_summary,
                 baseline_hash,
+                upstream_sha,
             ),
         )
         self._log_event(
@@ -491,24 +495,44 @@ class ZStepArchive:
             raise KeyError(candidate_id)
         return dict(row)
 
-    def accepted_patches(self) -> list[bytes]:
-        rows = self._conn.execute(
-            """
-            SELECT patch FROM candidates
-            WHERE status = ? ORDER BY generation ASC, candidate_id ASC
-            """,
-            (CandidateStatus.ACCEPTED.value,),
-        ).fetchall()
+    def accepted_patches(self, upstream_sha: str | None = None) -> list[bytes]:
+        if upstream_sha:
+            rows = self._conn.execute(
+                """
+                SELECT patch FROM candidates
+                WHERE status = ? AND upstream_sha = ?
+                ORDER BY generation ASC, candidate_id ASC
+                """,
+                (CandidateStatus.ACCEPTED.value, upstream_sha),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT patch FROM candidates
+                WHERE status = ? ORDER BY generation ASC, candidate_id ASC
+                """,
+                (CandidateStatus.ACCEPTED.value,),
+            ).fetchall()
         return [bytes(row["patch"]) for row in rows if bytes(row["patch"])]
 
-    def current_parent(self) -> str | None:
-        row = self._conn.execute(
-            """
-            SELECT candidate_id FROM candidates
-            WHERE status = ? ORDER BY generation DESC, candidate_id DESC LIMIT 1
-            """,
-            (CandidateStatus.ACCEPTED.value,),
-        ).fetchone()
+    def current_parent(self, upstream_sha: str | None = None) -> str | None:
+        if upstream_sha:
+            row = self._conn.execute(
+                """
+                SELECT candidate_id FROM candidates
+                WHERE status = ? AND upstream_sha = ?
+                ORDER BY generation DESC, candidate_id DESC LIMIT 1
+                """,
+                (CandidateStatus.ACCEPTED.value, upstream_sha),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                """
+                SELECT candidate_id FROM candidates
+                WHERE status = ? ORDER BY generation DESC, candidate_id DESC LIMIT 1
+                """,
+                (CandidateStatus.ACCEPTED.value,),
+            ).fetchone()
         return None if row is None else str(row["candidate_id"])
 
     def next_generation(self) -> int:

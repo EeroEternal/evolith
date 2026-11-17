@@ -184,6 +184,35 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
             "rejection rewind so online `idle_kv_cache_usage == 0.0` always holds."
         ),
     ),
+    CampaignSpec(
+        campaign_id="t2-4-agent-adaptive-kv-sched",
+        aliases=("t2-4", "agent-adaptive"),
+        priority_rank="T2-4",
+        title="Branch-Aware Agent Prefix Cache & Online NNLS SLO-Bounded Chunked Prefill",
+        plane=EvolutionPlane.L2_SCHEDULER,
+        expected_gain="+5% ~ +20% multi-branch agent KV reuse & long-context P99 ITL stability",
+        primary_niche_key="(plane=l2_scheduler,focus=agent_branch_kv_and_nnls_sched)",
+        allowed_roots=(
+            "crates/zs-kv/src",
+            "crates/zs-scheduler/src",
+        ),
+        complexity_free_lines=160,
+        max_changed_lines=320,
+        blueprint=(
+            "[Active Campaign T2-4 Blueprint — Branch-Aware Agent Prefix Cache & Online NNLS Step Scheduler]\n"
+            "  - Grounded in `EvolvingInfra` (arXiv:2611.12304, Algorithms E.1/E.2 & Section 5.2):\n"
+            "    1. Branch-Aware Prefix Cache (`crates/zs-kv/src/prefix_cache.rs`): track `branch_ref_count` "
+            "separately from active GPU `pin_count`; maintain `BranchState { version, node_path }` per "
+            "`branch_id` so `/compact` context rewrites (`old_path` not a prefix of `new_path`) immediately "
+            "decrement `branch_ref_count` on orphaned blocks, and evict `(branch_ref_count > 0, last_access_tick)` "
+            "so paused tool-call/sub-agent branches survive eviction ahead of compacted histories.\n"
+            "    2. Online NNLS Step-Time Predictor & SLO-Bounded Chunking (`crates/zs-scheduler/src`): fit "
+            "the 7-parameter MoE/MLA iteration-time model (`expert_fraction`, quadratic causal `attention_pairs`, "
+            "KV load, residual/router terms) via non-negative least squares (`nnls`) with 70/30 chronological "
+            "holdout validation, solve the quadratic prefill chunk cap under `cached_tokens`, and clamp "
+            "pure-prefill mixed steps to `max_mixed_step_tokens` (`3072`) so SM120 stays on `shm_v5_pxb`."
+        ),
+    ),
 )
 
 _CAMPAIGN_LOOKUP: dict[str, CampaignSpec] = {}

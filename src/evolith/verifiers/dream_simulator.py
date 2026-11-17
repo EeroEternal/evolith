@@ -43,9 +43,16 @@ class DreamTraceSimulator:
         {"math", "evolith.planes.l2_policies"}
     )
 
-    def __init__(self, num_requests: int = 320, seed: int = 2026) -> None:
+    def __init__(
+        self,
+        num_requests: int = 320,
+        seed: int = 2026,
+        *,
+        calibrated_model: object | None = None,
+    ) -> None:
         self.num_requests = num_requests
         self.seed = seed
+        self.calibrated_model = calibrated_model
         self.traces = self._generate_realistic_agent_traces(num_requests, seed)
 
     @staticmethod
@@ -120,14 +127,31 @@ class DreamTraceSimulator:
                 "source": policy_source_code,
                 "num_requests": self.num_requests,
                 "seed": self.seed,
+                "calibrated_model": (
+                    {
+                        "c0_fixed_sec": self.calibrated_model.c0_fixed_sec,  # type: ignore[attr-defined]
+                        "c1_per_uncached_tok_sec": self.calibrated_model.c1_per_uncached_tok_sec,  # type: ignore[attr-defined]
+                        "c2_per_attn_pair_sec": self.calibrated_model.c2_per_attn_pair_sec,  # type: ignore[attr-defined]
+                        "c3_per_restored_tok_sec": self.calibrated_model.c3_per_restored_tok_sec,  # type: ignore[attr-defined]
+                        "d0_fixed_sec": self.calibrated_model.d0_fixed_sec,  # type: ignore[attr-defined]
+                        "d1_routed_experts_sec": self.calibrated_model.d1_routed_experts_sec,  # type: ignore[attr-defined]
+                        "d2_per_request_sec": self.calibrated_model.d2_per_request_sec,  # type: ignore[attr-defined]
+                        "experts": self.calibrated_model.experts,  # type: ignore[attr-defined]
+                        "top_k": self.calibrated_model.top_k,  # type: ignore[attr-defined]
+                    }
+                    if self.calibrated_model is not None
+                    else None
+                ),
             }
         )
         runner_script = (
             "import json, sys\n"
             f"sys.path.insert(0, {src_root!r})\n"
             "from evolith.verifiers.dream_simulator import DreamTraceSimulator\n"
+            "from evolith.zstep.perf_model import IterationTimeModel\n"
             "cfg = json.loads(sys.stdin.read())\n"
-            "sim = DreamTraceSimulator(num_requests=cfg['num_requests'], seed=cfg['seed'])\n"
+            "cm = IterationTimeModel(**cfg['calibrated_model']) if cfg.get('calibrated_model') else None\n"
+            "sim = DreamTraceSimulator(num_requests=cfg['num_requests'], seed=cfg['seed'], calibrated_model=cm)\n"
             "res = sim._simulate_in_process(cfg['source'])\n"
             "sys.stdout.write(res.model_dump_json())\n"
         )
@@ -239,10 +263,25 @@ class DreamTraceSimulator:
             if tr.is_tool_call_turn and not pinned_survived:
                 uncached_tokens = tr.context_tokens  # Evicted during tool pause!
 
+            cached_tokens = max(0, tr.context_tokens - uncached_tokens)
             num_chunks = max(1.0, uncached_tokens / float(prefill_budget))
-            ttft_ms = num_chunks * (16.0 + 0.014 * prefill_budget) + (
-                0.0 if pinned_survived else 55.0
-            )
+            if self.calibrated_model is not None:
+                chunk_uc = min(uncached_tokens, prefill_budget)
+                chunk_ms = (
+                    float(
+                        self.calibrated_model.predict_prefill_iter_sec(  # type: ignore[attr-defined]
+                            chunk_uc,
+                            cached_tokens,
+                            restored_tokens=(0 if pinned_survived else cached_tokens),
+                        )
+                    )
+                    * 1000.0
+                )
+                ttft_ms = num_chunks * chunk_ms
+            else:
+                ttft_ms = num_chunks * (16.0 + 0.014 * prefill_budget) + (
+                    0.0 if pinned_survived else 55.0
+                )
 
             # 3. Evaluate Speculative Decoding & Context Lookup Policy
             draft_k, lookup_fill = propose_spec(
@@ -267,10 +306,23 @@ class DreamTraceSimulator:
 
             # Chunked prefill interference on decode TPOT
             prefill_interference_ms = max(0.0, (prefill_budget - 768) * 0.0045) if running_decodes >= 12 else 0.0
-            base_step_ms = 14.5 + (4.2 if running_decodes >= 16 else 0.0)
-            step_tpot_ms = (base_step_ms + verify_penalty_ms + prefill_interference_ms) / max(
-                1.0, effective_accept * 0.38
-            )
+            if self.calibrated_model is not None:
+                t_fwd = float(1 + total_verify_block)
+                base_step_ms = (
+                    float(
+                        self.calibrated_model.predict_decode_iter_sec(  # type: ignore[attr-defined]
+                            running_decodes,
+                            tokens_per_request=t_fwd,
+                        )
+                    )
+                    * 1000.0
+                )
+                step_tpot_ms = (base_step_ms + prefill_interference_ms) / max(1.0, effective_accept)
+            else:
+                base_step_ms = 14.5 + (4.2 if running_decodes >= 16 else 0.0)
+                step_tpot_ms = (base_step_ms + verify_penalty_ms + prefill_interference_ms) / max(
+                    1.0, effective_accept * 0.38
+                )
 
             ema_accept = 0.85 * ema_accept + 0.15 * effective_accept
             ema_tpot = 0.85 * ema_tpot + 0.15 * step_tpot_ms

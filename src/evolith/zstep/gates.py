@@ -353,6 +353,47 @@ def evaluate_screen(
     )
 
 
+def compute_paired_round_stats(
+    baseline: dict[str, list[TierMetric]],
+    candidate: dict[str, list[TierMetric]],
+) -> tuple[float, float, float] | None:
+    """Compute paired per-round geomean gain ``(mean_gain, se_gain, lcb_2se)`` (Evolving Infra Eq. 6)."""
+    labels = sorted(set(baseline) & set(candidate))
+    if not labels:
+        return None
+    common_repeats: set[int] | None = None
+    by_role_label_rep: dict[str, dict[str, dict[int, float]]] = {"b": {}, "c": {}}
+    for label in labels:
+        b_map = {
+            r.repeat: float(r.output_throughput_tok_s)
+            for r in baseline[label]
+            if math.isfinite(r.output_throughput_tok_s) and r.output_throughput_tok_s > 0.0
+        }
+        c_map = {
+            r.repeat: float(r.output_throughput_tok_s)
+            for r in candidate[label]
+            if math.isfinite(r.output_throughput_tok_s) and r.output_throughput_tok_s > 0.0
+        }
+        reps = set(b_map) & set(c_map)
+        common_repeats = reps if common_repeats is None else (common_repeats & reps)
+        by_role_label_rep["b"][label] = b_map
+        by_role_label_rep["c"][label] = c_map
+    if not common_repeats or len(common_repeats) < 2:
+        return None
+    round_gains: list[float] = []
+    for rep in sorted(common_repeats):
+        tier_gains = [
+            by_role_label_rep["c"][lbl][rep] / by_role_label_rep["b"][lbl][rep] - 1.0
+            for lbl in labels
+        ]
+        round_gains.append(_safe_geomean_gain(tier_gains, empty_default=0.0))
+    m = len(round_gains)
+    mean_g = statistics.mean(round_gains)
+    std_g = statistics.stdev(round_gains)
+    se_g = std_g / math.sqrt(m)
+    return mean_g, se_g, mean_g - 2.0 * se_g
+
+
 def evaluate_candidate(
     baseline: dict[str, list[TierMetric]],
     candidate: dict[str, list[TierMetric]],
@@ -466,14 +507,26 @@ def evaluate_candidate(
         max_cross_mode_logit_drift=task.max_cross_mode_logit_drift,
     )
 
+    paired = compute_paired_round_stats(baseline, candidate)
+    paired_lcb_2se = paired[2] if paired is not None else None
+    if paired is not None and task.min_paired_se_z > 0.0:
+        mean_g, se_g, _ = paired
+        threshold = task.min_paired_se_z * se_g
+        if mean_g <= threshold:
+            reasons.append(
+                f"paired round mean gain {mean_g:+.2%} <= {task.min_paired_se_z:.1f}*SE ({threshold:.2%})"
+            )
+
+    lcb_suffix = f", lcb_2se={paired_lcb_2se:+.2%}" if paired_lcb_2se is not None else ""
     metric_delta = (
-        f"geomean={geomean_gain:+.2%} (net_gate={net_gate_ratio:.4f}) "
+        f"geomean={geomean_gain:+.2%} (net_gate={net_gate_ratio:.4f}{lcb_suffix}) "
         f"[{', '.join(tier_deltas)}]"
     )
     return VerificationDecision(
         accepted=not reasons,
         geomean_gain=geomean_gain,
         net_gate_ratio=net_gate_ratio,
+        paired_lcb_2se=paired_lcb_2se,
         metric_delta=metric_delta,
         reasons=reasons,
     )

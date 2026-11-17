@@ -56,6 +56,11 @@ class ZStepRSILoop:
         self.proposer = proposer or build_proposer(task)
         self.remote = remote or ZStepRemoteRunner(task)
 
+    def _upstream_sha(self) -> str:
+        if hasattr(self.workspace, "upstream_head_sha"):
+            return str(self.workspace.upstream_head_sha())
+        return ""
+
     def _find_cached_baseline_screen(self, baseline_hash: str | None = None) -> Path | None:
         if baseline_hash:
             exact = self.task.baseline_cache_dir / f"{baseline_hash[:16]}-screen-metrics.json"
@@ -281,9 +286,10 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         for _ in range(self.task.max_generations):
             generation = self.archive.next_generation()
             candidate_id = f"g{generation:04d}-{uuid.uuid4().hex[:8]}"
-            parent_id = self.archive.current_parent()
+            upstream_sha = self._upstream_sha()
+            parent_id = self.archive.current_parent(upstream_sha=upstream_sha)
             candidate_dir = self.workspace.create_candidate(
-                candidate_id, self.archive.accepted_patches()
+                candidate_id, self.archive.accepted_patches(upstream_sha=upstream_sha)
             )
             evidence_dir = self.task.state_dir / "evidence" / candidate_id
             evidence_dir.mkdir(parents=True, exist_ok=False)
@@ -371,6 +377,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     patch_summary=proposal_meta.patch_summary,
                     evidence_dir=str(evidence_dir),
                     baseline_hash=baseline_hash,
+                    upstream_sha=upstream_sha,
                 )
 
                 stage = "local"
@@ -461,7 +468,8 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
             return CandidateStatus(str(row["status"]))
 
         expected_parent = row.get("parent_id") or None
-        current_parent = self.archive.current_parent()
+        row_upstream = str(row.get("upstream_sha") or "") or self._upstream_sha()
+        current_parent = self.archive.current_parent(upstream_sha=row_upstream)
         if expected_parent != current_parent:
             raise RuntimeError(
                 f"Cannot resume {candidate_id}: lineage parent moved from "
