@@ -294,14 +294,14 @@ def build_sm120_reflection_card(
             "    1. Decode steps<=max_graph_bucket execute via captured CUDA Graph replay; "
             "packing tiny host H2D/D2H metadata copies or changing Python object allocations "
             "inside capture-only paths yields <0.2% end-to-end gain.",
-            "    2. Note `main.rs` disables `device_token_overlap` on `deepseek_v41` only because "
-            "of the 3-token Engram window; keeping decode token/Engram state device-resident "
-            "with explicit cross-stream event synchronization is a major L2 lever.",
-            "    3. Target real hot paths (>3% impact): device-resident decode + Engram window, "
-            "segmented speculative draft/verify CUDAGraphs (`dspark`/`mtp`), "
-            "SM120 shape-bucket/AllReduce dispatch thresholds (`shm_v5` with Stage-1 self-slice "
-            "direct HBM write covers <=3.75 MiB / M<=384 @ H=5120, while M>384 eager prefill/mixed "
-            "steps route to `NCCL_SHM_USE_CUDA_MEMCPY=1` + `NCCL_SHM_MEMCPY_MODE=3` + 6chx4MiB Xeon DDIO), "
+            "    2. `crates/zs-server/src/lib.rs` (pinned) already enables `device_token_overlap`; "
+            "keep decode token/Engram state device-resident inside `deepseek_v41.py` with explicit "
+            "cross-stream event synchronization and never edit pinned `lib.rs`.",
+            "    3. Target real hot paths (>3% impact): hybrid CX8 PXB-IPC + Host-SHM collectives "
+            "(`shm_v5_pxb` in `shm_allreduce.py` + `NCCL_SHM_MEMCPY_MODE=3` on large transfers), "
+            "segmented speculative draft/verify CUDAGraphs (`dspark`), "
+            "SM120 shape-bucket/AllReduce/AllGather dispatch thresholds (`ZSTEP_SHM_MAX_AR_NUMEL`, "
+            "`ZSTEP_SHM_MAX_AG_NUMEL`, `DEFAULT_MEGA_GATE_MIN_TOKENS`), "
             "or adaptive chunked-prefill token budgets.",
         ]
     )

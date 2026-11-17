@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import importlib.util
 import json
 import math
 import os
@@ -35,20 +37,31 @@ def _has_linux_x86_rust_target() -> bool:
         return False
 
 
+def _file_imports_torch(path: Path) -> bool:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name == "torch" or alias.name.startswith("torch.") for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and (node.module == "torch" or node.module.startswith("torch.")):
+                return True
+    return False
+
+
 def _discover_local_python_tests(candidate_dir: Path) -> list[str]:
     tests_root = candidate_dir / "worker/tests"
     if not tests_root.is_dir():
         return []
-    discovered = sorted(
-        f"worker/tests/{p.name}" for p in tests_root.glob("test_*.py") if p.is_file()
+    has_torch = importlib.util.find_spec("torch") is not None
+    return sorted(
+        f"worker/tests/{p.name}"
+        for p in tests_root.glob("test_*.py")
+        if p.is_file() and (has_torch or not _file_imports_torch(p))
     )
-    if discovered:
-        return discovered
-    candidates = [
-        "worker/tests/test_b12x_dsv41_lifecycle.py",
-        "worker/tests/test_shm_layout_parity.py",
-    ]
-    return [rel for rel in candidates if (candidate_dir / rel).is_file()]
 
 
 def run_local_gates(candidate_dir: Path, task: ZStepRSITask, evidence_dir: Path) -> None:
@@ -63,11 +76,33 @@ def run_local_gates(candidate_dir: Path, task: ZStepRSITask, evidence_dir: Path)
         (["cargo", "fmt", "--all", "--check"], None),
         (cargo_test, None),
     ]
-    # On macOS, typecheck the full workspace (including Linux-only zs-shm/zs-scheduler/zs-server)
+    # On macOS, typecheck Linux crates (full workspace when a Linux C cross-compiler
+    # is installed for C build scripts like `onig_sys`, or pure-Rust crates otherwise)
     if is_darwin and _has_linux_x86_rust_target():
-        commands.append(
-            (["cargo", "check", "--workspace", "--target", "x86_64-unknown-linux-gnu"], None)
-        )
+        if shutil.which("x86_64-linux-gnu-gcc") is not None:
+            commands.append(
+                (["cargo", "check", "--workspace", "--target", "x86_64-unknown-linux-gnu"], None)
+            )
+        else:
+            commands.append(
+                (
+                    [
+                        "cargo",
+                        "check",
+                        "-p",
+                        "zs-kv",
+                        "-p",
+                        "zs-wire",
+                        "-p",
+                        "zs-shm",
+                        "-p",
+                        "zs-scheduler",
+                        "--target",
+                        "x86_64-unknown-linux-gnu",
+                    ],
+                    None,
+                )
+            )
     if shutil.which("ruff") is not None:
         commands.append((["ruff", "check", "worker/"], None))
 
@@ -126,12 +161,32 @@ def _median_metric(metrics: list[TierMetric], field: str) -> float:
     return statistics.median(float(getattr(metric, field)) for metric in metrics)
 
 
+def _validate_positive_finite(
+    value: float, label: str, field: str, reasons: list[str]
+) -> bool:
+    if not math.isfinite(value) or value <= 0.0:
+        reasons.append(f"{label} {field} is non-positive or non-finite ({value})")
+        return False
+    return True
+
+
+def _safe_geomean_gain(gains: list[float], *, empty_default: float = 0.0) -> float:
+    if not gains:
+        return empty_default
+    if any(not math.isfinite(g) or g <= -1.0 for g in gains):
+        return -1.0
+    return math.exp(sum(math.log1p(g) for g in gains) / len(gains)) - 1.0
+
+
 def _check_parity_guards(
     parity_path: Path,
     reasons: list[str],
     *,
     max_cross_mode_logit_drift: float = 8.0,
 ) -> None:
+    if not parity_path.is_file():
+        reasons.append(f"parity report missing at {parity_path.name}")
+        return
     recompilations, rates = load_parity(parity_path)
     if recompilations:
         reasons.append(f"unexpected Triton recompilations: {recompilations}")
@@ -140,15 +195,18 @@ def _check_parity_guards(
             reasons.append(f"prime_squares_table {mode} exact match is not 100%")
 
     payload = json.loads(parity_path.read_text(encoding="utf-8"))
-    chunked_sched = payload.get("chunked_schedule")
-    if isinstance(chunked_sched, dict):
-        cp_steps = int(chunked_sched.get("chunked_prefill_steps", 0))
-        mixed_steps = int(chunked_sched.get("decode_steps_with_partial_prefill", 0))
-        if cp_steps <= 0 or mixed_steps <= 0:
-            reasons.append(
-                "chunked_schedule failed exposure gate: "
-                f"chunked_prefill_steps={cp_steps}, decode_steps_with_partial_prefill={mixed_steps}"
-            )
+    if "chunked_schedule" in payload or "unchunked_schedule" in payload:
+        chunked_sched = payload.get("chunked_schedule")
+        if not isinstance(chunked_sched, dict):
+            reasons.append("chunked_schedule missing or null in parity report")
+        else:
+            cp_steps = int(chunked_sched.get("chunked_prefill_steps", 0))
+            mixed_steps = int(chunked_sched.get("decode_steps_with_partial_prefill", 0))
+            if cp_steps <= 0 or mixed_steps <= 0:
+                reasons.append(
+                    "chunked_schedule failed exposure gate: "
+                    f"chunked_prefill_steps={cp_steps}, decode_steps_with_partial_prefill={mixed_steps}"
+                )
 
     for case in payload.get("cases", []):
         if not isinstance(case, dict):
@@ -161,13 +219,22 @@ def _check_parity_guards(
                 "prime_squares_table violated cross-mode invariance (single/batched/chunked diverged)"
             )
         for pair_label, pair in (("single_vs_batched", svb), ("batched_vs_chunked", bvc)):
+            if pair is None:
+                continue
             if not isinstance(pair, dict):
+                reasons.append(f"case {case_name} {pair_label} has malformed mismatch entry")
                 continue
             left = pair.get("left_top2")
             right = pair.get("right_top2")
-            if not isinstance(left, dict) or not isinstance(right, dict):
-                continue
-            if "top1_logit" not in left or "top1_logit" not in right:
+            if (
+                not isinstance(left, dict)
+                or not isinstance(right, dict)
+                or "top1_logit" not in left
+                or "top1_logit" not in right
+            ):
+                reasons.append(
+                    f"case {case_name} {pair_label} mismatch missing top1_logit metadata"
+                )
                 continue
             left_logit = float(left["top1_logit"])
             right_logit = float(right["top1_logit"])
@@ -189,6 +256,8 @@ def evaluate_screen(
     parity_path: Path | None,
     task: ZStepRSITask,
     baseline_metrics_path: Path | None = None,
+    *,
+    require_parity: bool = False,
 ) -> ScreenDecision:
     """
     Validates screen-stage correctness, Triton zero-recompilation, and non-regression
@@ -201,6 +270,12 @@ def evaluate_screen(
             reasons,
             max_cross_mode_logit_drift=task.max_cross_mode_logit_drift,
         )
+    elif require_parity:
+        reasons.append("screen parity report missing")
+
+    if not candidate_metrics_path.is_file():
+        reasons.append("screen benchmark metrics missing")
+        return ScreenDecision(passed=False, reasons=reasons)
 
     candidate = load_benchmark(candidate_metrics_path)
     if not candidate:
@@ -209,7 +284,18 @@ def evaluate_screen(
 
     for label, rows in sorted(candidate.items()):
         for row in rows:
-            if row.idle_kv_cache_usage is not None and row.idle_kv_cache_usage > 0.0:
+            for field in (
+                "output_throughput_tok_s",
+                "median_ttft_ms",
+                "mean_tpot_ms",
+                "p99_itl_ms",
+            ):
+                _validate_positive_finite(
+                    float(getattr(row, field)), f"screen {label}", field, reasons
+                )
+            if row.idle_kv_cache_usage is not None and (
+                not math.isfinite(row.idle_kv_cache_usage) or row.idle_kv_cache_usage > 0.0
+            ):
                 reasons.append(
                     f"screen {label} leaked idle KV cache ({row.idle_kv_cache_usage:.4f} > 0.0)"
                 )
@@ -224,6 +310,11 @@ def evaluate_screen(
         for label in sorted(set(baseline) & set(candidate)):
             base_tp = _median_metric(baseline[label], "output_throughput_tok_s")
             cand_tp = _median_metric(candidate[label], "output_throughput_tok_s")
+            if not (
+                _validate_positive_finite(base_tp, f"screen baseline {label}", "output_throughput_tok_s", reasons)
+                and _validate_positive_finite(cand_tp, f"screen {label}", "output_throughput_tok_s", reasons)
+            ):
+                continue
             gain = cand_tp / base_tp - 1.0
             gains.append(gain)
             delta_parts.append(f"{label}:{gain:+.2%} ({cand_tp:.1f} tok/s)")
@@ -235,6 +326,11 @@ def evaluate_screen(
             for field in ("median_ttft_ms", "mean_tpot_ms", "p99_itl_ms"):
                 base_lat = _median_metric(baseline[label], field)
                 cand_lat = _median_metric(candidate[label], field)
+                if not (
+                    _validate_positive_finite(base_lat, f"screen baseline {label}", field, reasons)
+                    and _validate_positive_finite(cand_lat, f"screen {label}", field, reasons)
+                ):
+                    continue
                 reg = cand_lat / base_lat - 1.0
                 if reg > task.max_screen_latency_regression:
                     reasons.append(
@@ -244,15 +340,11 @@ def evaluate_screen(
     else:
         for label, rows in sorted(candidate.items()):
             cand_tp = _median_metric(rows, "output_throughput_tok_s")
-            if cand_tp <= 0:
+            if cand_tp <= 0 or not math.isfinite(cand_tp):
                 reasons.append(f"screen {label} non-positive throughput {cand_tp}")
             delta_parts.append(f"{label}:{cand_tp:.1f} tok/s")
 
-    geomean_gain = (
-        math.exp(sum(math.log1p(g) for g in gains) / len(gains)) - 1.0
-        if gains
-        else 0.0
-    )
+    geomean_gain = _safe_geomean_gain(gains, empty_default=0.0)
     return ScreenDecision(
         passed=not reasons,
         gain=geomean_gain,
@@ -270,14 +362,32 @@ def evaluate_candidate(
     changed_lines: int = 0,
 ) -> VerificationDecision:
     reasons: list[str] = []
+    if not baseline:
+        reasons.append("baseline benchmark produced no tier metrics")
+    if not candidate:
+        reasons.append("candidate benchmark produced no tier metrics")
     labels = sorted(set(baseline) & set(candidate))
     for label in sorted(set(baseline) - set(candidate)):
         reasons.append(f"candidate missing tier {label}")
     for label in sorted(set(candidate) - set(baseline)):
         reasons.append(f"baseline missing tier {label}")
+    for role_name, grouped in (("baseline", baseline), ("candidate", candidate)):
+        for label, rows in sorted(grouped.items()):
+            for row in rows:
+                for field in (
+                    "output_throughput_tok_s",
+                    "median_ttft_ms",
+                    "mean_tpot_ms",
+                    "p99_itl_ms",
+                ):
+                    _validate_positive_finite(
+                        float(getattr(row, field)), f"{role_name} {label}", field, reasons
+                    )
     for label, rows in sorted(candidate.items()):
         for row in rows:
-            if row.idle_kv_cache_usage is not None and row.idle_kv_cache_usage > 0.0:
+            if row.idle_kv_cache_usage is not None and (
+                not math.isfinite(row.idle_kv_cache_usage) or row.idle_kv_cache_usage > 0.0
+            ):
                 reasons.append(
                     f"{label} leaked idle KV cache ({row.idle_kv_cache_usage:.4f} > 0.0)"
                 )
@@ -293,6 +403,22 @@ def evaluate_candidate(
     for label in labels:
         base_throughput = _median_metric(baseline[label], "output_throughput_tok_s")
         candidate_throughput = _median_metric(candidate[label], "output_throughput_tok_s")
+        if not (
+            math.isfinite(base_throughput)
+            and base_throughput > 0.0
+            and math.isfinite(candidate_throughput)
+            and candidate_throughput > 0.0
+        ):
+            continue
+        if len(candidate[label]) >= 2:
+            tp_samples = [float(m.output_throughput_tok_s) for m in candidate[label]]
+            mean_tp = statistics.mean(tp_samples)
+            if mean_tp > 0:
+                cv = statistics.pstdev(tp_samples) / mean_tp
+                if cv > task.max_tier_cv:
+                    reasons.append(
+                        f"{label} throughput dispersion CV={cv:.2%} exceeds limit {task.max_tier_cv:.2%}"
+                    )
         gain = candidate_throughput / base_throughput - 1.0
         gains.append(gain)
         base_tpot = _median_metric(baseline[label], "mean_tpot_ms")
@@ -305,15 +431,18 @@ def evaluate_candidate(
         for field, limit in latency_limits.items():
             base_value = _median_metric(baseline[label], field)
             candidate_value = _median_metric(candidate[label], field)
+            if not (
+                math.isfinite(base_value)
+                and base_value > 0.0
+                and math.isfinite(candidate_value)
+                and candidate_value > 0.0
+            ):
+                continue
             regression = candidate_value / base_value - 1.0
             if regression > limit:
                 reasons.append(f"{label} {field} regressed {regression:.2%}")
 
-    geomean_gain = (
-        math.exp(sum(math.log1p(gain) for gain in gains) / len(gains)) - 1.0
-        if gains
-        else -1.0
-    )
+    geomean_gain = _safe_geomean_gain(gains, empty_default=-1.0)
     if geomean_gain < task.min_geomean_gain:
         reasons.append(f"geomean throughput gain {geomean_gain:.2%} below required minimum")
 

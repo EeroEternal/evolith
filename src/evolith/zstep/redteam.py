@@ -173,7 +173,7 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
 
         # Anti-cheat: spoofing Triton recompilation counters or skipping greedy gates
         if _SPOOF_RECOMP_RE.search(joined) and (
-            "main.rs" in file_path or "runtime_loop.py" in file_path
+            "main.rs" in file_path or "lib.rs" in file_path or "runtime_loop.py" in file_path
         ):
             findings.append(
                 RedTeamFinding(
@@ -233,7 +233,7 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
 
         # Category 3 & 4: overwrite_war + execution_context (multi-stream WAR hazard, VS-003/VS-012)
         if file_path.startswith("worker/zstep_worker/") and _STREAM_CTOR_RE.search(joined):
-            if not _STREAM_SYNC_RE.search(all_added_blob):
+            if not _STREAM_SYNC_RE.search(joined):
                 findings.append(
                     RedTeamFinding(
                         category="overwrite_war",

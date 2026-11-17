@@ -156,3 +156,31 @@ def test_summarize_failure_reason_preserves_diagnostic_over_json_and_teardown_no
         reason = str(row["failure_reason"])
         assert "exact_token_match_rate 0.8125 < 1.0" in reason
         assert "TRITON_RECOMPILATIONS=0" not in reason
+
+
+def test_archive_redacts_hidden_verify_tier_labels_and_records_events(tmp_path: Path) -> None:
+    with ZStepArchive(tmp_path / "events.sqlite3") as archive:
+        archive.start_candidate("g0007", 7, None, b"diff", "s7", hypothesis="Split PXB ring")
+        archive.update_stage("g0007", "verify")
+        archive.finish_candidate(
+            "g0007",
+            CandidateStatus.VERIFY_REJECTED,
+            "ev7",
+            "in1024_c128 p99 ITL regressed +7.2%",
+            metric_delta="geomean=+1.2% [in1024_c128:-4.1%, in512_c16:+2.0%]",
+        )
+        redacted = archive.compressed_lineage_memory(
+            hidden_tier_labels=("in1024_c128", "in512_c16")
+        )
+        assert "in1024_c128" not in redacted
+        assert "in512_c16" not in redacted
+        assert "verify_tier" in redacted
+        assert "p99 ITL regressed" in redacted
+
+        events = archive.list_events("g0007")
+        assert [e["event_type"] for e in events] == [
+            "start_candidate",
+            "update_stage",
+            "finish_candidate",
+        ]
+        assert len(archive.list_events()) == 3

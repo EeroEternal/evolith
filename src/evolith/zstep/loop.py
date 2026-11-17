@@ -26,7 +26,11 @@ from evolith.zstep.redteam import (
     compute_spec_pins,
     run_redteam_gate,
 )
-from evolith.zstep.remote import ZStepRemoteRunner
+from evolith.zstep.remote import (
+    RemoteInfraError,
+    RemotePreflightError,
+    ZStepRemoteRunner,
+)
 from evolith.zstep.task import CandidateStatus, PatchStats, ZStepRSITask
 from evolith.zstep.workspace import ZStepWorkspace
 
@@ -56,10 +60,6 @@ class ZStepRSILoop:
             exact = self.task.baseline_cache_dir / f"{baseline_hash[:16]}-screen-metrics.json"
             if exact.is_file():
                 return exact
-        if self.task.baseline_cache_dir.is_dir():
-            candidates = sorted(self.task.baseline_cache_dir.glob("*-screen-metrics.json"))
-            if candidates:
-                return candidates[-1]
         return None
 
     def _find_latest_candidate_screen(self, parent_id: str | None) -> Path | None:
@@ -90,7 +90,13 @@ class ZStepRSILoop:
         active_campaign: CampaignSpec | None = None,
     ) -> str:
         task = active_task or self.task
-        compressed_history = self.archive.compressed_lineage_memory(limit=8)
+        hidden_labels = {
+            item.split(":", 1)[0] for item in task.verify_tiers.split(";") if item
+        }
+        compressed_history = self.archive.compressed_lineage_memory(
+            limit=8,
+            hidden_tier_labels=hidden_labels,
+        )
         allowed_list = "\n".join(f"  - {root}" for root in task.allowed_roots)
         reflection_card = build_sm120_reflection_card(
             candidate_dir,
@@ -188,34 +194,25 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
     ) -> None:
         screen_metrics = self.remote.screen(candidate_id, candidate_archive, evidence_dir)
         screen_parity = evidence_dir / "screen-parity.json"
-        has_parity = screen_parity.is_file()
-        has_tiers = False
-        if screen_metrics.is_file():
-            try:
-                payload = json.loads(screen_metrics.read_text(encoding="utf-8"))
-                has_tiers = isinstance(payload, dict) and "tiers" in payload
-            except ValueError:
-                has_tiers = False
-
-        if has_tiers or has_parity:
-            screen_decision = evaluate_screen(
-                screen_metrics,
-                screen_parity if has_parity else None,
-                active_task or self.task,
-                baseline_screen,
-            )
-            (evidence_dir / "screen-decision.json").write_text(
-                screen_decision.model_dump_json(indent=2),
-                encoding="utf-8",
-            )
-            self.archive.update_stage(
-                candidate_id,
-                "verify" if screen_decision.passed else "screen",
-                screen_gain=screen_decision.gain,
-                metric_delta=screen_decision.metric_delta,
-            )
-            if not screen_decision.passed:
-                raise ScreenRejectedError("; ".join(screen_decision.reasons))
+        screen_decision = evaluate_screen(
+            screen_metrics,
+            screen_parity if screen_parity.is_file() else None,
+            active_task or self.task,
+            baseline_screen,
+            require_parity=True,
+        )
+        (evidence_dir / "screen-decision.json").write_text(
+            screen_decision.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        self.archive.update_stage(
+            candidate_id,
+            "verify" if screen_decision.passed else "screen",
+            screen_gain=screen_decision.gain,
+            metric_delta=screen_decision.metric_delta,
+        )
+        if not screen_decision.passed:
+            raise ScreenRejectedError("; ".join(screen_decision.reasons))
 
     def _finalize_verification(
         self,
@@ -226,12 +223,25 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         changed_lines: int,
         evidence_dir: Path,
         active_task: ZStepRSITask | None = None,
+        expected_baseline_hash: str = "",
     ) -> CandidateStatus:
         candidate_json, baseline_json, parity_json = self.remote.verify(
             candidate_id, baseline_archive, candidate_archive, evidence_dir
         )
         if hashlib.sha256(candidate_archive.read_bytes()).hexdigest() != source_hash:
             raise RuntimeError("candidate source hash changed before verification")
+        if (
+            expected_baseline_hash
+            and hashlib.sha256(baseline_archive.read_bytes()).hexdigest()
+            != expected_baseline_hash
+        ):
+            raise RuntimeError("baseline source hash changed before verification")
+        cand_row = self.archive.get_candidate(candidate_id)
+        if (cand_row.get("parent_id") or None) != self.archive.current_parent():
+            raise RuntimeError(
+                f"lineage parent advanced before accepting {candidate_id} "
+                f"(expected {cand_row.get('parent_id')}, got {self.archive.current_parent()})"
+            )
         decision = evaluate_candidate(
             load_benchmark(baseline_json),
             load_benchmark(candidate_json),
@@ -327,6 +337,11 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     changed_files=patch_stats.changed_files,
                     changed_lines=patch_stats.changed_lines,
                 )
+                effective_niche_key = (
+                    active_campaign.primary_niche_key
+                    if active_campaign is not None
+                    else proposal_meta.niche_key
+                )
                 patch_path = self.task.state_dir / "patches" / f"{candidate_id}.patch"
                 patch_path.parent.mkdir(parents=True, exist_ok=True)
                 patch_path.write_bytes(patch_stats.patch)
@@ -341,19 +356,20 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     patch_stats.patch,
                     source_hash,
                     plane=patch_stats.plane,
-                    niche_key=proposal_meta.niche_key,
+                    niche_key=effective_niche_key,
                     changed_lines=patch_stats.changed_lines,
                     changed_files=patch_stats.changed_files,
                     hypothesis=proposal_meta.hypothesis,
                     patch_summary=proposal_meta.patch_summary,
                     evidence_dir=str(evidence_dir),
+                    baseline_hash=baseline_hash,
                 )
 
                 stage = "local"
-                if proposal_meta.niche_key in blocked:
-                    prior = blocked[proposal_meta.niche_key]
+                if effective_niche_key in blocked:
+                    prior = blocked[effective_niche_key]
                     raise PremiseStrikeError(
-                        f"Premise 2-strike circuit breaker tripped on `{proposal_meta.niche_key}` "
+                        f"Premise 2-strike circuit breaker tripped on `{effective_niche_key}` "
                         f"after {len(prior)} consecutive rejections (last: {prior[-1]})"
                     )
                 run_redteam_gate(
@@ -399,20 +415,28 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     patch_stats.changed_lines,
                     evidence_dir,
                     active_task=active_task,
+                    expected_baseline_hash=baseline_hash,
                 )
                 statuses.append(final_status)
             except Exception as error:
-                status = {
-                    "propose": CandidateStatus.LOCAL_REJECTED,
-                    "local": CandidateStatus.LOCAL_REJECTED,
-                    "screen": CandidateStatus.SCREEN_REJECTED,
-                }.get(stage, CandidateStatus.FAILED)
+                is_infra = isinstance(error, (RemotePreflightError, RemoteInfraError))
+                if is_infra:
+                    status = CandidateStatus.FAILED
+                else:
+                    status = {
+                        "propose": CandidateStatus.LOCAL_REJECTED,
+                        "local": CandidateStatus.LOCAL_REJECTED,
+                        "screen": CandidateStatus.SCREEN_REJECTED,
+                    }.get(stage, CandidateStatus.FAILED)
                 self._write_failure(evidence_dir, error)
                 self.archive.finish_candidate(
                     candidate_id, status, str(evidence_dir), str(error)
                 )
                 statuses.append(status)
-                if stage in {"preflight", "baseline_screen"}:
+                if is_infra or stage in {
+                    "preflight",
+                    "baseline_screen",
+                }:
                     break
         return statuses
 
@@ -422,8 +446,19 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         `baseline.tar.gz` and `candidate.tar.gz` archives and round-level checkpoints.
         """
         row = self.archive.get_candidate(candidate_id)
-        if str(row["status"]) != CandidateStatus.PROPOSED.value:
+        if str(row["status"]) not in {
+            CandidateStatus.PROPOSED.value,
+            CandidateStatus.FAILED.value,
+        }:
             return CandidateStatus(str(row["status"]))
+
+        expected_parent = row.get("parent_id") or None
+        current_parent = self.archive.current_parent()
+        if expected_parent != current_parent:
+            raise RuntimeError(
+                f"Cannot resume {candidate_id}: lineage parent moved from "
+                f"{expected_parent} to {current_parent}"
+            )
 
         evidence_raw = str(row["evidence_dir"] or "")
         evidence_dir = (
@@ -443,9 +478,14 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         if not expected_hash or actual_hash != expected_hash:
             raise RuntimeError("candidate source hash mismatch on resume")
 
+        baseline_hash = hashlib.sha256(baseline_archive.read_bytes()).hexdigest()
+        expected_baseline_hash = str(row.get("baseline_hash") or "")
+        if expected_baseline_hash and baseline_hash != expected_baseline_hash:
+            raise RuntimeError("baseline source hash mismatch on resume")
+
         campaign_selector = self.task.campaign
         campaign_file = evidence_dir / "campaign.json"
-        if (not campaign_selector or campaign_selector == "none") and campaign_file.is_file():
+        if campaign_file.is_file():
             try:
                 saved = json.loads(campaign_file.read_text(encoding="utf-8"))
                 if isinstance(saved, dict) and isinstance(saved.get("campaign_id"), str):
@@ -455,13 +495,15 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         active_campaign = resolve_campaign(campaign_selector)
         active_task = apply_campaign_to_task(self.task, active_campaign)
 
-        baseline_hash = hashlib.sha256(baseline_archive.read_bytes()).hexdigest()
         changed_lines = int(row.get("changed_lines") or 0)
         stage = "preflight"
         try:
             self.remote.preflight()
             screen_metrics = evidence_dir / "screen-metrics.json"
             if not screen_metrics.is_file():
+                if active_task.enable_gpu_smoke and hasattr(self.remote, "gpu_smoke"):
+                    stage = "screen"
+                    self.remote.gpu_smoke(candidate_id, candidate_archive)
                 baseline_screen: Path | None = None
                 if hasattr(self.remote, "screen_baseline"):
                     stage = "baseline_screen"
@@ -477,12 +519,14 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     active_task=active_task,
                 )
             else:
+                stage = "screen"
                 parity_path = evidence_dir / "screen-parity.json"
                 screen_decision = evaluate_screen(
                     screen_metrics,
                     parity_path if parity_path.is_file() else None,
                     active_task,
                     self._find_cached_baseline_screen(baseline_hash),
+                    require_parity=True,
                 )
                 if not screen_decision.passed:
                     raise ScreenRejectedError("; ".join(screen_decision.reasons))
@@ -497,12 +541,17 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 changed_lines,
                 evidence_dir,
                 active_task=active_task,
+                expected_baseline_hash=baseline_hash,
             )
         except Exception as error:
             status = (
-                CandidateStatus.SCREEN_REJECTED
-                if stage == "screen"
-                else CandidateStatus.FAILED
+                CandidateStatus.FAILED
+                if isinstance(error, (RemotePreflightError, RemoteInfraError))
+                else (
+                    CandidateStatus.SCREEN_REJECTED
+                    if stage == "screen"
+                    else CandidateStatus.FAILED
+                )
             )
             self._write_failure(evidence_dir, error)
             self.archive.finish_candidate(

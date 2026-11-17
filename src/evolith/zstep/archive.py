@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import sqlite3
 
 from evolith.controller.archive import SteppingStonesArchive
@@ -19,6 +20,7 @@ _EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("screen_gain", "REAL NOT NULL DEFAULT 0"),
     ("net_gate_ratio", "REAL NOT NULL DEFAULT 1"),
     ("stage", "TEXT NOT NULL DEFAULT 'propose'"),
+    ("baseline_hash", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -30,7 +32,8 @@ _NOISE_TAIL_TOKENS: tuple[str, ...] = (
     "},",
     "],",
 )
-_ROOT_CAUSE_KEYWORDS: tuple[str, ...] = (
+_EXCEPTION_KEYWORDS: tuple[str, ...] = (
+    "traceback (most recent call last)",
     "runtimeerror:",
     "typeerror:",
     "valueerror:",
@@ -42,6 +45,8 @@ _ROOT_CAUSE_KEYWORDS: tuple[str, ...] = (
     "panicked at",
     "error[e",
     "error:",
+)
+_ROOT_CAUSE_KEYWORDS: tuple[str, ...] = (
     "exact_token_match_rate",
     "violated cross-mode invariance",
     "logit drift",
@@ -57,6 +62,11 @@ def _is_noise_tail_line(line: str) -> bool:
     if not stripped or stripped in _NOISE_TAIL_TOKENS:
         return True
     if stripped.startswith("TRITON_RECOMPILATIONS=0"):
+        return True
+    lower = stripped.lower()
+    if re.match(r'^"[^"\n]+"\s*:', stripped) and not any(
+        kw in lower for kw in _EXCEPTION_KEYWORDS
+    ):
         return True
     return False
 
@@ -80,13 +90,16 @@ def _summarize_failure_reason(raw: str, max_chars: int = 360) -> str:
     )
     body = lines[1:]
     diagnostic_hits: list[str] = []
-    for line in reversed(body):
-        if _is_noise_tail_line(line):
-            continue
-        lower = line.lower()
-        if any(kw in lower for kw in _ROOT_CAUSE_KEYWORDS) and line not in diagnostic_hits:
-            diagnostic_hits.append(line)
-        if len(diagnostic_hits) >= 2:
+    for kw_group in (_EXCEPTION_KEYWORDS, _ROOT_CAUSE_KEYWORDS):
+        for line in reversed(body):
+            if _is_noise_tail_line(line):
+                continue
+            lower = line.lower()
+            if any(kw in lower for kw in kw_group) and line not in diagnostic_hits:
+                diagnostic_hits.append(line)
+            if len(diagnostic_hits) >= 2:
+                break
+        if diagnostic_hits:
             break
 
     if diagnostic_hits:
@@ -150,7 +163,49 @@ class ZStepArchive:
                 self._conn.execute(
                     f"ALTER TABLE candidates ADD COLUMN {col_name} {col_ddl}"
                 )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candidate_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                stage TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         self._conn.commit()
+
+    def _log_event(
+        self,
+        candidate_id: str,
+        event_type: str,
+        *,
+        stage: str = "",
+        status: str = "",
+        detail: str = "",
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO candidate_events (candidate_id, event_type, stage, status, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (candidate_id, event_type, stage, status, detail[:500]),
+        )
+
+    def list_events(self, candidate_id: str | None = None) -> list[dict[str, object]]:
+        if candidate_id is not None:
+            rows = self._conn.execute(
+                "SELECT * FROM candidate_events WHERE candidate_id = ? ORDER BY event_id ASC",
+                (candidate_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM candidate_events ORDER BY event_id ASC"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def close(self) -> None:
         self._conn.close()
@@ -185,6 +240,12 @@ class ZStepArchive:
                 evidence_dir,
             ),
         )
+        self._log_event(
+            candidate_id,
+            "register_attempt",
+            stage="propose",
+            status=CandidateStatus.PROPOSED.value,
+        )
         self._conn.commit()
 
     def start_candidate(
@@ -202,6 +263,7 @@ class ZStepArchive:
         hypothesis: str = "",
         patch_summary: str = "",
         evidence_dir: str = "",
+        baseline_hash: str = "",
     ) -> None:
         files_json = json.dumps(list(changed_files))
         self._conn.execute(
@@ -209,8 +271,8 @@ class ZStepArchive:
             INSERT INTO candidates (
                 candidate_id, generation, parent_id, patch, source_hash, status,
                 evidence_dir, plane, niche_key, changed_lines, changed_files,
-                hypothesis, patch_summary, stage
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local')
+                hypothesis, patch_summary, stage, baseline_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local', ?)
             ON CONFLICT(candidate_id) DO UPDATE SET
                 patch = excluded.patch,
                 source_hash = excluded.source_hash,
@@ -222,7 +284,8 @@ class ZStepArchive:
                 changed_files = excluded.changed_files,
                 hypothesis = excluded.hypothesis,
                 patch_summary = excluded.patch_summary,
-                stage = 'local'
+                stage = 'local',
+                baseline_hash = CASE WHEN excluded.baseline_hash != '' THEN excluded.baseline_hash ELSE candidates.baseline_hash END
             """,
             (
                 candidate_id,
@@ -238,7 +301,15 @@ class ZStepArchive:
                 files_json,
                 hypothesis,
                 patch_summary,
+                baseline_hash,
             ),
+        )
+        self._log_event(
+            candidate_id,
+            "start_candidate",
+            stage="local",
+            status=CandidateStatus.PROPOSED.value,
+            detail=niche_key,
         )
         self._conn.commit()
 
@@ -262,6 +333,12 @@ class ZStepArchive:
         self._conn.execute(
             f"UPDATE candidates SET {', '.join(fields)} WHERE candidate_id = ?",
             params,
+        )
+        self._log_event(
+            candidate_id,
+            "update_stage",
+            stage=stage,
+            detail=metric_delta or "",
         )
         self._conn.commit()
 
@@ -360,6 +437,12 @@ class ZStepArchive:
             f"UPDATE candidates SET {', '.join(fields)} WHERE candidate_id = ?",
             params,
         )
+        self._log_event(
+            candidate_id,
+            "finish_candidate",
+            status=status.value,
+            detail=compact_reason,
+        )
         self._conn.commit()
         self._sync_stepping_stone(candidate_id)
 
@@ -389,6 +472,13 @@ class ZStepArchive:
                 metric_delta,
                 candidate_id,
             ),
+        )
+        self._log_event(
+            candidate_id,
+            "accept_candidate",
+            stage="done",
+            status=CandidateStatus.ACCEPTED.value,
+            detail=metric_delta,
         )
         self._conn.commit()
         self._sync_stepping_stone(candidate_id)
@@ -442,7 +532,12 @@ class ZStepArchive:
             raise KeyError(candidate_id)
         return str(row["evidence_dir"])
 
-    def compressed_lineage_memory(self, limit: int = 8) -> str:
+    def compressed_lineage_memory(
+        self,
+        limit: int = 8,
+        *,
+        hidden_tier_labels: set[str] | frozenset[str] = frozenset(),
+    ) -> str:
         """
         Formats historical zstep candidates as AIDE^2 16x compressed 4-tuples
         ([Hypothesis, PatchSummary, MetricDelta, FailureRootCause]).
@@ -467,7 +562,13 @@ class ZStepArchive:
                 f"[{cid} gen={row['generation']} {status.upper()}] "
                 f"Hyp: {hyp} | Patch: {summary} | Delta: {delta} | RootCause: {reason}"
             )
-        return "\n".join(lines[-limit:]) if lines else "None"
+        rendered = "\n".join(lines[-limit:]) if lines else "None"
+        if hidden_tier_labels and rendered != "None":
+            pattern = re.compile(
+                r"\b(?:" + "|".join(re.escape(lbl) for lbl in sorted(hidden_tier_labels)) + r")\b"
+            )
+            rendered = pattern.sub("verify_tier", rendered)
+        return rendered
 
     def blocked_niches(
         self,

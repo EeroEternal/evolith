@@ -20,10 +20,12 @@ class FakeWorkspace:
         self.received_patches.append(patches)
         path = self.task.candidates_dir / candidate_id
         path.mkdir(parents=True)
-        (path / "source.txt").write_text(candidate_id, encoding="utf-8")
+        layers = b"\n".join([b"frozen-baseline", *patches])
+        (path / "source.txt").write_bytes(layers)
         return path
 
     def capture_patch(self, candidate_dir: Path) -> bytes:
+        (candidate_dir / "source.txt").write_text(candidate_dir.name, encoding="utf-8")
         return f"patch-{candidate_dir.name}".encode()
 
     def freeze_source(self, source_dir: Path, destination: Path) -> Path:
@@ -610,4 +612,49 @@ def test_loop_feeds_latest_candidate_screen_into_next_generation_reflection_card
     assert len(proposer.prompts) == 2
     assert "[Algorithmic-vs-Wall-Clock Divergence]" in proposer.prompts[1]
     assert "in512_c1(tau=2.38, speedup=0.85x)" in proposer.prompts[1]
+
+
+def test_screen_infra_error_records_failed_zero_strikes_and_resumes_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from evolith.zstep.remote import RemoteInfraError
+
+    class FlakyTransportRemote(FakeRemote):
+        def __init__(self) -> None:
+            super().__init__([108.0])
+            self.fail_next_screen = True
+
+        def screen(self, candidate_id: str, source: Path, evidence_dir: Path):
+            if self.fail_next_screen:
+                self.fail_next_screen = False
+                raise RemoteInfraError("SSH transport failed: Connection reset by peer")
+            return super().screen(candidate_id, source, evidence_dir)
+
+    remote = FlakyTransportRemote()
+    loop, archive, _, _ = make_loop(tmp_path, monkeypatch, generations=2, remote=remote)
+    try:
+        statuses = loop.run()
+        # Transient SSH drop during `screen` records `FAILED` (0 strikes) and halts loop
+        assert statuses == [CandidateStatus.FAILED]
+        assert archive.blocked_niches(strike_limit=2, parent_id=None) == {}
+        cid = str(archive.list_candidates()[0]["candidate_id"])
+
+        # `resume()` recovers the post-freeze `FAILED` candidate to `ACCEPTED`!
+        resumed_status = loop.resume(cid)
+        assert resumed_status == CandidateStatus.ACCEPTED
+        assert archive.current_parent() == cid
+
+        # Attempting to resume an older candidate whose `parent_id` no longer matches `current_parent()` fails closed
+        archive.start_candidate(
+            "g0000-stale",
+            0,
+            None,
+            b"patch",
+            "sha",
+            evidence_dir=str(loop.task.state_dir / "evidence/g0000-stale"),
+        )
+        with pytest.raises(RuntimeError, match="lineage parent moved"):
+            loop.resume("g0000-stale")
+    finally:
+        archive.close()
 

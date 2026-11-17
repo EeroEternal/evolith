@@ -80,3 +80,22 @@ def _select_decode_bucket(num_seqs: int, max_bucket: int = 128) -> int:
     msg = str(exc_info.value)
     assert "violates bounds" in msg
     assert "divisible by 8" in msg
+
+
+def test_dispatch_verifier_blocks_dunder_escape_and_imports_in_selector(
+    tmp_path: Path,
+) -> None:
+    dsv41 = tmp_path / "worker/zstep_worker/models/deepseek_v41.py"
+    dsv41.parent.mkdir(parents=True)
+    dsv41.write_text(
+        """
+DSV41_DECODE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
+
+def _select_decode_bucket(num_seqs: int, max_bucket: int = 128) -> int:
+    _ = ().__class__.__bases__
+    return max_bucket
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(DispatchVerificationError, match="crashed"):
+        run_dispatch_verification(tmp_path)

@@ -390,3 +390,69 @@ def test_parity_exposure_invariance_and_cross_mode_logit_drift_guards(
     v_leak = evaluate_candidate(base, cand_leaky, healthy, task)  # type: ignore[arg-type]
     assert not v_leak.accepted
     assert any("leaked idle KV cache" in r for r in v_leak.reasons)
+
+
+def test_fail_closed_cv_nan_null_chunked_and_missing_parity_guards(tmp_path: Path) -> None:
+    task = make_task(tmp_path)
+    base = benchmark(tmp_path, "base-fc", 100.0)
+    cand_ok = benchmark(tmp_path, "cand-fc", 108.0)
+
+    # 1. `require_parity=True` rejects missing parity file on screen
+    good_screen = benchmark_file(tmp_path, "cand-reqp", 95.0, labels=("in512_c1",))
+    s_no_p = evaluate_screen(good_screen, None, task, require_parity=True)
+    assert not s_no_p.passed
+    assert any("parity report missing" in r for r in s_no_p.reasons)
+
+    # 2. `chunked_schedule: null` or missing `top1_logit` fails closed
+    null_sched = tmp_path / "parity-null-sched.json"
+    null_sched.write_text(
+        json.dumps(
+            {
+                "triton_recompilations": 0,
+                "chunked_schedule": None,
+                "cases": [
+                    {
+                        "name": "france_capital",
+                        "single_vs_batched_first_mismatch": {
+                            "token_index": 2,
+                            "left_top2": {},
+                            "right_top2": {"top1_logit": 15.0},
+                        },
+                    },
+                    {
+                        "name": "prime_squares_table",
+                        "single_match": {"exact_token_match_rate": 1.0},
+                        "batched_match": {"exact_token_match_rate": 1.0},
+                        "chunked_match": {"exact_token_match_rate": 1.0},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    d_null = evaluate_candidate(base, cand_ok, null_sched, task)  # type: ignore[arg-type]
+    assert not d_null.accepted
+    assert any("chunked_schedule" in r for r in d_null.reasons)
+    assert any("top1_logit" in r for r in d_null.reasons)
+
+    # 3. Excessive round-to-round CV (`> max_tier_cv = 0.10`) is rejected
+    noisy_cand = {
+        label: [
+            rows[0].model_copy(update={"output_throughput_tok_s": 80.0}),
+            rows[1].model_copy(update={"output_throughput_tok_s": 115.0}),
+            rows[2].model_copy(update={"output_throughput_tok_s": 150.0}),
+        ]
+        for label, rows in cand_ok.items()
+    }
+    d_cv = evaluate_candidate(base, noisy_cand, parity_report(tmp_path, 0, 1.0, "pcv.json"), task)  # type: ignore[arg-type]
+    assert not d_cv.accepted
+    assert any("CV" in r for r in d_cv.reasons)
+
+    # 4. Non-positive / NaN throughput fails closed without math domain crash
+    nan_cand = {
+        label: [row.model_copy(update={"output_throughput_tok_s": float("nan")}) for row in rows]
+        for label, rows in cand_ok.items()
+    }
+    d_nan = evaluate_candidate(base, nan_cand, parity_report(tmp_path, 0, 1.0, "pnan.json"), task)  # type: ignore[arg-type]
+    assert not d_nan.accepted
+    assert any("invalid" in r.lower() or "finite" in r.lower() for r in d_nan.reasons)

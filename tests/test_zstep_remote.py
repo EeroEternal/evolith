@@ -126,7 +126,8 @@ def test_benchmark_script_uses_unique_container_names_compile_guard_and_trap(
     assert "trap 'rm -rf " in verify_script
     assert f'--bench-tiers "{task.verify_tiers}"' in verify_script
     assert "--repeats 1" in verify_script
-    assert "--model-dir /data02/DeepSeek-V4.1-Flash-1017" in verify_script
+    assert f"--model-dir {task.model_dir}" in verify_script
+    assert "NCCL_P2P_DISABLE=1" not in verify_script
     assert "--max-prefill-chunk 24 --verify-greedy-json docs/benchmarks/phase3_vllm_greedy_reference.json" in verify_script
     assert "sudo" not in verify_script
 

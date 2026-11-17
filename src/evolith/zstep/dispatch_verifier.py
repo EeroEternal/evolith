@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Callable
 
 from pydantic import BaseModel, Field
@@ -92,6 +95,16 @@ def _compile_isolated_selector(
     for child in ast.walk(stripped):
         if isinstance(child, ast.arg):
             child.annotation = None
+        elif isinstance(child, (ast.Import, ast.ImportFrom)):
+            raise ValueError(f"Import forbidden inside selector `{fn_name}`")
+        elif isinstance(child, ast.Attribute) and child.attr.startswith("__"):
+            raise ValueError(
+                f"Dunder attribute `{child.attr}` forbidden inside selector `{fn_name}`"
+            )
+        elif isinstance(child, ast.Name) and child.id.startswith("__"):
+            raise ValueError(
+                f"Dunder identifier `{child.id}` forbidden inside selector `{fn_name}`"
+            )
     mod = ast.Module(body=[stripped], type_ignores=[])
     ast.fix_missing_locations(mod)
     ns: dict[str, object] = {"__builtins__": dict(_SAFE_BUILTINS), **constants}
@@ -173,6 +186,68 @@ def verify_bucket_selector_exhaustively(
     return checked, violations
 
 
+def _verify_selector_in_subprocess(
+    file_path: Path,
+    fn_name: str,
+    ladder: tuple[int, ...],
+    consts: dict[str, object],
+    label: str,
+    timeout_sec: float = 5.0,
+) -> tuple[int, list[str]] | None:
+    payload = json.dumps(
+        {
+            "file_path": str(file_path),
+            "fn_name": fn_name,
+            "ladder": list(ladder),
+            "consts": {
+                k: list(v) if isinstance(v, tuple) else v
+                for k, v in consts.items()
+                if isinstance(v, (int, float, str, bool, list, tuple))
+            },
+            "label": label,
+        }
+    )
+    src_root = str(Path(__file__).resolve().parents[2])
+    code = (
+        "import ast, json, sys\n"
+        f"sys.path.insert(0, {src_root!r})\n"
+        "from pathlib import Path\n"
+        "from evolith.zstep.dispatch_verifier import (\n"
+        "    _compile_isolated_selector,\n"
+        "    verify_bucket_selector_exhaustively,\n"
+        ")\n"
+        "cfg = json.loads(sys.stdin.read())\n"
+        "tree = ast.parse(Path(cfg['file_path']).read_text(encoding='utf-8'))\n"
+        "consts = {k: tuple(v) if isinstance(v, list) else v for k, v in cfg['consts'].items()}\n"
+        "fn = _compile_isolated_selector(tree, cfg['fn_name'], consts)\n"
+        "if fn is None:\n"
+        "    print(json.dumps({'present': False}))\n"
+        "else:\n"
+        "    pairs, errs = verify_bucket_selector_exhaustively(fn, tuple(cfg['ladder']), cfg['label'])\n"
+        "    print(json.dumps({'present': True, 'pairs': pairs, 'errs': errs}))\n"
+    )
+    scrubbed_env = {"PATH": os.environ.get("PATH", "")}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-I", "-c", code],
+            input=payload,
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            env=scrubbed_env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return 0, [f"{label} timed out after {timeout_sec:.1f}s during exhaustive verification"]
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()[-1:] or ["subprocess error"]
+        return 0, [f"{label} crashed during verification: {detail[0]}"]
+    out = json.loads(proc.stdout.strip())
+    if not out.get("present"):
+        return None
+    return int(out["pairs"]), list(out["errs"])
+
+
 def run_dispatch_verification(
     candidate_dir: Path,
     evidence_dir: Path | None = None,
@@ -215,16 +290,26 @@ def run_dispatch_verification(
             ladder = base_ladder
 
         consts_with_default = {"DECODE_GRAPH_BUCKETS": base_ladder, **consts}
+        found_in_file = 0
         for fn_name in sorted(_SELECTOR_FN_NAMES):
-            fn = _compile_isolated_selector(tree, fn_name, consts_with_default)
-            if fn is None:
-                continue
-            pairs, errs = verify_bucket_selector_exhaustively(
-                fn, ladder, f"{rel_path}:{fn_name}"
+            sub_res = _verify_selector_in_subprocess(
+                file_path,
+                fn_name,
+                ladder,
+                consts_with_default,
+                f"{rel_path}:{fn_name}",
             )
+            if sub_res is None:
+                continue
+            found_in_file += 1
+            pairs, errs = sub_res
             checked_pairs += pairs
             verified_selectors.append(f"{rel_path}:{fn_name}")
             violations.extend(errs)
+        if rel_path.endswith("shm_bridge.py") and "DECODE_GRAPH_BUCKETS" in consts and found_in_file == 0:
+            violations.append(
+                f"{rel_path}: expected bucket selector function (`select_decode_bucket`) is missing"
+            )
 
     b12x_path = candidate_dir / "worker/zstep_worker/kernels_sm120/b12x_dsv41.py"
     if b12x_path.is_file():

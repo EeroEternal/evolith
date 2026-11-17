@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+import os
 from pathlib import Path
 
 from pydantic import BaseModel, Field, model_validator
@@ -77,11 +78,22 @@ class VerificationDecision(BaseModel):
 class ZStepRSITask(BaseModel):
     project_root: Path
     source_repo: Path
-    baseline_sha: str = "596d4ef"
-    remote_user: str = "node-user"
-    remote_host: str = "10.23.51.33"
+    baseline_sha: str = "2bea5a1"
+    remote_user: str = Field(
+        default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_USER", "ubuntu")
+    )
+    remote_host: str = Field(
+        default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_HOST", "127.0.0.1")
+    )
     remote_root: str = "evolith-rsi"
-    model_dir: str = "/data02/DeepSeek-V4.1-Flash-1017"
+    remote_rustup_root: str = Field(
+        default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_RUSTUP_ROOT", "")
+    )
+    model_dir: str = Field(
+        default_factory=lambda: os.environ.get(
+            "EVOLITH_ZSTEP_MODEL_DIR", "/models/DeepSeek-V4.1-Flash"
+        )
+    )
     model_id: str = "DeepSeek-V4.1-Flash"
     model_type: str = "deepseek_v41"
     image: str = "vllm/vllm-openai:v0.31.0"
@@ -98,6 +110,7 @@ class ZStepRSITask(BaseModel):
     max_ttft_regression: float = 0.05
     max_tpot_regression: float = 0.05
     max_p99_itl_regression: float = 0.05
+    max_tier_cv: float = Field(default=0.10, ge=0.0)
     max_screen_throughput_regression: float = 0.02
     max_screen_latency_regression: float = 0.08
     keep_remote_stage: bool = False
@@ -108,7 +121,10 @@ class ZStepRSITask(BaseModel):
     proposer_api_base: str = "http://127.0.0.1:8080/v1"
     proposer_model: str = "DeepSeek-V4.1-Flash"
     enable_gpu_smoke: bool = False
-    gpu_smoke_tests: tuple[str, ...] = ("worker/tests/test_shm_layout_parity.py",)
+    gpu_smoke_tests: tuple[str, ...] = (
+        "worker/tests/test_shm_layout_parity.py",
+        "worker/tests/test_p2p_probe.py",
+    )
     premise_strike_limit: int = Field(default=2, ge=1)
     parity_prefill_chunk: int = Field(default=24, ge=1)
     max_cross_mode_logit_drift: float = Field(default=8.0, ge=0.0)
@@ -121,15 +137,18 @@ class ZStepRSITask(BaseModel):
         "docs/benchmarks/phase3_vllm_greedy_reference.json",
         "scripts/prepare_sm120_overlay.sh",
         "crates/zs-wire/src/lib.rs",
+        "crates/zs-server/src/lib.rs",
         "worker/zstep_worker/shm_bridge.py",
+        "worker/tests/test_shm_layout_parity.py",
     )
     allowed_roots: tuple[str, ...] = (
         "worker/zstep_worker/models/deepseek_v41.py",
+        "worker/zstep_worker/models/deepseek_v41_dspark.py",
         "worker/zstep_worker/runtime_loop.py",
+        "worker/zstep_worker/p2p_probe.py",
+        "worker/zstep_worker/spec_decode.py",
         "worker/zstep_worker/kernels_sm120",
         "crates/zs-scheduler/src",
-        "crates/zs-server/src/main.rs",
-        "worker/tests",
     )
 
     @property

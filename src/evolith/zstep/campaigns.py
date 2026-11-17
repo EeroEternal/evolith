@@ -33,36 +33,25 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         allowed_roots=(
             "worker/zstep_worker/models/deepseek_v41.py",
             "worker/zstep_worker/kernels_sm120/shm_allreduce.py",
-            "crates/zs-server/src/main.rs",
-            "worker/tests",
         ),
         complexity_free_lines=180,
         max_changed_lines=320,
         blueprint=(
             "[Active Campaign T1-1 Blueprint — Device-Resident Decode + GPU Engram Window]\n"
-            "  - Reference Blueprint: `worker/zstep_worker/models/qwen35_moe.py` (`launch`/`finish` split, "
-            "`parity = header.step_id & 1` double-buffered host staging & CUDA events, `STEP_FLAG_DEVICE_TOKENS`).\n"
-            "  - Why `deepseek_v41` is currently non-overlapped: `crates/zs-server/src/main.rs` disables "
-            "`engine.set_device_token_overlap` on `is_dsv41` ONLY because `DeepSeekV41StepRunner` lacks "
-            "`launch`/`finish` and reads `engram_prev_window` from host every decode step.\n"
-            "  - Exact Invariants Required (vstack Pillars: Agreement + Isolation + Integrity):\n"
-            "    1. CRITICAL TP8 Agreement (`shm_allreduce.py`): `tp8_argmax_gather_shm_kernel` currently "
-            "writes `out_top2_tokens` ONLY under `if (rank == 0)`! Before reading `out_tokens_gpu` on "
-            "`STEP_FLAG_DEVICE_TOKENS` steps, ALL 8 ranks must merge `slot_pairs` into `out_top2_tokens` "
-            "so ranks 0..7 feed identical sampled token IDs.\n"
-            "    2. Per-Slot GPU State (`deepseek_v41.py`): maintain `last_token_gpu[max_seqs]` and "
-            "`slot_lookback_gpu[max_seqs, 3]` (`[t-1, t-2, t-3]`). Note PyTorch dtype invariant: "
-            "`comp_bt_gpu` is `torch.int32`, whereas `index_select`/`index_copy_` strictly require "
-            "`torch.int64` (`long`) index tensors (cast `.to(torch.int64)` or allocate slot index buffers as `torch.int64`). "
-            "On any non-`STEP_FLAG_DEVICE_TOKENS` step "
-            "(prefill/mixed or initial decode step), seed from host `tok_np` & `prev_win_np`; at step end "
-            "(inside captured decode graph & after eager sample), shift `slot_lookback_gpu[slot] = "
-            "[cur_input_tok, prev_lb_0, prev_lb_1]` and store `last_token_gpu[slot] = sampled_top1_tok`.\n"
-            "    3. Parity Double-Buffering: use `parity = header.step_id & 1` for host pinned staging "
+            "  - Reference Blueprint: `worker/zstep_worker/models/qwen35_moe.py` & `deepseek_v41.py` "
+            "(`launch`/`finish` split, `parity = header.step_id & 1` double-buffered host staging & "
+            "CUDA events, `STEP_FLAG_DEVICE_TOKENS`, already wired in pinned `crates/zs-server/src/lib.rs`).\n"
+            "  - Optimization Focus at `2bea5a1`: eliminate any remaining host-staging overhead, redundant "
+            "event waits, or lookback/token scatter bottlenecks inside `DeepSeekV41StepRunner` (`deepseek_v41.py`) "
+            "and `shm_allreduce.py` while strictly preserving:\n"
+            "    1. CRITICAL TP8 Agreement (`shm_allreduce.py`): all 8 ranks must merge `slot_pairs` into "
+            "`out_top2_tokens` identically on `STEP_FLAG_DEVICE_TOKENS` steps.\n"
+            "    2. Per-Slot GPU State (`deepseek_v41.py`): `last_token_gpu[max_seqs]` and "
+            "`slot_lookback_gpu[max_seqs, 3]` (`[t-1, t-2, t-3]`) with `torch.int64` index tensors for "
+            "`index_select`/`index_copy_`, re-seeded on non-`STEP_FLAG_DEVICE_TOKENS` steps.\n"
+            "    3. Parity Double-Buffering: `parity = header.step_id & 1` for host pinned staging "
             "buffers and `start_events[parity]`/`end_events[parity]` so `launch(step N+1)` never overwrites "
-            "buffers still read by `step N`.\n"
-            "    4. Enable `engine.set_device_token_overlap(std::env::var(\"ZSTEP_DECODE_DEVICE_TOKENS\")"
-            ".map_or(true, |v| v != \"0\"))` in `crates/zs-server/src/main.rs`."
+            "buffers still read by `step N`."
         ),
     ),
     CampaignSpec(
@@ -75,9 +64,9 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         primary_niche_key="(plane=l1_kernel,focus=sm120_dispatch_buckets)",
         allowed_roots=(
             "worker/zstep_worker/models/deepseek_v41.py",
+            "worker/zstep_worker/p2p_probe.py",
             "worker/zstep_worker/kernels_sm120/b12x_dsv41.py",
             "worker/zstep_worker/kernels_sm120/shm_allreduce.py",
-            "worker/tests",
         ),
         complexity_free_lines=90,
         max_changed_lines=180,
@@ -107,7 +96,6 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         primary_niche_key="(plane=l2_scheduler,focus=adaptive_chunked_prefill)",
         allowed_roots=(
             "crates/zs-scheduler/src",
-            "crates/zs-server/src/main.rs",
         ),
         complexity_free_lines=120,
         max_changed_lines=240,
@@ -132,7 +120,6 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
             "worker/zstep_worker/models/deepseek_v41.py",
             "worker/zstep_worker/runtime_loop.py",
             "crates/zs-scheduler/src",
-            "worker/tests",
         ),
         complexity_free_lines=140,
         max_changed_lines=260,
@@ -155,7 +142,6 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
             "worker/zstep_worker/kernels_sm120/norm_quant.py",
             "worker/zstep_worker/kernels_sm120/moe_router.py",
             "worker/zstep_worker/kernels_sm120/b12x_dsv41.py",
-            "worker/tests",
         ),
         complexity_free_lines=120,
         max_changed_lines=240,
@@ -181,7 +167,6 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
             "worker/zstep_worker/models/qwen35_moe.py",
             "worker/zstep_worker/models/qwen35_mtp.py",
             "crates/zs-scheduler/src",
-            "worker/tests",
         ),
         complexity_free_lines=160,
         max_changed_lines=300,

@@ -123,3 +123,8 @@ def test_freeze_source_excludes_git_and_build_outputs(tmp_path: Path) -> None:
         names = tar.getnames()
     assert "worker/zstep_worker/runtime_loop.py" in names
     assert not any(name.startswith((".git", "target", "worker/__pycache__")) for name in names)
+
+    # Identical source content frozen across two clones produces byte-identical SHA-256
+    candidate_two = manager.create_candidate("g0002-archive", [])
+    archive_two = manager.freeze_source(candidate_two, tmp_path / "evidence/candidate2.tar.gz")
+    assert archive.read_bytes() == archive_two.read_bytes()

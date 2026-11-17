@@ -46,10 +46,25 @@ FORBIDDEN_NAMES: frozenset[str] = frozenset(
 
 FORBIDDEN_ATTRS: frozenset[str] = frozenset(
     {
+        "_core",
+        "ag_frame",
+        "core",
+        "cr_frame",
+        "ctypes",
+        "ctypeslib",
         "cudaStreamCreate",
         "cudaStreamCreateWithFlags",
+        "distutils",
+        "f2py",
+        "f_back",
+        "f_builtins",
+        "f_code",
+        "f_globals",
+        "f_locals",
         "fork",
         "fromfile",
+        "func_globals",
+        "gi_frame",
         "kill",
         "load",
         "loadtxt",
@@ -57,6 +72,7 @@ FORBIDDEN_ATTRS: frozenset[str] = frozenset(
         "open",
         "popen",
         "Popen",
+        "rec",
         "remove",
         "rmdir",
         "rmtree",
@@ -67,6 +83,8 @@ FORBIDDEN_ATTRS: frozenset[str] = frozenset(
         "savetxt",
         "spawn",
         "system",
+        "tb_frame",
+        "testing",
         "tofile",
         "unlink",
         "urlopen",
@@ -172,6 +190,14 @@ def audit_sandboxed_python(
     for node in ast.walk(tree):
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             return False, "Anti-Cheat Gate: 'global'/'nonlocal' statement forbidden inside kernel."
+        if isinstance(
+            node,
+            (ast.AsyncFunctionDef, ast.ClassDef, ast.Yield, ast.YieldFrom, ast.Await),
+        ):
+            return (
+                False,
+                f"Anti-Cheat Gate: Disallowed construct '{type(node).__name__}' inside sandbox.",
+            )
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name not in allowed_modules:
@@ -218,6 +244,102 @@ def audit_sandboxed_python(
     return True, "OK"
 
 
+_ALLOWED_NUMPY_ATTRS: frozenset[str] = frozenset(
+    {
+        "abs",
+        "all",
+        "allclose",
+        "amax",
+        "amin",
+        "any",
+        "arange",
+        "argmax",
+        "argmin",
+        "argsort",
+        "array",
+        "asarray",
+        "bool_",
+        "clip",
+        "concatenate",
+        "cos",
+        "dot",
+        "einsum",
+        "empty",
+        "empty_like",
+        "exp",
+        "expand_dims",
+        "eye",
+        "float16",
+        "float32",
+        "float64",
+        "floor",
+        "full",
+        "full_like",
+        "inf",
+        "int32",
+        "int64",
+        "isfinite",
+        "isnan",
+        "linalg",
+        "log",
+        "log1p",
+        "matmul",
+        "max",
+        "maximum",
+        "mean",
+        "min",
+        "minimum",
+        "nan",
+        "ndarray",
+        "newaxis",
+        "ones",
+        "ones_like",
+        "percentile",
+        "pi",
+        "power",
+        "prod",
+        "reciprocal",
+        "reshape",
+        "rint",
+        "round",
+        "sin",
+        "sort",
+        "sqrt",
+        "square",
+        "squeeze",
+        "stack",
+        "std",
+        "sum",
+        "tanh",
+        "transpose",
+        "uint8",
+        "var",
+        "where",
+        "zeros",
+        "zeros_like",
+    }
+)
+
+
+class _SafeModuleProxy:
+    __slots__ = ("_mod", "_allowed", "_name")
+
+    def __init__(self, mod: Any, allowed: frozenset[str], name: str) -> None:
+        object.__setattr__(self, "_mod", mod)
+        object.__setattr__(self, "_allowed", allowed)
+        object.__setattr__(self, "_name", name)
+
+    def __getattr__(self, attr: str) -> Any:
+        if attr not in object.__getattribute__(self, "_allowed"):
+            raise AttributeError(
+                f"Anti-Cheat Gate: Attribute '{object.__getattribute__(self, '_name')}.{attr}' is not in sandbox allowlist"
+            )
+        return getattr(object.__getattribute__(self, "_mod"), attr)
+
+    def __setattr__(self, attr: str, value: Any) -> None:
+        raise TypeError("Sandbox module proxy is read-only")
+
+
 def make_safe_builtins(allowed_modules: frozenset[str]) -> dict[str, object]:
     def _safe_import(
         name: str,
@@ -231,113 +353,11 @@ def make_safe_builtins(allowed_modules: frozenset[str]) -> dict[str, object]:
         mod = importlib.import_module(name)
         if not fromlist and "." in name:
             return importlib.import_module(name.split(".", 1)[0])
+        if name == "numpy":
+            return _SafeModuleProxy(mod, _ALLOWED_NUMPY_ATTRS, "numpy")
         return mod
 
     return {**_SAFE_BUILTIN_SYMBOLS, "__import__": _safe_import}
-
-
-def run_isolated_subprocess_probe(
-    source_code: str,
-    *,
-    mode: str,
-    op_name: str = "",
-    timeout_sec: float = 5.0,
-) -> tuple[bool, str]:
-    """
-    Executes untrusted candidate source inside an isolated `-I` child Python process
-    with restricted `__builtins__` and a wall-clock timeout before any parent-process
-    evaluation occurs.
-    """
-    src_root = str(Path(__file__).resolve().parents[2])
-    payload = json.dumps({"source": source_code, "mode": mode, "op_name": op_name})
-    runner_script = (
-        "import json, sys\n"
-        f"sys.path.insert(0, {src_root!r})\n"
-        "import numpy as np\n"
-        "from evolith.verifiers.kernel_sandbox import _subprocess_entry\n"
-        "_subprocess_entry(json.loads(sys.stdin.read()))\n"
-    )
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "OMP_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-        "OPENBLAS_NUM_THREADS": "1",
-    }
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-I", "-c", runner_script],
-            input=payload,
-            text=True,
-            capture_output=True,
-            timeout=timeout_sec,
-            env=env,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"Sandbox subprocess timed out after {timeout_sec:.1f}s"
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip().splitlines()
-        msg = detail[-1] if detail else f"exit code {proc.returncode}"
-        return False, f"Sandbox subprocess rejected candidate: {msg}"
-    return True, "OK"
-
-
-def _subprocess_entry(spec: dict[str, str]) -> None:
-    source = spec["source"]
-    mode = spec["mode"]
-    if mode == "l1_kernel":
-        allowed = frozenset({"numpy", "math"})
-        ok, reason = audit_sandboxed_python(source, allowed_modules=allowed)
-        if not ok:
-            raise RuntimeError(reason)
-        ns: dict[str, object] = {"__builtins__": make_safe_builtins(allowed)}
-        exec(compile(source, "<sandboxed_kernel>", "exec"), ns)
-        fn = ns.get("kernel_fn")
-        if not callable(fn):
-            raise ValueError("Source code must define a callable 'kernel_fn(...)'.")
-        rng = np.random.default_rng(0)
-        if spec.get("op_name") == "triattention_prerope_score":
-            args: tuple[np.ndarray, ...] = (
-                rng.standard_normal((2, 16, 64), dtype=np.float32),
-                rng.standard_normal((2, 64), dtype=np.float32),
-                rng.uniform(-0.1, 0.1, size=(128,)).astype(np.float32),
-            )
-        else:
-            args = (
-                rng.standard_normal((2, 64), dtype=np.float32),
-                rng.standard_normal((2, 64), dtype=np.float32),
-                rng.uniform(0.5, 1.5, size=(64,)).astype(np.float32),
-            )
-        _ = fn(*args)
-    elif mode == "l2_policy":
-        from evolith.planes.l2_policies import EngineStepState
-
-        allowed = frozenset({"math", "evolith.planes.l2_policies"})
-        ok, reason = audit_sandboxed_python(source, allowed_modules=allowed)
-        if not ok:
-            raise RuntimeError(reason)
-        ns = {"__builtins__": make_safe_builtins(allowed)}
-        exec(compile(source, "<sandboxed_l2_policy>", "exec"), ns)
-        state = EngineStepState(
-            running_decode_reqs=4,
-            waiting_prefill_tokens=512,
-            free_gpu_kv_blocks=1024,
-            total_gpu_kv_blocks=2048,
-            ema_draft_accept_len=3.5,
-            ema_tpot_ms=12.0,
-        )
-        for req_fn in (
-            "propose_speculative_config",
-            "compute_chunked_prefill_budget",
-            "score_kv_block_retention",
-        ):
-            if not callable(ns.get(req_fn)):
-                raise ValueError(f"Policy code missing callable '{req_fn}'.")
-        _ = ns["propose_speculative_config"](state, 2048, 4)  # type: ignore[operator]
-        _ = ns["compute_chunked_prefill_budget"](state)  # type: ignore[operator]
-        _ = ns["score_kv_block_retention"](1.0, 1024, 0.5, False, 0.0, 10.0)  # type: ignore[operator]
-    else:
-        raise ValueError(f"Unknown sandbox mode: {mode}")
 
 
 class HardenedKernelVerifier:
@@ -395,6 +415,8 @@ class HardenedKernelVerifier:
         op_name: str,
         candidate_code: str,
         baseline_code: str,
+        *,
+        timeout_sec: float = 10.0,
     ) -> KernelEvalResult:
         loc = len(
             [
@@ -403,8 +425,6 @@ class HardenedKernelVerifier:
                 if ln.strip() and not ln.strip().startswith("#")
             ]
         )
-
-        # Stage 1: Static AST + Isolated Subprocess Gate
         ok_ast, reason = self.stage1_static_ast_gate(candidate_code)
         if not ok_ast:
             return KernelEvalResult(
@@ -416,17 +436,85 @@ class HardenedKernelVerifier:
                 rejection_reason=reason,
             )
 
-        ok_sub, sub_reason = run_isolated_subprocess_probe(
-            candidate_code, mode="l1_kernel", op_name=op_name
+        src_root = str(Path(__file__).resolve().parents[2])
+        payload = json.dumps(
+            {
+                "op_name": op_name,
+                "candidate_code": candidate_code,
+                "baseline_code": baseline_code,
+                "ring_buffer_slots": self.ring_buffer_slots,
+                "timed_iters": self.timed_iters,
+            }
         )
-        if not ok_sub:
+        runner_script = (
+            "import json, sys\n"
+            f"sys.path.insert(0, {src_root!r})\n"
+            "from evolith.verifiers.kernel_sandbox import HardenedKernelVerifier\n"
+            "cfg = json.loads(sys.stdin.read())\n"
+            "v = HardenedKernelVerifier(ring_buffer_slots=cfg['ring_buffer_slots'], timed_iters=cfg['timed_iters'])\n"
+            "res = v._evaluate_in_process(cfg['op_name'], cfg['candidate_code'], cfg['baseline_code'])\n"
+            "sys.stdout.write(res.model_dump_json())\n"
+        )
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+        }
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-I", "-c", runner_script],
+                input=payload,
+                text=True,
+                capture_output=True,
+                timeout=timeout_sec,
+                env=env,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
             return KernelEvalResult(
                 op_name=op_name,
                 passed_ast_gate=True,
                 passed_correctness_gate=False,
                 passed_anti_cheat_gate=False,
                 loc=loc,
-                rejection_reason=sub_reason,
+                rejection_reason=f"Sandbox subprocess timed out after {timeout_sec:.1f}s",
+            )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip().splitlines()
+            msg = detail[-1] if detail else f"exit code {proc.returncode}"
+            return KernelEvalResult(
+                op_name=op_name,
+                passed_ast_gate=True,
+                passed_correctness_gate=False,
+                passed_anti_cheat_gate=False,
+                loc=loc,
+                rejection_reason=f"Sandbox subprocess rejected candidate: {msg}",
+            )
+        return KernelEvalResult.model_validate_json(proc.stdout)
+
+    def _evaluate_in_process(
+        self,
+        op_name: str,
+        candidate_code: str,
+        baseline_code: str,
+    ) -> KernelEvalResult:
+        loc = len(
+            [
+                ln
+                for ln in candidate_code.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+        )
+        ok_ast, reason = self.stage1_static_ast_gate(candidate_code)
+        if not ok_ast:
+            return KernelEvalResult(
+                op_name=op_name,
+                passed_ast_gate=False,
+                passed_correctness_gate=False,
+                passed_anti_cheat_gate=False,
+                loc=loc,
+                rejection_reason=reason,
             )
 
         try:
@@ -442,7 +530,7 @@ class HardenedKernelVerifier:
                 rejection_reason=f"Compilation failed: {exc}",
             )
 
-        # Stage 2: Standard + Adversarial Prime Shapes + Input Immutability Checksum
+        # Stage 2: Standard + Adversarial Prime Shapes + Exact Input Immutability Check
         rng = np.random.default_rng(42)
         test_shapes = [(1, 256), (4, 512), (8, 512), (3, 509), (7, 251)]
         max_diff_overall = 0.0
@@ -450,9 +538,9 @@ class HardenedKernelVerifier:
 
         for b, d in test_shapes:
             inputs = self._make_inputs(op_name, b, d, rng)
-            checksums_before = [float(np.sum(arr, dtype=np.float64)) for arr in inputs]
+            snapshots = [arr.copy() for arr in inputs]
             try:
-                ref_out = base_fn(*inputs)
+                ref_out = base_fn(*[arr.copy() for arr in snapshots])
                 cand_out = cand_fn(*inputs)
             except Exception as exc:
                 return KernelEvalResult(
@@ -464,8 +552,7 @@ class HardenedKernelVerifier:
                     rejection_reason=f"Runtime error on shape {(b, d)}: {exc}",
                 )
 
-            checksums_after = [float(np.sum(arr, dtype=np.float64)) for arr in inputs]
-            if not np.allclose(checksums_before, checksums_after, rtol=1e-6, atol=1e-6):
+            if any(not np.array_equal(arr, snap) for arr, snap in zip(inputs, snapshots)):
                 return KernelEvalResult(
                     op_name=op_name,
                     passed_ast_gate=True,
@@ -475,39 +562,61 @@ class HardenedKernelVerifier:
                     rejection_reason="Anti-Cheat Gate: In-place mutation of read-only input tensors detected.",
                 )
 
-            if cand_out.shape != ref_out.shape:
+            ref_tensors = ref_out if isinstance(ref_out, tuple) else (ref_out,)
+            cand_tensors = cand_out if isinstance(cand_out, tuple) else (cand_out,)
+            if len(cand_tensors) != len(ref_tensors):
                 return KernelEvalResult(
                     op_name=op_name,
                     passed_ast_gate=True,
                     passed_correctness_gate=False,
                     passed_anti_cheat_gate=True,
                     loc=loc,
-                    rejection_reason=f"Shape mismatch: got {cand_out.shape}, expected {ref_out.shape}",
+                    rejection_reason=f"Output arity mismatch: got {len(cand_tensors)}, expected {len(ref_tensors)}",
                 )
 
-            diff = float(
-                np.max(np.abs(cand_out.astype(np.float64) - ref_out.astype(np.float64)))
-            )
-            max_diff_overall = max(max_diff_overall, diff)
-            flat_c = cand_out.astype(np.float64).ravel()
-            flat_r = ref_out.astype(np.float64).ravel()
-            cos = float(
-                np.dot(flat_c, flat_r)
-                / (np.linalg.norm(flat_c) * np.linalg.norm(flat_r) + 1e-12)
-            )
-            min_cos_overall = min(min_cos_overall, cos)
-
-            if diff > 5e-2 or cos < 0.999:
-                return KernelEvalResult(
-                    op_name=op_name,
-                    passed_ast_gate=True,
-                    passed_correctness_gate=False,
-                    passed_anti_cheat_gate=True,
-                    max_abs_diff=diff,
-                    cosine_sim=cos,
-                    loc=loc,
-                    rejection_reason=f"Numerical mismatch on shape {(b, d)}: max_diff={diff:.4e}, cos={cos:.6f}",
+            for cand_arr_raw, ref_arr_raw in zip(cand_tensors, ref_tensors):
+                cand_arr = np.asarray(cand_arr_raw)
+                ref_arr = np.asarray(ref_arr_raw)
+                if cand_arr.shape != ref_arr.shape:
+                    return KernelEvalResult(
+                        op_name=op_name,
+                        passed_ast_gate=True,
+                        passed_correctness_gate=False,
+                        passed_anti_cheat_gate=True,
+                        loc=loc,
+                        rejection_reason=f"Shape mismatch: got {cand_arr.shape}, expected {ref_arr.shape}",
+                    )
+                if not np.all(np.isfinite(cand_arr)):
+                    return KernelEvalResult(
+                        op_name=op_name,
+                        passed_ast_gate=True,
+                        passed_correctness_gate=False,
+                        passed_anti_cheat_gate=True,
+                        loc=loc,
+                        rejection_reason=f"Non-finite output on shape {(b, d)}",
+                    )
+                diff = float(
+                    np.max(np.abs(cand_arr.astype(np.float64) - ref_arr.astype(np.float64)))
                 )
+                max_diff_overall = max(max_diff_overall, diff)
+                flat_c = cand_arr.astype(np.float64).ravel()
+                flat_r = ref_arr.astype(np.float64).ravel()
+                cos = float(
+                    np.dot(flat_c, flat_r)
+                    / (np.linalg.norm(flat_c) * np.linalg.norm(flat_r) + 1e-12)
+                )
+                min_cos_overall = min(min_cos_overall, cos)
+                if diff > 5e-2 or cos < 0.999:
+                    return KernelEvalResult(
+                        op_name=op_name,
+                        passed_ast_gate=True,
+                        passed_correctness_gate=False,
+                        passed_anti_cheat_gate=True,
+                        max_abs_diff=diff,
+                        cosine_sim=cos,
+                        loc=loc,
+                        rejection_reason=f"Numerical mismatch on shape {(b, d)}: max_diff={diff:.4e}, cos={cos:.6f}",
+                    )
 
         # Stage 3 & 4: Ring-Buffer Timing & Analytic Roofline Classification across buckets
         buckets = [("batch_1", 1, 512), ("batch_4", 4, 512), ("batch_16", 16, 512)]

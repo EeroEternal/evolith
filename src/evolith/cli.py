@@ -228,8 +228,21 @@ def archive_cmd(
 @app.command("zstep-evolve")
 def zstep_evolve_cmd(
     source: str = typer.Option("~/github/zstep", "--source"),
-    host: str = typer.Option("10.23.51.33", "--host"),
-    user: str = typer.Option("node-user", "--user"),
+    host: str = typer.Option("127.0.0.1", "--host", envvar="EVOLITH_ZSTEP_HOST"),
+    user: str = typer.Option("ubuntu", "--user", envvar="EVOLITH_ZSTEP_USER"),
+    model_dir: str = typer.Option(
+        "/models/DeepSeek-V4.1-Flash",
+        "--model-dir",
+        envvar="EVOLITH_ZSTEP_MODEL_DIR",
+        help="Remote model weights directory mounted read-only into benchmark containers.",
+    ),
+    rustup_root: str = typer.Option(
+        "",
+        "--rustup-root",
+        envvar="EVOLITH_ZSTEP_RUSTUP_ROOT",
+        help="Optional remote rustup installation prefix containing cargo/ and rustup/.",
+    ),
+    baseline_sha: str = typer.Option("2bea5a1", "--baseline-sha"),
     generations: int = typer.Option(1, "--generations", min=1, max=100),
     local_timeout: int = typer.Option(1800, "--local-timeout", min=1),
     campaign: str = typer.Option(
@@ -272,8 +285,11 @@ def zstep_evolve_cmd(
     task = ZStepRSITask(
         project_root=Path.cwd(),
         source_repo=Path(source).expanduser().resolve(),
+        baseline_sha=baseline_sha,
         remote_host=host,
         remote_user=user,
+        remote_rustup_root=rustup_root,
+        model_dir=model_dir,
         max_generations=generations,
         local_timeout_sec=local_timeout,
         campaign=campaign,
@@ -308,8 +324,21 @@ def zstep_submit_cmd(
         help="Concise summary of the code mutation.",
     ),
     source: str = typer.Option("~/github/zstep", "--source"),
-    host: str = typer.Option("10.23.51.33", "--host"),
-    user: str = typer.Option("node-user", "--user"),
+    host: str = typer.Option("127.0.0.1", "--host", envvar="EVOLITH_ZSTEP_HOST"),
+    user: str = typer.Option("ubuntu", "--user", envvar="EVOLITH_ZSTEP_USER"),
+    model_dir: str = typer.Option(
+        "/models/DeepSeek-V4.1-Flash",
+        "--model-dir",
+        envvar="EVOLITH_ZSTEP_MODEL_DIR",
+        help="Remote model weights directory mounted read-only into benchmark containers.",
+    ),
+    rustup_root: str = typer.Option(
+        "",
+        "--rustup-root",
+        envvar="EVOLITH_ZSTEP_RUSTUP_ROOT",
+        help="Optional remote rustup installation prefix containing cargo/ and rustup/.",
+    ),
+    baseline_sha: str = typer.Option("2bea5a1", "--baseline-sha"),
     local_timeout: int = typer.Option(1800, "--local-timeout", min=1),
     campaign: str = typer.Option(
         "none",
@@ -322,6 +351,11 @@ def zstep_submit_cmd(
         "--propose-only",
         help="Run Coordinator local/RedTeam/dispatch gates and freeze archives without remote SSH.",
     ),
+    gpu_smoke: bool = typer.Option(
+        False,
+        "--gpu-smoke",
+        help="Run fast container GPU smoke tests before full 475 GiB benchmark sweeps.",
+    ),
 ) -> None:
     """Submit a unified diff directly through Evolith's full Coordinator gates, screen, and 3-round verify."""
     from evolith.zstep.archive import ZStepArchive
@@ -332,12 +366,16 @@ def zstep_submit_cmd(
     task = ZStepRSITask(
         project_root=Path.cwd(),
         source_repo=Path(source).expanduser().resolve(),
+        baseline_sha=baseline_sha,
         remote_host=host,
         remote_user=user,
+        remote_rustup_root=rustup_root,
+        model_dir=model_dir,
         max_generations=1,
         local_timeout_sec=local_timeout,
         campaign=campaign,
         propose_only=propose_only,
+        enable_gpu_smoke=gpu_smoke,
     )
     proposer = PatchProposer(
         Path(patch),
@@ -405,8 +443,26 @@ def zstep_campaigns_cmd() -> None:
 def zstep_resume_cmd(
     candidate_id: str,
     source: str = typer.Option("~/github/zstep", "--source"),
-    host: str = typer.Option("10.23.51.33", "--host"),
-    user: str = typer.Option("node-user", "--user"),
+    host: str = typer.Option("127.0.0.1", "--host", envvar="EVOLITH_ZSTEP_HOST"),
+    user: str = typer.Option("ubuntu", "--user", envvar="EVOLITH_ZSTEP_USER"),
+    model_dir: str = typer.Option(
+        "/models/DeepSeek-V4.1-Flash",
+        "--model-dir",
+        envvar="EVOLITH_ZSTEP_MODEL_DIR",
+        help="Remote model weights directory mounted read-only into benchmark containers.",
+    ),
+    rustup_root: str = typer.Option(
+        "",
+        "--rustup-root",
+        envvar="EVOLITH_ZSTEP_RUSTUP_ROOT",
+        help="Optional remote rustup installation prefix containing cargo/ and rustup/.",
+    ),
+    baseline_sha: str = typer.Option("2bea5a1", "--baseline-sha"),
+    gpu_smoke: bool = typer.Option(
+        False,
+        "--gpu-smoke",
+        help="Run fast container GPU smoke tests when resuming pre-screen candidates.",
+    ),
 ) -> None:
     """Resume an interrupted zstep candidate from frozen source archives and round checkpoints."""
     from evolith.zstep.archive import ZStepArchive
@@ -416,8 +472,12 @@ def zstep_resume_cmd(
     task = ZStepRSITask(
         project_root=Path.cwd(),
         source_repo=Path(source).expanduser().resolve(),
+        baseline_sha=baseline_sha,
         remote_host=host,
         remote_user=user,
+        remote_rustup_root=rustup_root,
+        model_dir=model_dir,
+        enable_gpu_smoke=gpu_smoke,
     )
     with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
         try:
@@ -464,8 +524,13 @@ def zstep_status_cmd() -> None:
 
 
 @app.command("zstep-evidence")
-def zstep_evidence_cmd(candidate_id: str) -> None:
-    """Print the evidence directory for a zstep candidate."""
+def zstep_evidence_cmd(
+    candidate_id: str,
+    events: bool = typer.Option(
+        False, "--events", help="Also print recorded lifecycle events for this candidate."
+    ),
+) -> None:
+    """Print the evidence directory (and optional event trail) for a zstep candidate."""
     from evolith.zstep.archive import ZStepArchive
 
     with ZStepArchive(Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3") as archive:
@@ -474,7 +539,10 @@ def zstep_evidence_cmd(candidate_id: str) -> None:
         except KeyError:
             console.print(f"Unknown zstep candidate: {candidate_id}")
             raise typer.Exit(code=1) from None
+        event_rows = archive.list_events(candidate_id) if events else []
     console.print(evidence)
+    for ev in event_rows:
+        console.print(f"[{ev['event_type']}] stage={ev['stage']} status={ev['status']} {ev['detail']}".rstrip())
 
 
 if __name__ == "__main__":
