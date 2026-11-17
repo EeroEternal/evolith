@@ -516,8 +516,15 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         changed_lines = int(row.get("changed_lines") or 0)
         stage = "preflight"
         try:
-            self.remote.preflight()
             screen_metrics = evidence_dir / "screen-metrics.json"
+            all_verify_cached = (
+                screen_metrics.is_file()
+                and (evidence_dir / "candidate-metrics.json").is_file()
+                and (evidence_dir / "baseline-metrics.json").is_file()
+                and (evidence_dir / "verify-parity.json").is_file()
+            )
+            if not all_verify_cached:
+                self.remote.preflight()
             if not screen_metrics.is_file():
                 if active_task.enable_gpu_smoke and hasattr(self.remote, "gpu_smoke"):
                     stage = "screen"

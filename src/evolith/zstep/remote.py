@@ -53,6 +53,8 @@ class ZStepRemoteRunner:
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 "-o",
+                "ConnectTimeout=15",
+                "-o",
                 "ServerAliveInterval=15",
                 "-o",
                 "ServerAliveCountMax=6",
@@ -75,6 +77,8 @@ class ZStepRemoteRunner:
             [
                 "-o",
                 "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=15",
                 "-o",
                 "ServerAliveInterval=15",
                 "-o",
@@ -506,11 +510,19 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         candidate_archive: Path,
         evidence: Path,
     ) -> tuple[Path, Path, Path]:
+        candidate_out = evidence / "candidate-metrics.json"
+        baseline_out = evidence / "baseline-metrics.json"
+        parity_local = evidence / "verify-parity.json"
+        if (
+            self._load_valid_checkpoint(candidate_out) is not None
+            and self._load_valid_checkpoint(baseline_out) is not None
+            and parity_local.is_file()
+        ):
+            return candidate_out, baseline_out, parity_local
         stage = self._remote_run(candidate_id, "verify")
         lock = f"{stage}/.lock"
         self._require_success(self._ssh(["mkdir", "-p", stage]), "create verify stage")
         self._require_success(self._ssh(["mkdir", lock]), "acquire verify lock")
-        parity_local = evidence / "verify-parity.json"
         try:
             baseline_dir: str | None = None
             candidate_dir: str | None = None
