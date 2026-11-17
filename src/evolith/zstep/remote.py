@@ -134,6 +134,11 @@ class ZStepRemoteRunner:
         stem = PurePosixPath(output_path).stem
         return f"evolith-{_sanitize_container_token(f'{scope}-{stem}')}"
 
+    def _docker_gpus_spec(self) -> str:
+        # Docker's `--gpus` uses CSV key=val parsing; comma-separated device IDs
+        # must carry literal inner double quotes (`"device=0,1,..."`).
+        return shlex.quote(f'"device={self.task.gpu_devices}"')
+
     def benchmark_script(
         self,
         source_dir: str,
@@ -176,7 +181,7 @@ class ZStepRemoteRunner:
             + benchmark
         )
         rustup_prefix = shlex.quote(self.task.remote_rustup_root.strip())
-        gpus_spec = shlex.quote(f"device={self.task.gpu_devices}")
+        gpus_spec = self._docker_gpus_spec()
         return f"""set -euo pipefail
 trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
 CUSTOM_RUSTUP_ROOT={rustup_prefix}
@@ -247,7 +252,7 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
     def probe_script(self, source_dir: str, probe_rel_path: str, output_rel_path: str) -> str:
         container_name = self._container_name(source_dir, "gpu-probe")
         overlay_dir = f"/tmp/{container_name}-overlay"
-        gpus_spec = shlex.quote(f"device={self.task.gpu_devices}")
+        gpus_spec = self._docker_gpus_spec()
         inner_cmd = (
             "set -euo pipefail\n"
             'trap \'rm -rf /dev/shm/zstep* >/dev/null 2>&1 || true; chown -R "${HOST_UID}:${HOST_GID}" /workspace >/dev/null 2>&1 || true\' EXIT\n'
@@ -308,7 +313,7 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         container_name = self._container_name(source_dir, "gpu-smoke")
         overlay_dir = f"/tmp/{container_name}-overlay"
         test_args = " ".join(shlex.quote(t) for t in tests)
-        gpus_spec = shlex.quote(f"device={self.task.gpu_devices}")
+        gpus_spec = self._docker_gpus_spec()
         inner_cmd = (
             "set -euo pipefail\n"
             'trap \'rm -rf /dev/shm/zstep* >/dev/null 2>&1 || true; chown -R "${HOST_UID}:${HOST_GID}" /workspace >/dev/null 2>&1 || true\' EXIT\n'
