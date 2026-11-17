@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shlex
 import subprocess
+import time
 from typing import Callable
 
 from evolith.zstep.task import ZStepRSITask
@@ -47,7 +48,16 @@ class ZStepRemoteRunner:
     def _ssh(self, args: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
         self._require_host()
         command = ["sshpass", "-e", "ssh"] if os.environ.get("SSHPASS") else ["ssh"]
-        command.extend(["-o", "StrictHostKeyChecking=accept-new"])
+        command.extend(
+            [
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=6",
+            ]
+        )
         if not os.environ.get("SSHPASS"):
             command.extend(["-o", "BatchMode=yes"])
         command.extend([self.destination, shlex.join(args)])
@@ -61,14 +71,34 @@ class ZStepRemoteRunner:
     def _scp(self, source: str, destination: str) -> subprocess.CompletedProcess[str]:
         self._require_host()
         command = ["sshpass", "-e", "scp"] if os.environ.get("SSHPASS") else ["scp"]
-        command.extend(["-o", "StrictHostKeyChecking=accept-new"])
+        command.extend(
+            [
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=6",
+            ]
+        )
         if not os.environ.get("SSHPASS"):
             command.extend(["-o", "BatchMode=yes"])
         command.extend([source, destination])
-        try:
-            return self.executor(command, timeout=self.task.remote_timeout_sec)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            raise RemoteInfraError(f"SCP transfer failed: {exc}") from exc
+        max_tries = 3 if self.executor == self._execute else 1
+        last_res: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(max_tries):
+            try:
+                last_res = self.executor(command, timeout=self.task.remote_timeout_sec)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                if attempt + 1 >= max_tries:
+                    raise RemoteInfraError(f"SCP transfer failed: {exc}") from exc
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if last_res.returncode == 0 or attempt + 1 >= max_tries:
+                return last_res
+            time.sleep(1.5 * (attempt + 1))
+        assert last_res is not None
+        return last_res
 
     @staticmethod
     def _require_success(result: subprocess.CompletedProcess[str], action: str) -> str:
