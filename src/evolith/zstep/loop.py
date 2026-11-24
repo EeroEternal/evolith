@@ -14,12 +14,14 @@ from evolith.zstep.campaigns import (
     resolve_campaign,
 )
 from evolith.zstep.dispatch_verifier import run_dispatch_verification
+from evolith.zstep.formal_verifier import run_formal_verification
 from evolith.zstep.gates import (
     evaluate_candidate,
     evaluate_screen,
     load_benchmark,
     run_local_gates,
 )
+from evolith.zstep.memory_ring import load_memory_ring
 from evolith.zstep.profiling import build_sm120_reflection_card
 from evolith.zstep.proposer import build_proposer, parse_proposal_metadata
 from evolith.zstep.redteam import (
@@ -55,6 +57,11 @@ class ZStepRSILoop:
         self.archive = archive or ZStepArchive(task.state_dir / "archive.sqlite3")
         self.proposer = proposer or build_proposer(task)
         self.remote = remote or ZStepRemoteRunner(task)
+
+    def _upstream_sha(self) -> str:
+        if hasattr(self.workspace, "upstream_head_sha"):
+            return str(self.workspace.upstream_head_sha())
+        return ""
 
     def _find_cached_baseline_screen(self, baseline_hash: str | None = None) -> Path | None:
         if baseline_hash:
@@ -108,6 +115,10 @@ class ZStepRSILoop:
         campaign_section = (
             f"\n{active_campaign.blueprint}\n" if active_campaign is not None else ""
         )
+        memory_ring = load_memory_ring(
+            task.project_root, allowed_roots=task.allowed_roots
+        )
+        memory_section = f"\n{memory_ring}\n" if memory_ring else ""
         niche_example = (
             active_campaign.primary_niche_key
             if active_campaign is not None
@@ -129,7 +140,7 @@ Strict Modification Contract:
 - Run relevant local checks. The public screen tiers are {task.screen_tiers}.
 {campaign_section}
 {reflection_card}
-
+{memory_section}
 AIDE^2 Compressed Lineage Memory (Previous Candidates — Do NOT Repeat Rejected Hypotheses):
 {compressed_history}
 
@@ -238,10 +249,12 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         ):
             raise RuntimeError("baseline source hash changed before verification")
         cand_row = self.archive.get_candidate(candidate_id)
-        if (cand_row.get("parent_id") or None) != self.archive.current_parent():
+        row_upstream = str(cand_row.get("upstream_sha") or "") or self._upstream_sha()
+        actual_parent = self.archive.current_parent(upstream_sha=row_upstream)
+        if (cand_row.get("parent_id") or None) != actual_parent:
             raise RuntimeError(
                 f"lineage parent advanced before accepting {candidate_id} "
-                f"(expected {cand_row.get('parent_id')}, got {self.archive.current_parent()})"
+                f"(expected {cand_row.get('parent_id')}, got {actual_parent})"
             )
         decision = evaluate_candidate(
             load_benchmark(baseline_json),
@@ -281,9 +294,10 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         for _ in range(self.task.max_generations):
             generation = self.archive.next_generation()
             candidate_id = f"g{generation:04d}-{uuid.uuid4().hex[:8]}"
-            parent_id = self.archive.current_parent()
+            upstream_sha = self._upstream_sha()
+            parent_id = self.archive.current_parent(upstream_sha=upstream_sha)
             candidate_dir = self.workspace.create_candidate(
-                candidate_id, self.archive.accepted_patches()
+                candidate_id, self.archive.accepted_patches(upstream_sha=upstream_sha)
             )
             evidence_dir = self.task.state_dir / "evidence" / candidate_id
             evidence_dir.mkdir(parents=True, exist_ok=False)
@@ -322,6 +336,9 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                         ),
                         encoding="utf-8",
                     )
+                had_shm_allreduce = (
+                    candidate_dir / "worker/zstep_worker/kernels_sm120/shm_allreduce.py"
+                ).is_file()
                 spec_pins = compute_spec_pins(candidate_dir, active_task.pinned_spec_files)
                 baseline_archive = self.workspace.freeze_source(
                     candidate_dir, evidence_dir / "baseline.tar.gz"
@@ -371,6 +388,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     patch_summary=proposal_meta.patch_summary,
                     evidence_dir=str(evidence_dir),
                     baseline_hash=baseline_hash,
+                    upstream_sha=upstream_sha,
                 )
 
                 stage = "local"
@@ -388,6 +406,15 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     expected_pins=spec_pins,
                 )
                 run_dispatch_verification(candidate_dir, evidence_dir)
+                has_shm_now = (
+                    candidate_dir / "worker/zstep_worker/kernels_sm120/shm_allreduce.py"
+                ).is_file()
+                run_formal_verification(
+                    candidate_dir,
+                    evidence_dir,
+                    require_z3=(had_shm_allreduce or has_shm_now),
+                    expect_shm_allreduce=had_shm_allreduce,
+                )
                 run_local_gates(candidate_dir, active_task, evidence_dir)
                 if self.task.propose_only:
                     self.archive.update_stage(candidate_id, "preflight")
@@ -461,7 +488,8 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
             return CandidateStatus(str(row["status"]))
 
         expected_parent = row.get("parent_id") or None
-        current_parent = self.archive.current_parent()
+        row_upstream = str(row.get("upstream_sha") or "") or self._upstream_sha()
+        current_parent = self.archive.current_parent(upstream_sha=row_upstream)
         if expected_parent != current_parent:
             raise RuntimeError(
                 f"Cannot resume {candidate_id}: lineage parent moved from "
@@ -506,8 +534,15 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
         changed_lines = int(row.get("changed_lines") or 0)
         stage = "preflight"
         try:
-            self.remote.preflight()
             screen_metrics = evidence_dir / "screen-metrics.json"
+            all_verify_cached = (
+                screen_metrics.is_file()
+                and (evidence_dir / "candidate-metrics.json").is_file()
+                and (evidence_dir / "baseline-metrics.json").is_file()
+                and (evidence_dir / "verify-parity.json").is_file()
+            )
+            if not all_verify_cached:
+                self.remote.preflight()
             if not screen_metrics.is_file():
                 if active_task.enable_gpu_smoke and hasattr(self.remote, "gpu_smoke"):
                     stage = "screen"

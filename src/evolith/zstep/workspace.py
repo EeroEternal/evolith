@@ -34,6 +34,21 @@ class ZStepWorkspace:
 
     def prepare_upstream(self) -> None:
         if self.task.upstream_dir.exists():
+            if self.task.baseline_sha and self.task.baseline_sha != "HEAD":
+                cur_full = (
+                    _run(["git", "rev-parse", "HEAD"], self.task.upstream_dir)
+                    .stdout.decode("utf-8")
+                    .strip()
+                )
+                if not cur_full.startswith(self.task.baseline_sha.lower()):
+                    _run(
+                        ["git", "fetch", "--tags", "origin"],
+                        self.task.upstream_dir,
+                    )
+                    _run(
+                        ["git", "checkout", "--detach", self.task.baseline_sha],
+                        self.task.upstream_dir,
+                    )
             return
         self.task.upstream_dir.parent.mkdir(parents=True, exist_ok=True)
         _run(
@@ -48,6 +63,14 @@ class ZStepWorkspace:
         _run(
             ["git", "checkout", "--detach", self.task.baseline_sha],
             self.task.upstream_dir,
+        )
+
+    def upstream_head_sha(self) -> str:
+        self.prepare_upstream()
+        return (
+            _run(["git", "rev-parse", "--short=7", "HEAD"], self.task.upstream_dir)
+            .stdout.decode("utf-8")
+            .strip()
         )
 
     def create_candidate(self, candidate_id: str, accepted_patches: list[bytes]) -> Path:

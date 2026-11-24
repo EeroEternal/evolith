@@ -71,7 +71,7 @@ def test_local_gates_include_linux_target_check_ruff_and_python_tests(
 
     run_local_gates(tmp_path, make_task(tmp_path), tmp_path / "evidence")
 
-    assert ["cargo", "check", "--workspace", "--target", "x86_64-unknown-linux-gnu"] in commands
+    assert ["cargo", "check", "--workspace", "--tests", "--target", "x86_64-unknown-linux-gnu"] in commands
     assert ["ruff", "check", "worker/"] in commands
     assert any("pytest" in cmd and "worker/tests/test_shm_layout_parity.py" in cmd for cmd in commands)
 

@@ -71,6 +71,7 @@ class VerificationDecision(BaseModel):
     accepted: bool
     geomean_gain: float
     net_gate_ratio: float = 1.0
+    paired_lcb_2se: float | None = None
     metric_delta: str = ""
     reasons: list[str] = Field(default_factory=list)
 
@@ -78,7 +79,7 @@ class VerificationDecision(BaseModel):
 class ZStepRSITask(BaseModel):
     project_root: Path
     source_repo: Path
-    baseline_sha: str = "2bea5a1"
+    baseline_sha: str = "a773c4d"
     remote_user: str = Field(
         default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_USER", "ubuntu")
     )
@@ -116,6 +117,7 @@ class ZStepRSITask(BaseModel):
     max_tpot_regression: float = 0.05
     max_p99_itl_regression: float = 0.05
     max_tier_cv: float = Field(default=0.10, ge=0.0)
+    min_paired_se_z: float = Field(default=0.0, ge=0.0)
     max_screen_throughput_regression: float = 0.02
     max_screen_latency_regression: float = 0.08
     keep_remote_stage: bool = False
@@ -147,12 +149,14 @@ class ZStepRSITask(BaseModel):
         "worker/tests/test_shm_layout_parity.py",
     )
     allowed_roots: tuple[str, ...] = (
+        "worker/zstep_worker/env_config.py",
         "worker/zstep_worker/models/deepseek_v41.py",
         "worker/zstep_worker/models/deepseek_v41_dspark.py",
         "worker/zstep_worker/runtime_loop.py",
         "worker/zstep_worker/p2p_probe.py",
         "worker/zstep_worker/spec_decode.py",
         "worker/zstep_worker/kernels_sm120",
+        "crates/zs-kv/src",
         "crates/zs-scheduler/src",
     )
 

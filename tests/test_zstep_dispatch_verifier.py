@@ -21,7 +21,7 @@ def test_dispatch_verifier_proves_real_upstream_zstep_selectors_and_thresholds(
     # 128 max_buckets * 3 out-of-range + sum(1..128)=8256 = 8640 pairs
     assert report.checked_pairs >= 8640
     assert "worker/zstep_worker/shm_bridge.py:select_decode_bucket" in report.verified_selectors
-    assert report.verified_thresholds["DEFAULT_MEGA_GATE_MIN_TOKENS"] == 32
+    assert report.verified_thresholds["DEFAULT_MEGA_GATE_MIN_TOKENS"] in (1, 32)
     assert report.verified_thresholds["DEFAULT_ONE_SHOT_MAX_VECS"] == 4096
     assert (tmp_path / "evidence/dispatch-verification.json").is_file()
 

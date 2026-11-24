@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shlex
 import subprocess
+import time
 from typing import Callable
 
 from evolith.zstep.task import ZStepRSITask
@@ -44,31 +45,101 @@ class ZStepRemoteRunner:
                 "remote_host is required for remote execution; pass --host or set EVOLITH_ZSTEP_HOST"
             )
 
+    def _ssh_multiplex_opts(self) -> list[str]:
+        if self.executor != self._execute:
+            return []
+        return [
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPath=/tmp/evolith-ssh-%C",
+            "-o",
+            "ControlPersist=300",
+        ]
+
+    @staticmethod
+    def _is_pre_auth_ssh_drop(res: subprocess.CompletedProcess[str]) -> bool:
+        if res.returncode != 255:
+            return False
+        detail = (res.stderr + res.stdout).lower()
+        return any(
+            token in detail
+            for token in (
+                "banner exchange",
+                "kex_exchange_identification",
+                "connection timed out",
+                "connection reset by peer",
+            )
+        )
+
     def _ssh(self, args: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
         self._require_host()
         command = ["sshpass", "-e", "ssh"] if os.environ.get("SSHPASS") else ["ssh"]
-        command.extend(["-o", "StrictHostKeyChecking=accept-new"])
+        command.extend(
+            [
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=15",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=6",
+                *self._ssh_multiplex_opts(),
+            ]
+        )
         if not os.environ.get("SSHPASS"):
             command.extend(["-o", "BatchMode=yes"])
         command.extend([self.destination, shlex.join(args)])
-        try:
-            return self.executor(
-                command, timeout=timeout or self.task.remote_timeout_sec
-            )
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            raise RemoteInfraError(f"SSH transport failed: {exc}") from exc
+        max_tries = 3 if self.executor == self._execute else 1
+        last_res: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(max_tries):
+            try:
+                last_res = self.executor(
+                    command, timeout=timeout or self.task.remote_timeout_sec
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                raise RemoteInfraError(f"SSH transport failed: {exc}") from exc
+            if not self._is_pre_auth_ssh_drop(last_res) or attempt + 1 >= max_tries:
+                return last_res
+            time.sleep(3.0 * (attempt + 1))
+        assert last_res is not None
+        return last_res
 
     def _scp(self, source: str, destination: str) -> subprocess.CompletedProcess[str]:
         self._require_host()
         command = ["sshpass", "-e", "scp"] if os.environ.get("SSHPASS") else ["scp"]
-        command.extend(["-o", "StrictHostKeyChecking=accept-new"])
+        command.extend(
+            [
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=15",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=6",
+                *self._ssh_multiplex_opts(),
+            ]
+        )
         if not os.environ.get("SSHPASS"):
             command.extend(["-o", "BatchMode=yes"])
         command.extend([source, destination])
-        try:
-            return self.executor(command, timeout=self.task.remote_timeout_sec)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            raise RemoteInfraError(f"SCP transfer failed: {exc}") from exc
+        max_tries = 3 if self.executor == self._execute else 1
+        last_res: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(max_tries):
+            try:
+                last_res = self.executor(command, timeout=self.task.remote_timeout_sec)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                if attempt + 1 >= max_tries:
+                    raise RemoteInfraError(f"SCP transfer failed: {exc}") from exc
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if last_res.returncode == 0 or attempt + 1 >= max_tries:
+                return last_res
+            time.sleep(1.5 * (attempt + 1))
+        assert last_res is not None
+        return last_res
 
     @staticmethod
     def _require_success(result: subprocess.CompletedProcess[str], action: str) -> str:
@@ -134,6 +205,11 @@ class ZStepRemoteRunner:
         stem = PurePosixPath(output_path).stem
         return f"evolith-{_sanitize_container_token(f'{scope}-{stem}')}"
 
+    def _docker_gpus_spec(self) -> str:
+        # Docker's `--gpus` uses CSV key=val parsing; comma-separated device IDs
+        # must carry literal inner double quotes (`"device=0,1,..."`).
+        return shlex.quote(f'"device={self.task.gpu_devices}"')
+
     def benchmark_script(
         self,
         source_dir: str,
@@ -176,7 +252,7 @@ class ZStepRemoteRunner:
             + benchmark
         )
         rustup_prefix = shlex.quote(self.task.remote_rustup_root.strip())
-        gpus_spec = shlex.quote(f"device={self.task.gpu_devices}")
+        gpus_spec = self._docker_gpus_spec()
         return f"""set -euo pipefail
 trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
 CUSTOM_RUSTUP_ROOT={rustup_prefix}
@@ -244,11 +320,72 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         except Exception:
             pass
 
+    def probe_script(self, source_dir: str, probe_rel_path: str, output_rel_path: str) -> str:
+        container_name = self._container_name(source_dir, "gpu-probe")
+        overlay_dir = f"/tmp/{container_name}-overlay"
+        gpus_spec = self._docker_gpus_spec()
+        inner_cmd = (
+            "set -euo pipefail\n"
+            'trap \'rm -rf /dev/shm/zstep* >/dev/null 2>&1 || true; chown -R "${HOST_UID}:${HOST_GID}" /workspace >/dev/null 2>&1 || true\' EXIT\n'
+            "mkdir -p /workspace/results\n"
+            "PYTHONPATH=/workspace/worker /usr/bin/python3 "
+            f"{shlex.quote(probe_rel_path)} --output {shlex.quote(output_rel_path)}\n"
+        )
+        return f"""set -euo pipefail
+trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
+cd {shlex.quote(source_dir)}
+./scripts/prepare_sm120_overlay.sh {shlex.quote(overlay_dir)}
+DOCKER_OVERLAY_ARGS=($(./scripts/prepare_sm120_overlay.sh --print-docker-args {shlex.quote(overlay_dir)}))
+docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
+  -v "$PWD:/workspace" -w /workspace \\
+  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -e PYTHONDONTWRITEBYTECODE=1 \\
+  -e OMP_NUM_THREADS=1 -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
+  -e VLLM_HOST_IP=127.0.0.1 -e NCCL_SOCKET_IFNAME=lo -e GLOO_SOCKET_IFNAME=lo \\
+  "${{DOCKER_OVERLAY_ARGS[@]}}" {self.task.image} -lc {shlex.quote(inner_cmd)}
+"""
+
+    def run_probe(
+        self,
+        probe_id: str,
+        source_archive: Path,
+        probe_script_file: Path,
+        local_output: Path,
+    ) -> Path:
+        """Execute a fast isolated 8-GPU operator/collective microbenchmark probe without 475 GiB weights."""
+        self.preflight()
+        stage = self._remote_run(probe_id, "probe")
+        lock = f"{stage}/.lock"
+        self._require_success(self._ssh(["mkdir", "-p", stage]), "create probe stage")
+        self._require_success(self._ssh(["mkdir", lock]), "acquire probe lock")
+        container_name = self._container_name(f"{stage}/src", "gpu-probe")
+        try:
+            source_dir = self._upload_and_extract(source_archive, stage)
+            remote_probe = f"{source_dir}/_evolith_probe.py"
+            self._require_success(
+                self._scp(str(probe_script_file), f"{self.destination}:{remote_probe}"),
+                "upload probe script",
+            )
+            script = self.probe_script(source_dir, "_evolith_probe.py", "results/probe.json")
+            try:
+                result = self._ssh(["bash", "-lc", script])
+            except BaseException:
+                self._cleanup_orphan_container(container_name)
+                raise
+            if result.returncode:
+                self._cleanup_orphan_container(container_name)
+                detail = (result.stderr + result.stdout).strip()[-4000:]
+                err_cls = RemoteInfraError if result.returncode == 255 else RuntimeError
+                raise err_cls(f"Remote GPU probe exited {result.returncode}: {detail}")
+            return self._download(f"{source_dir}/results/probe.json", local_output)
+        finally:
+            self._cleanup_remote_stage(stage, lock)
+
     def gpu_smoke_script(self, source_dir: str, tests: tuple[str, ...]) -> str:
         container_name = self._container_name(source_dir, "gpu-smoke")
         overlay_dir = f"/tmp/{container_name}-overlay"
         test_args = " ".join(shlex.quote(t) for t in tests)
-        gpus_spec = shlex.quote(f"device={self.task.gpu_devices}")
+        rustup_prefix = shlex.quote(self.task.remote_rustup_root.strip())
+        gpus_spec = self._docker_gpus_spec()
         inner_cmd = (
             "set -euo pipefail\n"
             'trap \'rm -rf /dev/shm/zstep* >/dev/null 2>&1 || true; chown -R "${HOST_UID}:${HOST_GID}" /workspace >/dev/null 2>&1 || true\' EXIT\n'
@@ -257,7 +394,28 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         )
         return f"""set -euo pipefail
 trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
+CUSTOM_RUSTUP_ROOT={rustup_prefix}
+if [ -z "$CUSTOM_RUSTUP_ROOT" ] && [ -n "${{EVOLITH_ZSTEP_RUSTUP_ROOT:-}}" ]; then
+  CUSTOM_RUSTUP_ROOT="$EVOLITH_ZSTEP_RUSTUP_ROOT"
+elif [ -z "$CUSTOM_RUSTUP_ROOT" ] && [ -d "$HOME/evolith-rsi/rustup/cargo/bin" ]; then
+  CUSTOM_RUSTUP_ROOT="$HOME/evolith-rsi/rustup"
+fi
+if [ -n "$CUSTOM_RUSTUP_ROOT" ] && [ -d "$CUSTOM_RUSTUP_ROOT/cargo/bin" ]; then
+  export CARGO_HOME="${{CARGO_HOME:-$CUSTOM_RUSTUP_ROOT/cargo}}"
+  export RUSTUP_HOME="${{RUSTUP_HOME:-$CUSTOM_RUSTUP_ROOT/rustup}}"
+  export PATH="$CUSTOM_RUSTUP_ROOT/cargo/bin:$HOME/.cargo/bin:$PATH"
+else
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
 cd {shlex.quote(source_dir)}
+if [ -f Cargo.toml ]; then
+  if [ -d "$HOME/evolith-rsi/cargo-vendor" ]; then
+    CARGO_VENDOR_ARGS=(--offline --config "source.crates-io.replace-with='vendored-sources'" --config "source.vendored-sources.directory='$HOME/evolith-rsi/cargo-vendor'")
+    cargo "${{CARGO_VENDOR_ARGS[@]}}" test --release -p zs-wire -p zs-kv -p zs-shm -p zs-scheduler --lib
+  else
+    cargo test --release -p zs-wire -p zs-kv -p zs-shm -p zs-scheduler --lib
+  fi
+fi
 ./scripts/prepare_sm120_overlay.sh {shlex.quote(overlay_dir)}
 DOCKER_OVERLAY_ARGS=($(./scripts/prepare_sm120_overlay.sh --print-docker-args {shlex.quote(overlay_dir)}))
 docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
@@ -411,11 +569,19 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         candidate_archive: Path,
         evidence: Path,
     ) -> tuple[Path, Path, Path]:
+        candidate_out = evidence / "candidate-metrics.json"
+        baseline_out = evidence / "baseline-metrics.json"
+        parity_local = evidence / "verify-parity.json"
+        if (
+            self._load_valid_checkpoint(candidate_out) is not None
+            and self._load_valid_checkpoint(baseline_out) is not None
+            and parity_local.is_file()
+        ):
+            return candidate_out, baseline_out, parity_local
         stage = self._remote_run(candidate_id, "verify")
         lock = f"{stage}/.lock"
         self._require_success(self._ssh(["mkdir", "-p", stage]), "create verify stage")
         self._require_success(self._ssh(["mkdir", lock]), "acquire verify lock")
-        parity_local = evidence / "verify-parity.json"
         try:
             baseline_dir: str | None = None
             candidate_dir: str | None = None

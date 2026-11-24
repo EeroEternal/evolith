@@ -432,6 +432,22 @@ def zstep_submit_cmd(
         console.print(f"zstep candidate: {status.value}")
 
 
+def _detect_local_upstream_sha() -> str:
+    import subprocess
+
+    upstream_dir = Path.cwd() / "targets/zstep/upstream"
+    if not (upstream_dir / ".git").exists():
+        return ""
+    res = subprocess.run(
+        ["git", "rev-parse", "--short=7", "HEAD"],
+        cwd=upstream_dir,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
 @app.command("zstep-campaigns")
 def zstep_campaigns_cmd() -> None:
     """List ROI-ranked zstep optimization campaigns and their 2-Strike circuit breaker status."""
@@ -439,18 +455,20 @@ def zstep_campaigns_cmd() -> None:
     from evolith.zstep.campaigns import list_campaigns, resolve_campaign
 
     db_path = Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3"
+    upstream_sha = _detect_local_upstream_sha()
     blocked: dict[str, list[str]] = {}
     parent: str | None = None
     if db_path.is_file():
         with ZStepArchive(db_path) as archive:
-            parent = archive.current_parent()
+            parent = archive.current_parent(upstream_sha=upstream_sha)
             blocked = archive.blocked_niches(strike_limit=2, parent_id=parent)
 
+    parent_label = parent or (f"frozen@{upstream_sha}" if upstream_sha else "frozen-zstep-baseline")
     next_auto = resolve_campaign("auto", blocked)
     table = Table(
         title=(
             f"zstep ROI-Ranked Optimization Campaigns "
-            f"(parent: {markup_escape(str(parent or 'frozen-zstep-baseline'))}, "
+            f"(parent: {markup_escape(str(parent_label))}, "
             f"auto -> {next_auto.priority_rank if next_auto else 'exhausted'})"
         ),
         show_lines=True,
@@ -535,14 +553,16 @@ def zstep_status_cmd() -> None:
     """Show isolated zstep candidate lineage and the best verified baseline."""
     from evolith.zstep.archive import ZStepArchive
 
+    upstream_sha = _detect_local_upstream_sha()
     with ZStepArchive(Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3") as archive:
         entries = archive.list_candidates()
-        parent = archive.current_parent()
+        parent = archive.current_parent(upstream_sha=upstream_sha)
     if not entries:
         console.print("No zstep candidates recorded.")
         return
+    parent_label = parent or (f"frozen baseline ({upstream_sha})" if upstream_sha else "frozen baseline")
     table = Table(
-        title=f"zstep RSI (best verified parent: {markup_escape(str(parent or 'frozen baseline'))})"
+        title=f"zstep RSI (best verified parent: {markup_escape(str(parent_label))})"
     )
     table.add_column("Candidate", no_wrap=True)
     table.add_column("Parent", no_wrap=True)
@@ -592,6 +612,249 @@ def zstep_evidence_cmd(
     for ev in event_rows:
         line = f"[{ev['event_type']}] stage={ev['stage']} status={ev['status']} {ev['detail']}".rstrip()
         console.print(markup_escape(line))
+
+
+@app.command("zstep-probe")
+def zstep_probe_cmd(
+    script: str = typer.Option(..., "--script", "-s", help="Python operator/collective probe script."),
+    patch: str | None = typer.Option(None, "--patch", "-p", help="Optional unified git diff to apply before probing."),
+    output: str = typer.Option(
+        ".evolith/zstep-rsi/probes/latest-probe.json",
+        "--output",
+        "-o",
+        help="Local path to save downloaded JSON probe telemetry.",
+    ),
+    source: str = typer.Option("~/github/zstep", "--source"),
+    host: str | None = typer.Option(None, "--host", envvar="EVOLITH_ZSTEP_HOST"),
+    user: str | None = typer.Option(None, "--user", envvar="EVOLITH_ZSTEP_USER"),
+    baseline_sha: str | None = typer.Option(None, "--baseline-sha"),
+) -> None:
+    """Run a fast isolated 8-GPU microbenchmark probe without loading full 475 GiB model weights."""
+    import shutil
+    import subprocess
+    import tempfile
+    import uuid
+
+    from evolith.zstep.archive import ZStepArchive
+    from evolith.zstep.remote import ZStepRemoteRunner
+    from evolith.zstep.workspace import ZStepWorkspace
+
+    script_path = Path(script).expanduser().resolve()
+    if not script_path.is_file():
+        raise typer.BadParameter(f"Probe script not found: {script_path}")
+
+    task = _build_zstep_task(
+        source=source,
+        host=host,
+        user=user,
+        model_dir=None,
+        rustup_root=None,
+        baseline_sha=baseline_sha,
+        propose_only=False,
+        extra_fields={},
+    )
+    ws = ZStepWorkspace(task)
+    upstream_sha = ws.upstream_head_sha()
+    accepted_patches: list[bytes] = []
+    db_file = task.state_dir / "archive.sqlite3"
+    if db_file.is_file():
+        with ZStepArchive(db_file) as archive:
+            accepted_patches = archive.accepted_patches(upstream_sha=upstream_sha)
+    probe_id = f"probe-{uuid.uuid4().hex[:8]}"
+    with tempfile.TemporaryDirectory() as td:
+        tmp_dir = Path(td)
+        cand_dir = ws.create_candidate(probe_id, accepted_patches)
+        try:
+            if patch:
+                patch_bytes = Path(patch).expanduser().resolve().read_bytes()
+                subprocess.run(["git", "apply", "-"], input=patch_bytes, cwd=cand_dir, check=True)
+            tar_path = ws.freeze_source(cand_dir, tmp_dir / "probe-src.tar.gz")
+        finally:
+            shutil.rmtree(cand_dir, ignore_errors=True)
+        out_path = ZStepRemoteRunner(task).run_probe(
+            probe_id, tar_path, script_path, Path(output).expanduser().resolve()
+        )
+    console.print(markup_escape(str(out_path)))
+
+
+@app.command("zstep-memory")
+def zstep_memory_cmd(
+    campaign: str = typer.Option(
+        "none",
+        "--campaign",
+        "-c",
+        help="Optional campaign ID/alias (e.g. 't1-2', 't1-3', 't2-4') to preview scoped fact filtering.",
+    ),
+) -> None:
+    """Preview the local Memory Ring (facts, stepping stones, directives) injected into zstep prompts."""
+    from evolith.zstep.campaigns import resolve_campaign
+    from evolith.zstep.memory_ring import load_memory_ring
+
+    spec = resolve_campaign(campaign)
+    roots = spec.allowed_roots if spec is not None else ()
+    rendered = load_memory_ring(Path.cwd(), allowed_roots=roots)
+    if not rendered:
+        console.print("No local memory/ entries found.")
+        return
+    title_scope = spec.campaign_id if spec is not None else "all allowed_roots"
+    console.print(
+        Panel(
+            markup_escape(rendered),
+            title=f"Evolith Local Memory Ring (scope: {markup_escape(title_scope)})",
+            border_style="cyan",
+        )
+    )
+
+
+@app.command("zstep-formal-verify")
+def zstep_formal_verify_cmd(
+    target: str = typer.Option(
+        "targets/zstep/upstream",
+        "--target",
+        "-t",
+        help="Path to zstep source directory to formally verify.",
+    ),
+    calibrate: bool = typer.Option(
+        False,
+        "--calibrate",
+        help="Run real source-file mutation & historical candidate calibration (requires Z3).",
+    ),
+    allow_missing_z3: bool = typer.Option(
+        False,
+        "--allow-missing-z3",
+        help="Allow running AST-only checks when Z3 is not installed (default: fail-stop).",
+    ),
+) -> None:
+    """Run fail-stop AST + 3-way Z3 SMT verification (and source/historical calibration) on zstep."""
+    from evolith.zstep.formal_verifier import (
+        FormalVerificationError,
+        calibrate_formal_mutations,
+        run_formal_verification,
+    )
+
+    target_dir = Path(target).expanduser().resolve()
+    if not target_dir.is_dir():
+        console.print(f"[red]Target directory not found: {markup_escape(str(target_dir))}[/red]")
+        raise typer.Exit(code=1)
+
+    try:
+        report = run_formal_verification(
+            target_dir,
+            require_z3=not allow_missing_z3,
+            expect_shm_allreduce=True,
+        )
+    except FormalVerificationError as exc:
+        console.print(f"[bold red]FORMAL VERIFICATION FAILED[/bold red]: {markup_escape(str(exc))}")
+        raise typer.Exit(code=1) from None
+
+    table = Table(
+        title=(
+            f"veriserve/vstack Formal Gate [{report.gate_verdict}] "
+            f"| z3={'ON' if report.z3_available else 'OFF'} "
+            f"| target={markup_escape(target_dir.name)}"
+        ),
+        show_lines=True,
+    )
+    table.add_column("Clause ID", style="cyan", no_wrap=True)
+    table.add_column("Pillar", style="magenta", no_wrap=True)
+    table.add_column("Method", no_wrap=True)
+    table.add_column("Scope", justify="right", no_wrap=True)
+    table.add_column("Verdict", justify="center", no_wrap=True)
+    table.add_column("Anchored Sites / Notes")
+
+    verdict_styles = {
+        "PROVED": "[bold green]PROVED (Z3)[/bold green]",
+        "CLOSED_DIFF": "[bold green]CLOSED (3000 diff)[/bold green]",
+        "PASS": "[bold green]PASS (AST)[/bold green]",
+        "NOT_APPLICABLE": "[dim]N/A (non-PXB)[/dim]",
+        "MODEL_ONLY": "[yellow]MODEL_ONLY (non-gating)[/yellow]",
+        "INCONCLUSIVE_NO_Z3": "[yellow]INCONCLUSIVE (no Z3)[/yellow]",
+        "INCONCLUSIVE_MODEL_MISMATCH": "[bold yellow]INCONCLUSIVE (MODEL)[/bold yellow]",
+        "INCONCLUSIVE_TIMEOUT": "[bold red]INCONCLUSIVE (TIMEOUT)[/bold red]",
+        "INCONCLUSIVE_PARSE_ERROR": "[bold red]INCONCLUSIVE (PARSE)[/bold red]",
+        "INCONCLUSIVE_MISSING_FILE": "[bold red]INCONCLUSIVE (MISSING)[/bold red]",
+        "VIOLATION": "[bold red]VIOLATION[/bold red]",
+    }
+    for cl in report.clauses:
+        verdict = verdict_styles.get(
+            cl.verdict,
+            "[bold green]PASS[/bold green]" if cl.passed else "[bold red]VIOLATION[/bold red]",
+        )
+        if cl.method == "z3_smt2":
+            scope_str = "symbolic"
+        elif cl.method == "ast_exact_eval":
+            scope_str = "exact AST"
+        elif cl.method == "seeded_diff_3000":
+            scope_str = f"{cl.explored_states} trials"
+        else:
+            scope_str = f"{cl.explored_states} states"
+        notes = "\n".join(cl.anchored_sites) if cl.anchored_sites else (cl.detail or "-")
+        table.add_row(
+            cl.clause_id,
+            cl.pillar,
+            cl.method,
+            scope_str,
+            verdict,
+            markup_escape(notes),
+        )
+    console.print(table)
+    if report.weakest_link:
+        console.print(f"[dim]Weakest link: {markup_escape(report.weakest_link)}[/dim]")
+
+    if calibrate:
+        cal = calibrate_formal_mutations(target_dir)
+        mtable = Table(
+            title=(
+                f"vstack Source-Mutation Anti-Vacuity Gate "
+                f"(killed {cal.killed_mutants}/{cal.total_mutants}, kill_rate={cal.kill_rate:.0%})"
+            ),
+            show_lines=True,
+        )
+        mtable.add_column("Mutant ID", style="yellow", no_wrap=True)
+        mtable.add_column("Expected Clause", style="cyan", no_wrap=True)
+        mtable.add_column("Verdict", justify="center", no_wrap=True)
+        mtable.add_column("Killed?", justify="center", no_wrap=True)
+        mtable.add_column("Counterexample / Witness")
+        for row in cal.rows:
+            status = "[bold green]KILLED[/bold green]" if row.killed else "[bold red]SURVIVED[/bold red]"
+            mtable.add_row(
+                row.mutant_id,
+                row.expected_clause,
+                row.model_verdict,
+                status,
+                markup_escape((row.witness or "-")[:110]),
+            )
+        console.print(mtable)
+
+        if cal.historical_rows:
+            htable = Table(
+                title=(
+                    f"Historical Candidate Agreement "
+                    f"(matched {cal.historical_matched}/{cal.historical_checked})"
+                ),
+                show_lines=True,
+            )
+            htable.add_column("Candidate", style="cyan", no_wrap=True)
+            htable.add_column("Expected", justify="center", no_wrap=True)
+            htable.add_column("Actual", justify="center", no_wrap=True)
+            htable.add_column("Match", justify="center", no_wrap=True)
+            htable.add_column("Historical Ground Truth / Witness")
+            for hrow in cal.historical_rows:
+                exp_s = "PASS" if hrow.expected_pass else "REJECT"
+                act_s = "PASS" if hrow.actual_pass else "REJECT"
+                m_s = "[bold green]OK[/bold green]" if hrow.matched_expectation else "[bold red]MISMATCH[/bold red]"
+                summary_note = hrow.witness or hrow.historical_note
+                htable.add_row(
+                    hrow.candidate_id,
+                    exp_s,
+                    act_s,
+                    m_s,
+                    markup_escape(summary_note[:110]),
+                )
+            console.print(htable)
+
+        if not cal.passed:
+            raise typer.Exit(code=1)
 
 
 register(app)
