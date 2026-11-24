@@ -187,14 +187,14 @@ def test_fail_stop_inline_and_split_3way_z3_plus_real_source_mutations(tmp_path:
     # Real source-file mutation suite (both split and inline _CPP_SOURCE/_CUDA_SOURCE layouts)
     cal_split = calibrate_formal_mutations(split_tree)
     assert cal_split.passed
-    assert cal_split.total_mutants == 7
-    assert cal_split.killed_mutants == 7
+    assert cal_split.total_mutants == 11
+    assert cal_split.killed_mutants == 11
     assert cal_split.kill_rate == 1.0
 
     inline_tree = _write_synthetic_zstep_tree(tmp_path / "inline_clean", inline_csrc=True)
     cal_inline = calibrate_formal_mutations(inline_tree)
     assert cal_inline.passed
-    assert cal_inline.killed_mutants == 7
+    assert cal_inline.killed_mutants == 11
 
     # g0001-class: missing NUM_PXB_RING_SLOTS using 4-slot NUM_RING_SLOTS in inline layout -> REJECTED!
     g0001_like = _write_synthetic_zstep_tree(
