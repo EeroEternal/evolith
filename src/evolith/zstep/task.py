@@ -79,7 +79,7 @@ class VerificationDecision(BaseModel):
 class ZStepRSITask(BaseModel):
     project_root: Path
     source_repo: Path
-    baseline_sha: str = "682eb08"
+    baseline_sha: str = "a773c4d"
     remote_user: str = Field(
         default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_USER", "ubuntu")
     )
@@ -149,6 +149,7 @@ class ZStepRSITask(BaseModel):
         "worker/tests/test_shm_layout_parity.py",
     )
     allowed_roots: tuple[str, ...] = (
+        "worker/zstep_worker/env_config.py",
         "worker/zstep_worker/models/deepseek_v41.py",
         "worker/zstep_worker/models/deepseek_v41_dspark.py",
         "worker/zstep_worker/runtime_loop.py",

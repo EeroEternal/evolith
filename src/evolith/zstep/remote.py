@@ -45,6 +45,33 @@ class ZStepRemoteRunner:
                 "remote_host is required for remote execution; pass --host or set EVOLITH_ZSTEP_HOST"
             )
 
+    def _ssh_multiplex_opts(self) -> list[str]:
+        if self.executor != self._execute:
+            return []
+        return [
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPath=/tmp/evolith-ssh-%C",
+            "-o",
+            "ControlPersist=300",
+        ]
+
+    @staticmethod
+    def _is_pre_auth_ssh_drop(res: subprocess.CompletedProcess[str]) -> bool:
+        if res.returncode != 255:
+            return False
+        detail = (res.stderr + res.stdout).lower()
+        return any(
+            token in detail
+            for token in (
+                "banner exchange",
+                "kex_exchange_identification",
+                "connection timed out",
+                "connection reset by peer",
+            )
+        )
+
     def _ssh(self, args: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
         self._require_host()
         command = ["sshpass", "-e", "ssh"] if os.environ.get("SSHPASS") else ["ssh"]
@@ -58,17 +85,26 @@ class ZStepRemoteRunner:
                 "ServerAliveInterval=15",
                 "-o",
                 "ServerAliveCountMax=6",
+                *self._ssh_multiplex_opts(),
             ]
         )
         if not os.environ.get("SSHPASS"):
             command.extend(["-o", "BatchMode=yes"])
         command.extend([self.destination, shlex.join(args)])
-        try:
-            return self.executor(
-                command, timeout=timeout or self.task.remote_timeout_sec
-            )
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            raise RemoteInfraError(f"SSH transport failed: {exc}") from exc
+        max_tries = 3 if self.executor == self._execute else 1
+        last_res: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(max_tries):
+            try:
+                last_res = self.executor(
+                    command, timeout=timeout or self.task.remote_timeout_sec
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                raise RemoteInfraError(f"SSH transport failed: {exc}") from exc
+            if not self._is_pre_auth_ssh_drop(last_res) or attempt + 1 >= max_tries:
+                return last_res
+            time.sleep(3.0 * (attempt + 1))
+        assert last_res is not None
+        return last_res
 
     def _scp(self, source: str, destination: str) -> subprocess.CompletedProcess[str]:
         self._require_host()
@@ -83,6 +119,7 @@ class ZStepRemoteRunner:
                 "ServerAliveInterval=15",
                 "-o",
                 "ServerAliveCountMax=6",
+                *self._ssh_multiplex_opts(),
             ]
         )
         if not os.environ.get("SSHPASS"):
@@ -347,6 +384,7 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         container_name = self._container_name(source_dir, "gpu-smoke")
         overlay_dir = f"/tmp/{container_name}-overlay"
         test_args = " ".join(shlex.quote(t) for t in tests)
+        rustup_prefix = shlex.quote(self.task.remote_rustup_root.strip())
         gpus_spec = self._docker_gpus_spec()
         inner_cmd = (
             "set -euo pipefail\n"
@@ -356,7 +394,28 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         )
         return f"""set -euo pipefail
 trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
+CUSTOM_RUSTUP_ROOT={rustup_prefix}
+if [ -z "$CUSTOM_RUSTUP_ROOT" ] && [ -n "${{EVOLITH_ZSTEP_RUSTUP_ROOT:-}}" ]; then
+  CUSTOM_RUSTUP_ROOT="$EVOLITH_ZSTEP_RUSTUP_ROOT"
+elif [ -z "$CUSTOM_RUSTUP_ROOT" ] && [ -d "$HOME/evolith-rsi/rustup/cargo/bin" ]; then
+  CUSTOM_RUSTUP_ROOT="$HOME/evolith-rsi/rustup"
+fi
+if [ -n "$CUSTOM_RUSTUP_ROOT" ] && [ -d "$CUSTOM_RUSTUP_ROOT/cargo/bin" ]; then
+  export CARGO_HOME="${{CARGO_HOME:-$CUSTOM_RUSTUP_ROOT/cargo}}"
+  export RUSTUP_HOME="${{RUSTUP_HOME:-$CUSTOM_RUSTUP_ROOT/rustup}}"
+  export PATH="$CUSTOM_RUSTUP_ROOT/cargo/bin:$HOME/.cargo/bin:$PATH"
+else
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
 cd {shlex.quote(source_dir)}
+if [ -f Cargo.toml ]; then
+  if [ -d "$HOME/evolith-rsi/cargo-vendor" ]; then
+    CARGO_VENDOR_ARGS=(--offline --config "source.crates-io.replace-with='vendored-sources'" --config "source.vendored-sources.directory='$HOME/evolith-rsi/cargo-vendor'")
+    cargo "${{CARGO_VENDOR_ARGS[@]}}" test --release -p zs-wire -p zs-kv -p zs-shm -p zs-scheduler --lib
+  else
+    cargo test --release -p zs-wire -p zs-kv -p zs-shm -p zs-scheduler --lib
+  fi
+fi
 ./scripts/prepare_sm120_overlay.sh {shlex.quote(overlay_dir)}
 DOCKER_OVERLAY_ARGS=($(./scripts/prepare_sm120_overlay.sh --print-docker-args {shlex.quote(overlay_dir)}))
 docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\

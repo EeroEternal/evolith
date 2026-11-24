@@ -14,12 +14,14 @@ from evolith.zstep.campaigns import (
     resolve_campaign,
 )
 from evolith.zstep.dispatch_verifier import run_dispatch_verification
+from evolith.zstep.formal_verifier import run_formal_verification
 from evolith.zstep.gates import (
     evaluate_candidate,
     evaluate_screen,
     load_benchmark,
     run_local_gates,
 )
+from evolith.zstep.memory_ring import load_memory_ring
 from evolith.zstep.profiling import build_sm120_reflection_card
 from evolith.zstep.proposer import build_proposer, parse_proposal_metadata
 from evolith.zstep.redteam import (
@@ -113,6 +115,10 @@ class ZStepRSILoop:
         campaign_section = (
             f"\n{active_campaign.blueprint}\n" if active_campaign is not None else ""
         )
+        memory_ring = load_memory_ring(
+            task.project_root, allowed_roots=task.allowed_roots
+        )
+        memory_section = f"\n{memory_ring}\n" if memory_ring else ""
         niche_example = (
             active_campaign.primary_niche_key
             if active_campaign is not None
@@ -134,7 +140,7 @@ Strict Modification Contract:
 - Run relevant local checks. The public screen tiers are {task.screen_tiers}.
 {campaign_section}
 {reflection_card}
-
+{memory_section}
 AIDE^2 Compressed Lineage Memory (Previous Candidates — Do NOT Repeat Rejected Hypotheses):
 {compressed_history}
 
@@ -330,6 +336,9 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                         ),
                         encoding="utf-8",
                     )
+                had_shm_allreduce = (
+                    candidate_dir / "worker/zstep_worker/kernels_sm120/shm_allreduce.py"
+                ).is_file()
                 spec_pins = compute_spec_pins(candidate_dir, active_task.pinned_spec_files)
                 baseline_archive = self.workspace.freeze_source(
                     candidate_dir, evidence_dir / "baseline.tar.gz"
@@ -397,6 +406,15 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     expected_pins=spec_pins,
                 )
                 run_dispatch_verification(candidate_dir, evidence_dir)
+                has_shm_now = (
+                    candidate_dir / "worker/zstep_worker/kernels_sm120/shm_allreduce.py"
+                ).is_file()
+                run_formal_verification(
+                    candidate_dir,
+                    evidence_dir,
+                    require_z3=(had_shm_allreduce or has_shm_now),
+                    expect_shm_allreduce=had_shm_allreduce,
+                )
                 run_local_gates(candidate_dir, active_task, evidence_dir)
                 if self.task.propose_only:
                     self.archive.update_stage(candidate_id, "preflight")

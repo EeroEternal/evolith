@@ -81,7 +81,17 @@ def run_local_gates(candidate_dir: Path, task: ZStepRSITask, evidence_dir: Path)
     if is_darwin and _has_linux_x86_rust_target():
         if shutil.which("x86_64-linux-gnu-gcc") is not None:
             commands.append(
-                (["cargo", "check", "--workspace", "--target", "x86_64-unknown-linux-gnu"], None)
+                (
+                    [
+                        "cargo",
+                        "check",
+                        "--workspace",
+                        "--tests",
+                        "--target",
+                        "x86_64-unknown-linux-gnu",
+                    ],
+                    None,
+                )
             )
         else:
             commands.append(
@@ -89,6 +99,7 @@ def run_local_gates(candidate_dir: Path, task: ZStepRSITask, evidence_dir: Path)
                     [
                         "cargo",
                         "check",
+                        "--tests",
                         "-p",
                         "zs-kv",
                         "-p",

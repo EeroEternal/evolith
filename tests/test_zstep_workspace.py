@@ -128,3 +128,29 @@ def test_freeze_source_excludes_git_and_build_outputs(tmp_path: Path) -> None:
     candidate_two = manager.create_candidate("g0002-archive", [])
     archive_two = manager.freeze_source(candidate_two, tmp_path / "evidence/candidate2.tar.gz")
     assert archive.read_bytes() == archive_two.read_bytes()
+
+
+def test_prepare_upstream_syncs_when_baseline_sha_advances(tmp_path: Path) -> None:
+    source = make_source_repo(tmp_path)
+    sha1 = (
+        subprocess.run(["git", "rev-parse", "--short=7", "HEAD"], cwd=source, check=True, capture_output=True)
+        .stdout.decode()
+        .strip()
+    )
+    ws1 = ZStepWorkspace(make_task(tmp_path, source, baseline_sha=sha1))
+    assert ws1.upstream_head_sha() == sha1
+
+    write(source / "worker/zstep_worker/env_config.py", "# env\n")
+    run(["git", "add", "."], source)
+    run(["git", "commit", "-qm", "merged pr"], source)
+    sha2 = (
+        subprocess.run(["git", "rev-parse", "--short=7", "HEAD"], cwd=source, check=True, capture_output=True)
+        .stdout.decode()
+        .strip()
+    )
+    assert sha2 != sha1
+
+    ws2 = ZStepWorkspace(make_task(tmp_path, source, baseline_sha=sha2))
+    assert ws2.upstream_head_sha() == sha2
+    cand = ws2.create_candidate("g0013-rebased", [])
+    assert (cand / "worker/zstep_worker/env_config.py").read_text() == "# env\n"

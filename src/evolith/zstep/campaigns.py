@@ -19,6 +19,7 @@ class CampaignSpec:
     complexity_free_lines: int
     max_changed_lines: int
     blueprint: str
+    extra_pinned_files: tuple[str, ...] = ()
 
 
 CAMPAIGNS: tuple[CampaignSpec, ...] = (
@@ -127,8 +128,12 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
             "[Active Campaign T2-1 Blueprint — Ping-Pong Host Staging & Consolidated Decode I/O]\n"
             "  - Consolidate fragmented host-to-device metadata copies and overlap CPU numpy/table "
             "preparation for step N+1 with GPU execution of step N using strict parity-indexed "
-            "double buffers and CUDA Event synchronization (zero single-buffer WAR hazards)."
+            "double buffers and CUDA Event synchronization (zero single-buffer WAR hazards).\n"
+            "  - veriserve Safety Prerequisite: NEVER return cancelled `BlockLease` pages or parity "
+            "slots to `FREE` while an overlapped GPU `step N` may still read/write them (`DRAINING` "
+            "until `finish(step N)` stop-evidence; `QUARANTINED`/`signal_abort()` on unstopped timeout)."
         ),
+        extra_pinned_files=("crates/zs-kv/src/lib.rs",),
     ),
     CampaignSpec(
         campaign_id="t2-2-sm120-fusion",
@@ -181,8 +186,10 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
             "and guard SHM `compressor_slot_ids` behind `num_recurrent_checkpoints > 0`.\n"
             "    3. Prefix Lease Page Accounting (`serving.rs`): after `promote_completed_prefixes_in_batch`, "
             "enforce `seq.page_ids.len() == prefix_lease.pages() + seq.kv_leases.len()` on cross-page "
-            "rejection rewind so online `idle_kv_cache_usage == 0.0` always holds."
+            "rejection rewind so online `idle_kv_cache_usage == 0.0` always holds; never reclaim pages "
+            "on timeout without GPU step completion evidence."
         ),
+        extra_pinned_files=("crates/zs-kv/src/lib.rs",),
     ),
     CampaignSpec(
         campaign_id="t2-4-agent-adaptive-kv-sched",
@@ -254,10 +261,12 @@ def resolve_campaign(
 def apply_campaign_to_task(task: ZStepRSITask, spec: CampaignSpec | None) -> ZStepRSITask:
     if spec is None:
         return task
+    merged_pins = tuple(dict.fromkeys((*task.pinned_spec_files, *spec.extra_pinned_files)))
     return task.model_copy(
         update={
             "allowed_roots": spec.allowed_roots,
             "complexity_free_lines": spec.complexity_free_lines,
             "max_changed_lines": spec.max_changed_lines,
+            "pinned_spec_files": merged_pins,
         }
     )
