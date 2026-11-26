@@ -6,6 +6,7 @@ import re
 import sqlite3
 
 from evolith.controller.archive import SteppingStonesArchive
+from evolith.core.envelope import EnvelopeFailureLog, EnvelopeGap
 from evolith.models import EvolutionPlane, LineageNode
 from evolith.zstep.task import CandidateStatus
 
@@ -137,6 +138,7 @@ class ZStepArchive:
         self.stepping_stones = SteppingStonesArchive(db_path=db_path)
         self.stepping_stones._conn.close()
         self.stepping_stones._conn = self._conn
+        self.envelope_log = EnvelopeFailureLog(db_path, conn=self._conn)
 
     def _init_schema(self) -> None:
         self._conn.execute(
@@ -639,3 +641,20 @@ class ZStepArchive:
             for niche, reasons in streaks.items()
             if len(reasons) >= strike_limit
         }
+
+    def record_envelope_gap(self, gap: EnvelopeGap) -> EnvelopeGap:
+        """Persist an explicit capability/envelope gap alongside candidate lineage."""
+        recorded = self.envelope_log.record(gap)
+        if gap.candidate_id:
+            self._log_event(
+                gap.candidate_id,
+                "envelope_gap",
+                stage="envelope",
+                status=gap.category.value,
+                detail=f"{gap.blocked_by_boundary}: {gap.attempted_optimization}",
+            )
+            self._conn.commit()
+        return recorded
+
+    def list_envelope_gaps(self) -> list[EnvelopeGap]:
+        return self.envelope_log.list_gaps()

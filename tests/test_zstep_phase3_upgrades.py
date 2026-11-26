@@ -401,8 +401,8 @@ def test_hardware_and_benchmark_profiles_plus_remote_32_topology_inference(tmp_p
     task = ZStepRSITask(
         project_root=tmp_path,
         source_repo=tmp_path / "zstep",
-        remote_host="10.23.51.32",
-        remote_user="node-user",
+        remote_host="192.0.2.32",
+        remote_user="bench-user",
         remote_sudo=True,
         hardware_profile="sm120-8x6000d-pp2tp4",
         benchmark_profile="longctx-agent",
@@ -415,6 +415,8 @@ def test_hardware_and_benchmark_profiles_plus_remote_32_topology_inference(tmp_p
     bscript = remote.benchmark_script("/tmp/src", "/tmp/out.json", task.screen_tiers, 1, None)
     assert "/data02/zstep-work/rustup" in bscript
     assert "ZSTEP_PIPELINE_PARALLEL_SIZE=2" in bscript
+    assert "ZSTEP_DECODE_DEVICE_TOKENS=0" in bscript
+    assert "ZSTEP_PP_PREFILL_MICROBATCHES=1" in bscript
     assert "ZSTEP_PP_DECODE_PIPELINE=1" in bscript
 
 

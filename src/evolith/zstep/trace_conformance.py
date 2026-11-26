@@ -56,10 +56,15 @@ def verify_trace_conformance(
     evidence_dir: Path | None = None,
     max_cross_mode_logit_drift: float = 8.0,
     require_schedule_exposure: bool = True,
+    require_cuda_graph: bool = False,
+    require_seis_checks: bool = False,
+    expected_vocab_size: int | None = None,
     raise_on_failure: bool = True,
 ) -> TraceConformanceReport:
     """Validate real GPU parity and benchmark execution traces against formal invariants."""
     clauses: list[TraceCheckClause] = []
+    payload: object = None
+    m_payload: object = None
 
     if parity_path is None or not parity_path.is_file():
         clauses.append(
@@ -357,6 +362,100 @@ def verify_trace_conformance(
                             witness=kv_violation,
                         )
                     )
+
+    # 5. CUDA Graph required / zero silent eager fallback guard
+    p_dict = payload if (parity_path and parity_path.is_file() and isinstance(payload, dict)) else {}
+    m_dict = (
+        m_payload
+        if (metrics_path and metrics_path.is_file() and isinstance(m_payload, dict))
+        else {}
+    )
+    eager_fb = m_dict.get("eager_fallback_steps", p_dict.get("eager_fallback_steps"))
+    guard_fail = m_dict.get("graph_guard_failures", p_dict.get("graph_guard_failures"))
+    if eager_fb is None and guard_fail is None:
+        clauses.append(
+            TraceCheckClause(
+                clause_id="TRACE_CUDA_GRAPH_REQUIRED",
+                pillar="Determinism",
+                verdict="INCONCLUSIVE_INCOMPLETE_TRACE" if require_cuda_graph else "NOT_APPLICABLE",
+                passed=not require_cuda_graph,
+                detail="CUDA Graph fallback counters not emitted by harness",
+                witness=(
+                    "Missing `eager_fallback_steps` / `graph_guard_failures` with `require_cuda_graph=True`"
+                    if require_cuda_graph
+                    else None
+                ),
+            )
+        )
+    else:
+        fb_cnt = int(eager_fb or 0)
+        gf_cnt = int(guard_fail or 0)
+        graph_ok = fb_cnt == 0 and gf_cnt == 0
+        clauses.append(
+            TraceCheckClause(
+                clause_id="TRACE_CUDA_GRAPH_REQUIRED",
+                pillar="Determinism",
+                verdict="CONFORMANT" if graph_ok else "VIOLATION",
+                passed=graph_ok,
+                detail=f"eager_fallback_steps={fb_cnt}, graph_guard_failures={gf_cnt}",
+                witness=(
+                    None
+                    if graph_ok
+                    else (
+                        f"CUDA Graph silent fallback or guard failure detected: "
+                        f"eager_fallback_steps={fb_cnt}, graph_guard_failures={gf_cnt}"
+                    )
+                ),
+            )
+        )
+
+    # 6. SEIS 4-point anti-reward-hacking suite (EOS, full vocab, varied sequences, decode path)
+    seis = p_dict.get("seis_invariants") or m_dict.get("seis_invariants")
+    if not isinstance(seis, dict):
+        clauses.append(
+            TraceCheckClause(
+                clause_id="TRACE_SEIS_ANTI_CHEAT_INVARIANTS",
+                pillar="AntiCheat",
+                verdict="INCONCLUSIVE_INCOMPLETE_TRACE" if require_seis_checks else "NOT_APPLICABLE",
+                passed=not require_seis_checks,
+                detail="Optional `seis_invariants` telemetry not present",
+                witness=(
+                    "Missing `seis_invariants` block with `require_seis_checks=True`"
+                    if require_seis_checks
+                    else None
+                ),
+            )
+        )
+    else:
+        seis_err: str | None = None
+        if seis.get("eos_stop_consistent") is False or int(seis.get("eos_mismatch_count", 0)) > 0:
+            seis_err = "SEIS violation: EOS termination mismatch / suppressed EOS stopping detected"
+        elif seis.get("vocab_slicing_detected") is True:
+            seis_err = "SEIS violation: vocabulary row slicing / partial logits hack detected"
+        elif (
+            expected_vocab_size is not None
+            and int(seis.get("vocab_size_checked", 0)) < expected_vocab_size
+        ):
+            seis_err = (
+                f"SEIS violation: checked vocab {seis.get('vocab_size_checked')} < "
+                f"expected {expected_vocab_size}"
+            )
+        elif seis.get("stale_cache_reuse_detected") is True or int(
+            seis.get("distinct_request_sequences", 2)
+        ) < 2:
+            seis_err = "SEIS violation: insufficient distinct request sequences or stale cache reuse"
+        elif int(seis.get("decode_steps_exercised", 1)) <= 0:
+            seis_err = "SEIS violation: benchmark failed to exercise decode path (`decode_steps <= 0`)"
+        clauses.append(
+            TraceCheckClause(
+                clause_id="TRACE_SEIS_ANTI_CHEAT_INVARIANTS",
+                pillar="AntiCheat",
+                verdict="VIOLATION" if seis_err else "CONFORMANT",
+                passed=(seis_err is None),
+                detail="Verified EOS parity, full-vocab integrity, varied prompts, and decode coverage",
+                witness=seis_err,
+            )
+        )
 
     has_violation = any(c.verdict == "VIOLATION" for c in clauses)
     has_incomplete = any(c.verdict == "INCONCLUSIVE_INCOMPLETE_TRACE" for c in clauses)

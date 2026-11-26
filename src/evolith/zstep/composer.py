@@ -27,6 +27,11 @@ import subprocess
 import tempfile
 from typing import Callable
 
+from evolith.core.surface import (
+    TargetSurface,
+    are_patches_closure_orthogonal,
+    default_zstep_surface,
+)
 from evolith.zstep.archive import ZStepArchive
 from evolith.zstep.task import CandidateStatus
 
@@ -123,8 +128,11 @@ def find_orthogonal_stepping_stone_pairs(
     parent_id: str | None = None,
     min_gain: float = 0.015,
     max_gain: float = 0.0299,
+    surface: TargetSurface | None = None,
+    enforce_resource_closure: bool = True,
 ) -> list[SteppingStonePair]:
-    """Return ranked disjoint-file near-miss positive candidate pairs from `archive`."""
+    """Return ranked orthogonal near-miss positive candidate pairs from `archive`."""
+    active_surface = surface or default_zstep_surface()
     eligible: list[dict[str, object]] = []
     for row in archive.list_candidates():
         if str(row.get("status")) != CandidateStatus.VERIFY_REJECTED.value:
@@ -158,6 +166,20 @@ def find_orthogonal_stepping_stone_pairs(
             fb = set(b["_files"])  # type: ignore[arg-type]
             if not fa.isdisjoint(fb):
                 continue
+            if enforce_resource_closure:
+                ok_orth, _why = are_patches_closure_orthogonal(
+                    active_surface,
+                    left_files=tuple(a["_files"]),  # type: ignore[arg-type]
+                    right_files=tuple(b["_files"]),  # type: ignore[arg-type]
+                    left_patch_text=bytes(a.get("patch") or b"").decode(
+                        "utf-8", errors="replace"
+                    ),
+                    right_patch_text=bytes(b.get("patch") or b"").decode(
+                        "utf-8", errors="replace"
+                    ),
+                )
+                if not ok_orth:
+                    continue
             ga = float(a["_gain"])  # type: ignore[arg-type]
             gb = float(b["_gain"])  # type: ignore[arg-type]
             est = (1.0 + ga) * (1.0 + gb) - 1.0

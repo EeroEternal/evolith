@@ -374,7 +374,9 @@ fi"""
         overlay_snip = self._overlay_env_snippet(overlay_dir)
         sudo_pfx = self._sudo_shell_prefix()
         pp_env = (
-            f"-e ZSTEP_PIPELINE_PARALLEL_SIZE={hw.pp_size} -e ZSTEP_PP_DECODE_PIPELINE={'1' if hw.decode_pipeline_1f1b else '0'} "
+            f"-e ZSTEP_PIPELINE_PARALLEL_SIZE={hw.pp_size} -e ZSTEP_DECODE_DEVICE_TOKENS=0 "
+            f"-e ZSTEP_PP_PREFILL_MICROBATCHES=1 "
+            f"-e ZSTEP_PP_DECODE_PIPELINE={'1' if hw.decode_pipeline_1f1b else '0'} "
             if hw.pp_size > 1
             else ""
         )
