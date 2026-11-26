@@ -12,6 +12,7 @@ from evolith.models import EvolutionPlane
 class CandidateStatus(str, Enum):
     PROPOSED = "proposed"
     LOCAL_REJECTED = "local_rejected"
+    FORMAL_INCONCLUSIVE = "formal_inconclusive"
     SCREEN_REJECTED = "screen_rejected"
     VERIFY_REJECTED = "verify_rejected"
     ACCEPTED = "accepted"
@@ -79,7 +80,7 @@ class VerificationDecision(BaseModel):
 class ZStepRSITask(BaseModel):
     project_root: Path
     source_repo: Path
-    baseline_sha: str = "a773c4d"
+    baseline_sha: str = "a36fab8"
     remote_user: str = Field(
         default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_USER", "ubuntu")
     )
@@ -95,6 +96,17 @@ class ZStepRSITask(BaseModel):
     remote_rustup_root: str = Field(
         default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_RUSTUP_ROOT", "")
     )
+    remote_sudo: bool = Field(
+        default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_SUDO", "0") == "1"
+    )
+    hardware_profile: str = Field(
+        default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_HW_PROFILE", "auto")
+    )
+    benchmark_profile: str = Field(
+        default_factory=lambda: os.environ.get("EVOLITH_ZSTEP_BENCH_PROFILE", "custom")
+    )
+    isolate_hw_state: bool = False
+    enable_scout_probe: bool = False
     model_dir: str = Field(
         default_factory=lambda: os.environ.get(
             "EVOLITH_ZSTEP_MODEL_DIR", "/models/DeepSeek-V4.1-Flash"
@@ -158,6 +170,8 @@ class ZStepRSITask(BaseModel):
         "worker/zstep_worker/kernels_sm120",
         "crates/zs-kv/src",
         "crates/zs-scheduler/src",
+        "crates/zs-server/src/serve.rs",
+        "crates/zs-server/src/serve",
     )
 
     @property
@@ -170,14 +184,36 @@ class ZStepRSITask(BaseModel):
 
     @property
     def state_dir(self) -> Path:
-        return self.project_root / ".evolith/zstep-rsi"
+        base = self.project_root / ".evolith/zstep-rsi"
+        if self.isolate_hw_state and self.hardware_profile.strip().lower() not in ("", "auto"):
+            from evolith.zstep.hardware import resolve_hardware_profile
+
+            hw = resolve_hardware_profile(self.hardware_profile, state_dir=base)
+            return base / hw.profile_id
+        return base
 
     @property
     def baseline_cache_dir(self) -> Path:
         return self.state_dir / "baseline-cache"
 
+    def resolved_hardware_profile(self):
+        from evolith.zstep.hardware import resolve_hardware_profile
+
+        return resolve_hardware_profile(
+            self.hardware_profile, state_dir=self.project_root / ".evolith/zstep-rsi"
+        )
+
     @model_validator(mode="after")
     def validate_tiers(self) -> ZStepRSITask:
+        bprof = self.benchmark_profile.strip().lower()
+        if bprof and bprof != "custom":
+            from evolith.zstep.hardware import resolve_benchmark_profile
+
+            preset = resolve_benchmark_profile(bprof)
+            if "screen_tiers" not in self.model_fields_set:
+                self.screen_tiers = preset.screen_tiers
+            if "verify_tiers" not in self.model_fields_set:
+                self.verify_tiers = preset.verify_tiers
         public = {item.split(":", 1)[0] for item in self.screen_tiers.split(";") if item}
         hidden = {item.split(":", 1)[0] for item in self.verify_tiers.split(";") if item}
         if not public or not hidden:

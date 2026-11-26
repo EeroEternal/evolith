@@ -13,8 +13,12 @@ from evolith.zstep.campaigns import (
     apply_campaign_to_task,
     resolve_campaign,
 )
+from evolith.zstep.composer import extract_and_validate_scout_probe
 from evolith.zstep.dispatch_verifier import run_dispatch_verification
-from evolith.zstep.formal_verifier import run_formal_verification
+from evolith.zstep.formal_verifier import (
+    FormalInconclusiveError,
+    run_formal_verification,
+)
 from evolith.zstep.gates import (
     evaluate_candidate,
     evaluate_screen,
@@ -35,6 +39,7 @@ from evolith.zstep.remote import (
     ZStepRemoteRunner,
 )
 from evolith.zstep.task import CandidateStatus, PatchStats, ZStepRSITask
+from evolith.zstep.trace_conformance import verify_trace_conformance
 from evolith.zstep.workspace import ZStepWorkspace
 
 
@@ -96,8 +101,15 @@ class ZStepRSILoop:
         blocked_niches: dict[str, list[str]] | None = None,
         active_task: ZStepRSITask | None = None,
         active_campaign: CampaignSpec | None = None,
+        scout_telemetry: str | None = None,
     ) -> str:
         task = active_task or self.task
+        hw = task.resolved_hardware_profile()
+        topo_desc = (
+            f"PP={hw.pp_size}×TP={hw.tp_size}, {hw.gpu_arch.upper()}, {hw.world_size}×{hw.gpu_name}"
+            if hw.pp_size > 1
+            else f"TP={hw.tp_size}, {hw.gpu_arch.upper()}, {hw.world_size}×{hw.gpu_name}"
+        )
         hidden_labels = {
             item.split(":", 1)[0] for item in task.verify_tiers.split(";") if item
         }
@@ -119,13 +131,27 @@ class ZStepRSILoop:
             task.project_root, allowed_roots=task.allowed_roots
         )
         memory_section = f"\n{memory_ring}\n" if memory_ring else ""
+        scout_section = ""
+        if scout_telemetry is not None:
+            scout_section = (
+                "\nMeasured Stage-1 8-GPU Scout Probe Telemetry (use these real measurements to write your final patch):\n"
+                f"{scout_telemetry}\n"
+            )
+        elif task.enable_scout_probe and not task.propose_only:
+            scout_section = (
+                "\nOptional Stage-1 Scout Probe Protocol:\n"
+                "- Before editing source files, you MAY emit a read-only GPU microbenchmark script wrapped in "
+                "`EVOLITH_SCOUT_PROBE_BEGIN` ... `EVOLITH_SCOUT_PROBE_END` (accepting `--output <path>` and writing JSON) "
+                "with zero file modifications; Evolith will run it on the isolated GPU container (~35s) and return the "
+                "measured JSON for Stage-2 patch synthesis.\n"
+            )
         niche_example = (
             active_campaign.primary_niche_key
             if active_campaign is not None
             else "(plane=<l1_kernel|l2_scheduler>,focus=<short_tag>)"
         )
         return f"""Parent: {parent_id or 'frozen-zstep-baseline'}
-Improve DeepSeek-V4.1-Flash (TP=8, SM120) serving throughput without weakening correctness or latency.
+Improve {task.model_id} ({topo_desc}) serving throughput without weakening correctness or latency.
 
 Strict Modification Contract:
 - Edit ONLY these allowlisted zstep source paths:
@@ -138,7 +164,7 @@ Strict Modification Contract:
 - Do not modify benchmark semantics, dependency manifests, model files, or verifier rules.
 - Do not access remote hosts, credentials, other workspaces, or hidden verification cases.
 - Run relevant local checks. The public screen tiers are {task.screen_tiers}.
-{campaign_section}
+{scout_section}{campaign_section}
 {reflection_card}
 {memory_section}
 AIDE^2 Compressed Lineage Memory (Previous Candidates — Do NOT Repeat Rejected Hypotheses):
@@ -256,13 +282,24 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 f"lineage parent advanced before accepting {candidate_id} "
                 f"(expected {cand_row.get('parent_id')}, got {actual_parent})"
             )
+        eff_task = active_task or self.task
         decision = evaluate_candidate(
             load_benchmark(baseline_json),
             load_benchmark(candidate_json),
             parity_json,
-            active_task or self.task,
+            eff_task,
             changed_lines=changed_lines,
         )
+        if parity_json.is_file():
+            raw_parity = parity_json.read_text(encoding="utf-8", errors="replace")
+            verify_trace_conformance(
+                parity_json,
+                candidate_json,
+                evidence_dir=evidence_dir,
+                max_cross_mode_logit_drift=eff_task.max_cross_mode_logit_drift,
+                require_schedule_exposure=("chunked_schedule" in raw_parity),
+                raise_on_failure=False,
+            )
         (evidence_dir / "decision.json").write_text(
             decision.model_dump_json(indent=2),
             encoding="utf-8",
@@ -336,14 +373,46 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                         ),
                         encoding="utf-8",
                     )
+                hw = active_task.resolved_hardware_profile()
                 had_shm_allreduce = (
-                    candidate_dir / "worker/zstep_worker/kernels_sm120/shm_allreduce.py"
+                    candidate_dir / f"{hw.kernel_backend_dir}/shm_allreduce.py"
                 ).is_file()
                 spec_pins = compute_spec_pins(candidate_dir, active_task.pinned_spec_files)
                 baseline_archive = self.workspace.freeze_source(
                     candidate_dir, evidence_dir / "baseline.tar.gz"
                 )
                 baseline_hash = hashlib.sha256(baseline_archive.read_bytes()).hexdigest()
+                scout_telemetry: str | None = None
+                if (
+                    active_task.enable_scout_probe
+                    and not self.task.propose_only
+                    and hasattr(self.remote, "run_probe")
+                ):
+                    scout_prompt = self._prompt(
+                        parent_id,
+                        candidate_dir,
+                        baseline_hash,
+                        blocked,
+                        active_task=active_task,
+                        active_campaign=active_campaign,
+                    )
+                    scout_out = self.proposer.propose(candidate_dir, scout_prompt, evidence_dir)
+                    scout_script = extract_and_validate_scout_probe(scout_out)
+                    if scout_script is not None:
+                        scout_py = evidence_dir / "scout_probe.py"
+                        scout_json = evidence_dir / "scout-probe.json"
+                        scout_py.write_text(scout_script, encoding="utf-8")
+                        self.remote.run_probe(
+                            f"{candidate_id}-scout",
+                            baseline_archive,
+                            scout_py,
+                            scout_json,
+                        )
+                        scout_telemetry = scout_json.read_text(encoding="utf-8")[:6000]
+                        shutil.rmtree(candidate_dir, ignore_errors=True)
+                        candidate_dir = self.workspace.create_candidate(
+                            candidate_id, self.archive.accepted_patches(upstream_sha=upstream_sha)
+                        )
                 proposer_out, patch_stats = self._propose_and_capture(
                     candidate_dir,
                     self._prompt(
@@ -353,6 +422,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                         blocked,
                         active_task=active_task,
                         active_campaign=active_campaign,
+                        scout_telemetry=scout_telemetry,
                     ),
                     evidence_dir,
                     active_task=active_task,
@@ -407,13 +477,17 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 )
                 run_dispatch_verification(candidate_dir, evidence_dir)
                 has_shm_now = (
-                    candidate_dir / "worker/zstep_worker/kernels_sm120/shm_allreduce.py"
+                    candidate_dir / f"{hw.kernel_backend_dir}/shm_allreduce.py"
                 ).is_file()
                 run_formal_verification(
                     candidate_dir,
                     evidence_dir,
                     require_z3=(had_shm_allreduce or has_shm_now),
                     expect_shm_allreduce=had_shm_allreduce,
+                    max_single_pxb_bytes=hw.max_single_pxb_bytes,
+                    max_pp1_pxb_bytes=hw.max_pp1_pxb_bytes,
+                    max_pp2_pxb_bytes=hw.max_pp2_pxb_bytes,
+                    shm_rel_dir=hw.kernel_backend_dir,
                 )
                 run_local_gates(candidate_dir, active_task, evidence_dir)
                 if self.task.propose_only:
@@ -455,7 +529,9 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 statuses.append(final_status)
             except Exception as error:
                 is_infra = isinstance(error, (RemotePreflightError, RemoteInfraError))
-                if is_infra:
+                if isinstance(error, FormalInconclusiveError):
+                    status = CandidateStatus.FORMAL_INCONCLUSIVE
+                elif is_infra:
                     status = CandidateStatus.FAILED
                 else:
                     status = {

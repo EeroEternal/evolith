@@ -35,6 +35,7 @@ from __future__ import annotations
 import ast
 from collections import deque
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -47,6 +48,15 @@ import tempfile
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+from evolith.zstep.formal_cross_lang import (
+    MAX_SAFE_PP1_TOTAL_PXB_BYTES,
+    MAX_SAFE_PP2_TOTAL_PXB_BYTES,
+    verify_cpp_guard_differential,
+    verify_static_runner_pxb_total_budget,
+    verify_z3_cross_lang_swa_pool_safety,
+    verify_z3_dspark_bt_cache_horizon,
+)
 
 MAX_SAFE_PXB_HBM_BYTES: int = 180 * 1024 * 1024  # 180 MiB static PXB IPC ring ceiling
 
@@ -70,6 +80,14 @@ HISTORICAL_CANDIDATE_EXPECTATIONS: dict[str, tuple[bool, str]] = {
 
 class FormalVerificationError(RuntimeError):
     pass
+
+
+class FormalViolationError(FormalVerificationError):
+    """Candidate broke a proved safety, conservation, or cross-language invariant (`REJECTED`)."""
+
+
+class FormalInconclusiveError(FormalVerificationError):
+    """Fail-closed modeling mismatch, parse failure, timeout, or missing Z3 (`INCONCLUSIVE`)."""
 
 
 class ClauseResult(BaseModel):
@@ -108,6 +126,9 @@ class HistoricalCandidateRow(BaseModel):
 class FormalVerificationReport(BaseModel):
     passed: bool
     gate_verdict: Literal["CLOSED", "REJECTED", "INCONCLUSIVE", "NOT_APPLICABLE"] = "CLOSED"
+    contract_sha256: str = ""
+    target_tree_sha256: str = ""
+    z3_version: str = ""
     weakest_link: str = ""
     z3_available: bool
     z3_binary: str | None = None
@@ -1707,6 +1728,69 @@ def model_check_kv_prefix_spec_lifecycle(
 # ---------------------------------------------------------------------------
 
 
+def _detect_z3_version(z3_bin: str | None) -> str:
+    if not z3_bin:
+        return ""
+    try:
+        res = subprocess.run(
+            [z3_bin, "--version"],
+            text=True,
+            capture_output=True,
+            timeout=3.0,
+            check=False,
+        )
+        return (res.stdout or res.stderr).strip().splitlines()[0] if (res.stdout or res.stderr) else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _compute_formal_hashes(
+    candidate_dir: Path,
+    *,
+    max_single_pxb_bytes: int,
+    max_pp1_pxb_bytes: int,
+    max_pp2_pxb_bytes: int,
+    shm_rel_dir: str,
+) -> tuple[str, str]:
+    contract_payload = json.dumps(
+        {
+            "contract_version": "evolith-formal-v2",
+            "max_single_pxb_bytes": max_single_pxb_bytes,
+            "max_pp1_pxb_bytes": max_pp1_pxb_bytes,
+            "max_pp2_pxb_bytes": max_pp2_pxb_bytes,
+            "shm_rel_dir": shm_rel_dir,
+            "enforced_clause_catalog": [
+                "STATIC_PXB_RING_BYTES_BOUND",
+                "DIFF_PY_DESCRIPTOR_EQUIVALENCE",
+                "DIFF_CPP_GUARD_EQUIVALENCE",
+                "Z3_FUSED_AR_3WAY_SOUNDNESS",
+                "Z3_CROSS_LANG_SWA_POOL_SAFETY",
+                "Z3_DSPARK_BT_CACHE_HORIZON",
+                "STATIC_RUNNER_PXB_TOTAL_BUDGET",
+            ],
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    contract_sha = hashlib.sha256(contract_payload).hexdigest()
+
+    tree_hasher = hashlib.sha256()
+    watched_rels = (
+        f"{shm_rel_dir}/shm_allreduce.py",
+        f"{shm_rel_dir}/csrc/shm_allreduce.cpp",
+        f"{shm_rel_dir}/csrc/shm_allreduce_kernels.cu",
+        "worker/zstep_worker/models/deepseek_v41.py",
+        "worker/zstep_worker/models/deepseek_v41_dspark.py",
+        "crates/zs-server/src/serve.rs",
+        "crates/zs-server/src/serve/cli.rs",
+    )
+    for rel in watched_rels:
+        fp = candidate_dir / rel
+        if fp.is_file():
+            tree_hasher.update(rel.encode("utf-8") + b"\0")
+            tree_hasher.update(fp.read_bytes() + b"\0")
+    return contract_sha, tree_hasher.hexdigest()
+
+
 def run_formal_verification(
     candidate_dir: Path,
     evidence_dir: Path | None = None,
@@ -1714,16 +1798,29 @@ def run_formal_verification(
     require_z3: bool = False,
     expect_shm_allreduce: bool = False,
     diff_timeout_sec: float = 5.0,
+    max_single_pxb_bytes: int = MAX_SAFE_PXB_HBM_BYTES,
+    max_pp1_pxb_bytes: int = MAX_SAFE_PP1_TOTAL_PXB_BYTES,
+    max_pp2_pxb_bytes: int = MAX_SAFE_PP2_TOTAL_PXB_BYTES,
+    shm_rel_dir: str = "worker/zstep_worker/kernels_sm120",
 ) -> FormalVerificationReport:
-    """Run fail-stop AST + subprocess-isolated differential + 3-way Z3 verification."""
+    """Run fail-stop AST + subprocess-isolated Python/C++ differential + cross-language Z3 verification."""
     z3_bin = find_z3_binary()
     if z3_bin is None and require_z3:
-        raise FormalVerificationError(
+        raise FormalInconclusiveError(
             "Formal verification INCONCLUSIVE: Z3 binary is required (`require_z3=True`) but not found"
         )
 
+    contract_sha, target_tree_sha = _compute_formal_hashes(
+        candidate_dir,
+        max_single_pxb_bytes=max_single_pxb_bytes,
+        max_pp1_pxb_bytes=max_pp1_pxb_bytes,
+        max_pp2_pxb_bytes=max_pp2_pxb_bytes,
+        shm_rel_dir=shm_rel_dir,
+    )
+    z3_ver = _detect_z3_version(z3_bin)
+
     clauses: list[ClauseResult] = []
-    shm_py = candidate_dir / "worker/zstep_worker/kernels_sm120/shm_allreduce.py"
+    shm_py = candidate_dir / f"{shm_rel_dir}/shm_allreduce.py"
 
     if shm_py.is_file():
         try:
@@ -1737,14 +1834,38 @@ def run_formal_verification(
                     enforced=True,
                     verdict="INCONCLUSIVE_PARSE_ERROR",
                     passed=False,
-                    anchored_sites=["worker/zstep_worker/kernels_sm120/shm_allreduce.py:1"],
+                    anchored_sites=[f"{shm_rel_dir}/shm_allreduce.py:1"],
                     counterexample=f"SyntaxError in shm_allreduce.py: {exc}",
                 )
             )
         else:
-            clauses.append(verify_static_pxb_ring_bytes_bound(sources))
+            clauses.append(
+                verify_static_pxb_ring_bytes_bound(sources, max_hbm_bytes=max_single_pxb_bytes)
+            )
             clauses.append(
                 verify_py_descriptor_differential(sources, timeout_sec=diff_timeout_sec)
+            )
+            has_pxb_init = bool(
+                sources["shm_cls"] is not None
+                and any(
+                    isinstance(it, ast.FunctionDef) and it.name == "_init_pxb_ipc"
+                    for it in sources["shm_cls"].body
+                )
+            )
+            cpp_spec, cpp_err = _parse_cpp_fused_ar_strict(
+                sources["cpp_src"],
+                has_pxb_init=has_pxb_init,
+                rel_cpp=sources["rel_cpp"],
+                line_offset=sources["cpp_line_offset"],
+            )
+            clauses.append(
+                verify_cpp_guard_differential(
+                    sources,
+                    cpp_spec,
+                    cpp_err,
+                    clause_cls=ClauseResult,
+                    timeout_sec=diff_timeout_sec,
+                )
             )
             clauses.append(
                 verify_z3_fused_ar_3way_soundness(
@@ -1764,10 +1885,36 @@ def run_formal_verification(
                 enforced=True,
                 verdict="INCONCLUSIVE_MISSING_FILE",
                 passed=False,
-                anchored_sites=["worker/zstep_worker/kernels_sm120/shm_allreduce.py:1"],
-                counterexample="Missing expected file worker/zstep_worker/kernels_sm120/shm_allreduce.py",
+                anchored_sites=[f"{shm_rel_dir}/shm_allreduce.py:1"],
+                counterexample=f"Missing expected file {shm_rel_dir}/shm_allreduce.py",
             )
         )
+
+    # Cross-language Rust <-> Python SWA capacity, DSpark BT cache horizon & multi-instance PXB budget
+    clauses.append(
+        verify_z3_cross_lang_swa_pool_safety(
+            candidate_dir,
+            z3_bin,
+            clause_cls=ClauseResult,
+            require_z3=require_z3,
+        )
+    )
+    clauses.append(
+        verify_z3_dspark_bt_cache_horizon(
+            candidate_dir,
+            z3_bin,
+            clause_cls=ClauseResult,
+            require_z3=require_z3,
+        )
+    )
+    clauses.append(
+        verify_static_runner_pxb_total_budget(
+            candidate_dir,
+            clause_cls=ClauseResult,
+            max_pp1_bytes=max_pp1_pxb_bytes,
+            max_pp2_bytes=max_pp2_pxb_bytes,
+        )
+    )
 
     # Non-gating protocol design models (explicitly reported as MODEL_ONLY, enforced=False)
     clauses.append(model_check_double_buffer_ring(enforced=False))
@@ -1791,9 +1938,10 @@ def run_formal_verification(
         gate_verdict = "CLOSED"
 
     weakest_link = (
-        "Static PXB bound checks IPC ring bytes only (not dynamic activations); "
-        "Python guard is 3000-trial differentially checked against real fn, while C++/CUDA guards "
-        "are strict regex-extracted; SM_*_MODEL state machines are non-gating design models."
+        "Static PXB bounds check IPC ring bytes only (not dynamic activations); "
+        "Python & C++ fused guards are 3000-trial differentially checked against real compiled code, "
+        "while CUDA kernel launcher guards are strict AST/regex-extracted; "
+        "SM_*_MODEL state machines are non-gating design models."
     )
 
     violations = [
@@ -1801,9 +1949,13 @@ def run_formal_verification(
         for c in enforced_clauses
         if not c.passed
     ]
+    report_passed = gate_verdict in ("CLOSED", "NOT_APPLICABLE")
     report = FormalVerificationReport(
-        passed=not violations,
+        passed=report_passed,
         gate_verdict=gate_verdict,
+        contract_sha256=contract_sha,
+        target_tree_sha256=target_tree_sha,
+        z3_version=z3_ver,
         weakest_link=weakest_link,
         z3_available=z3_bin is not None,
         z3_binary=z3_bin,
@@ -1817,7 +1969,8 @@ def run_formal_verification(
             encoding="utf-8",
         )
     if violations:
-        raise FormalVerificationError(
+        err_cls = FormalViolationError if gate_verdict == "REJECTED" else FormalInconclusiveError
+        raise err_cls(
             f"Formal verification {gate_verdict}: " + "; ".join(violations)
         )
     return report
@@ -2068,6 +2221,119 @@ def calibrate_formal_mutations(
         "Z3_FUSED_AR_3WAY_SOUNDNESS",
         "INCONCLUSIVE_PARSE_ERROR",
         _inject_unparseable_guard,
+    )
+
+    # M8: Real C++ source edit -> unmodeled extra TORCH_CHECK(rows != 17) caught by compiled C++ 3000-trial diff
+    def _inject_unmodeled_cpp_guard(root: Path) -> None:
+        p = root / (rel_cpp if is_split else rel_py)
+        txt = p.read_text(encoding="utf-8")
+        needle = "const int64_t vecs_per_row = hidden / 8;"
+        if needle not in txt:
+            raise FormalVerificationError(f"Could not locate `{needle}` in {p} for M8")
+        txt = txt.replace(
+            needle,
+            needle + '\n    TORCH_CHECK(rows != 17, "unmodeled candidate rows!=17 guard");',
+            1,
+        )
+        p.write_text(txt, encoding="utf-8")
+
+    from evolith.zstep.formal_cross_lang import find_cpp_compiler
+
+    if find_cpp_compiler() is not None:
+        _run_source_mutant(
+            "M8_src_unmodeled_cpp_extra_guard_mismatch",
+            "DIFF_CPP_GUARD_EQUIVALENCE",
+            "INCONCLUSIVE_MODEL_MISMATCH",
+            _inject_unmodeled_cpp_guard,
+        )
+
+    # M9: Cross-language Rust <-> Python SWA pool under-reservation (`2 * max_seqs` vs 3-page verify straddle)
+    def _inject_swa_under_reservation(root: Path) -> None:
+        serve_rs = root / "crates/zs-server/src/serve.rs"
+        serve_rs.parent.mkdir(parents=True, exist_ok=True)
+        serve_rs.write_text(
+            "fn init_swa(args: &ServeArgs) {\n"
+            "    let min_active_swa = 2 * args.max_seqs as usize;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        v41_py = root / "worker/zstep_worker/models/deepseek_v41.py"
+        v41_py.parent.mkdir(parents=True, exist_ok=True)
+        v41_py.write_text(
+            "class _SwaPagePool:\n"
+            "    def map_active_windows(self, active_pt, seq_pos_min, seq_pos_max):\n"
+            "        for i in range(1):\n"
+            "            p_lo = max(0, (int(seq_pos_min[i]) - 127) // 128)\n"
+            "            p_hi = min(int(active_pt.shape[1]) - 1, int(seq_pos_max[i]) // 128)\n"
+            "        return active_pt, False\n",
+            encoding="utf-8",
+        )
+
+    _run_source_mutant(
+        "M9_src_cross_lang_swa_2x_under_reservation",
+        "Z3_CROSS_LANG_SWA_POOL_SAFETY",
+        "VIOLATION",
+        _inject_swa_under_reservation,
+    )
+
+    # M10: DSpark GPU block-table cache column horizon gap (`p_max // 128` vs `(p_max + k) // 128`)
+    def _inject_dspark_bt_horizon_gap(root: Path) -> None:
+        v41_py = root / "worker/zstep_worker/models/deepseek_v41.py"
+        v41_py.parent.mkdir(parents=True, exist_ok=True)
+        v41_py.write_text(
+            "class DeepSeekV41StepRunner:\n"
+            "    def _matches_gpu_bt_cache(self, bt_key, pt_np, slots_np, c_hi):\n"
+            "        return True\n"
+            "    def step_verify(self, pt_np, p_max, v_bucket, seq_slots_np):\n"
+            "        c_hi = np.minimum(pt_np.shape[1] - 1, p_max // 128)\n"
+            "        self._last_verify_bt_sig = (v_bucket, tuple(seq_slots_np))\n",
+            encoding="utf-8",
+        )
+        dsp_py = root / "worker/zstep_worker/models/deepseek_v41_dspark.py"
+        dsp_py.parent.mkdir(parents=True, exist_ok=True)
+        dsp_py.write_text(
+            "def draft(runner, req_slots, eff_b):\n"
+            "    sig_match = getattr(runner, '_last_verify_bt_sig', None) == (eff_b, tuple(req_slots))\n"
+            "    bt_cached = bool(sig_match)\n"
+            "    return bt_cached\n",
+            encoding="utf-8",
+        )
+
+    _run_source_mutant(
+        "M10_src_dspark_bt_cache_horizon_gap",
+        "Z3_DSPARK_BT_CACHE_HORIZON",
+        "VIOLATION",
+        _inject_dspark_bt_horizon_gap,
+    )
+
+    # M11: Multi-instance PXB IPC ring budget overflow on PP=1 (`shm_ar + shm_ar_tbo` > 256 MiB)
+    def _inject_dual_pxb_pp1_overflow(root: Path) -> None:
+        v41_py = root / "worker/zstep_worker/models/deepseek_v41.py"
+        v41_py.parent.mkdir(parents=True, exist_ok=True)
+        v41_py.write_text(
+            "class DeepSeekV41StepRunner:\n"
+            "    def __init__(self):\n"
+            "        ar_max_tokens = 4096\n"
+            "        tbo_cap_tokens = 4096\n"
+            "        self.shm_ar = HostMappedShmAllReduce(\n"
+            "            capacity_elements=ar_max_tokens * 8192,\n"
+            "            enable_pxb_p2p=self.p2p_report.pxb_shm_enabled,\n"
+            "            pxb_max_elements=ar_max_tokens * 5120,\n"
+            "        )\n"
+            "        if self.pp_size == 1:\n"
+            "            self.shm_ar_tbo = HostMappedShmAllReduce(\n"
+            "                capacity_elements=tbo_cap_tokens * 5120,\n"
+            "                enable_pxb_p2p=True,\n"
+            "                pxb_max_elements=tbo_cap_tokens * 5120,\n"
+            "            )\n",
+            encoding="utf-8",
+        )
+
+    _run_source_mutant(
+        "M11_src_runner_dual_pxb_pp1_budget_overflow",
+        "STATIC_RUNNER_PXB_TOTAL_BUDGET",
+        "VIOLATION",
+        _inject_dual_pxb_pp1_overflow,
     )
 
     resolved_cands = candidates_dir

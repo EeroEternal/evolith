@@ -319,6 +319,29 @@ def zstep_evolve_cmd(
         "--gpu-smoke",
         help="Run fast container GPU smoke tests before full 475 GiB benchmark sweeps.",
     ),
+    hw_profile: str | None = typer.Option(
+        None,
+        "--hw-profile",
+        envvar="EVOLITH_ZSTEP_HW_PROFILE",
+        help="Hardware profile ('auto', 'sm120-8x6000d-pp2tp4', 'sm120-8x6000d-tp8', 'sm120-8x5090-tp8', 'sm90-8xh100-tp8').",
+    ),
+    bench_profile: str | None = typer.Option(
+        None,
+        "--bench-profile",
+        envvar="EVOLITH_ZSTEP_BENCH_PROFILE",
+        help="Benchmark tier profile ('custom', 'short-throughput', 'longctx-agent').",
+    ),
+    sudo: bool = typer.Option(
+        False,
+        "--sudo",
+        envvar="EVOLITH_ZSTEP_SUDO",
+        help="Allow remote sudo fallback for Docker when SSH user is not in the docker group.",
+    ),
+    scout_probe: bool = typer.Option(
+        False,
+        "--scout-probe",
+        help="Enable endogenous Stage-1 Scout GPU microbenchmark probe before final patch synthesis.",
+    ),
 ) -> None:
     """Run isolated zstep source evolution; no deployment or upstream commit occurs."""
     from evolith.zstep.archive import ZStepArchive
@@ -340,6 +363,10 @@ def zstep_evolve_cmd(
             "proposer_api_base": proposer_api_base,
             "proposer_model": proposer_model,
             "enable_gpu_smoke": gpu_smoke,
+            "hardware_profile": hw_profile,
+            "benchmark_profile": bench_profile,
+            "remote_sudo": sudo,
+            "enable_scout_probe": scout_probe,
         },
     )
     with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
@@ -399,6 +426,24 @@ def zstep_submit_cmd(
         "--gpu-smoke",
         help="Run fast container GPU smoke tests before full 475 GiB benchmark sweeps.",
     ),
+    hw_profile: str | None = typer.Option(
+        None,
+        "--hw-profile",
+        envvar="EVOLITH_ZSTEP_HW_PROFILE",
+        help="Hardware profile ('auto', 'sm120-8x6000d-pp2tp4', 'sm120-8x6000d-tp8', 'sm120-8x5090-tp8', 'sm90-8xh100-tp8').",
+    ),
+    bench_profile: str | None = typer.Option(
+        None,
+        "--bench-profile",
+        envvar="EVOLITH_ZSTEP_BENCH_PROFILE",
+        help="Benchmark tier profile ('custom', 'short-throughput', 'longctx-agent').",
+    ),
+    sudo: bool = typer.Option(
+        False,
+        "--sudo",
+        envvar="EVOLITH_ZSTEP_SUDO",
+        help="Allow remote sudo fallback for Docker when SSH user is not in the docker group.",
+    ),
 ) -> None:
     """Submit a unified diff directly through Evolith's full Coordinator gates, screen, and 3-round verify."""
     from evolith.zstep.archive import ZStepArchive
@@ -418,6 +463,9 @@ def zstep_submit_cmd(
             "local_timeout_sec": local_timeout,
             "campaign": campaign,
             "enable_gpu_smoke": gpu_smoke,
+            "hardware_profile": hw_profile,
+            "benchmark_profile": bench_profile,
+            "remote_sudo": sudo,
         },
     )
     proposer = PatchProposer(
@@ -784,7 +832,7 @@ def zstep_formal_verify_cmd(
             scope_str = "symbolic"
         elif cl.method == "ast_exact_eval":
             scope_str = "exact AST"
-        elif cl.method == "seeded_diff_3000":
+        elif cl.method in ("seeded_diff_3000", "compiled_cpp_diff_3000"):
             scope_str = f"{cl.explored_states} trials"
         else:
             scope_str = f"{cl.explored_states} states"
@@ -798,6 +846,12 @@ def zstep_formal_verify_cmd(
             markup_escape(notes),
         )
     console.print(table)
+    if report.contract_sha256:
+        console.print(
+            f"[dim]Contract SHA256: {report.contract_sha256[:16]} "
+            f"| Tree SHA256: {report.target_tree_sha256[:16]} "
+            f"| {markup_escape(report.z3_version or 'z3=off')}[/dim]"
+        )
     if report.weakest_link:
         console.print(f"[dim]Weakest link: {markup_escape(report.weakest_link)}[/dim]")
 
@@ -855,6 +909,254 @@ def zstep_formal_verify_cmd(
 
         if not cal.passed:
             raise typer.Exit(code=1)
+
+
+@app.command("zstep-init-hw")
+def zstep_init_hw_cmd(
+    host: str | None = typer.Option(None, "--host", envvar="EVOLITH_ZSTEP_HOST"),
+    user: str | None = typer.Option(None, "--user", envvar="EVOLITH_ZSTEP_USER"),
+    preset: str | None = typer.Option(
+        None,
+        "--preset",
+        help="Optional built-in hardware profile preset instead of live SSH probe.",
+    ),
+    prefer_pp2: bool = typer.Option(
+        True,
+        "--prefer-pp2/--prefer-tp8",
+        help="Prefer intra-socket PP=2 x TP=4 on dual-NUMA 8-GPU PCIe hosts.",
+    ),
+) -> None:
+    """Probe remote GPU topology (or select a preset) and write hardware-profile.json."""
+    from evolith.zstep.hardware import resolve_hardware_profile
+    from evolith.zstep.remote import ZStepRemoteRunner
+
+    out_path = Path.cwd() / ".evolith/zstep-rsi/hardware-profile.json"
+    if preset:
+        profile = resolve_hardware_profile(preset)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
+    else:
+        task = _build_zstep_task(
+            source="~/github/zstep",
+            host=host,
+            user=user,
+            model_dir=None,
+            rustup_root=None,
+            baseline_sha=None,
+            propose_only=False,
+            extra_fields={},
+        )
+        profile = ZStepRemoteRunner(task).probe_hardware(
+            prefer_pp2_on_dual_socket_pcie=prefer_pp2
+        )
+    console.print(
+        Panel(
+            markup_escape(profile.model_dump_json(indent=2)),
+            title=f"HardwareProfile Ready: {markup_escape(profile.profile_id)}",
+            border_style="green",
+        )
+    )
+
+
+@app.command("zstep-trace-check")
+def zstep_trace_check_cmd(
+    parity: str = typer.Option(..., "--parity", "-p", help="Path to runtime parity JSON."),
+    metrics: str | None = typer.Option(None, "--metrics", "-m", help="Optional benchmark metrics JSON."),
+    allow_unexposed_schedule: bool = typer.Option(
+        False, "--allow-unexposed-schedule", help="Skip chunked_schedule exposure requirement."
+    ),
+) -> None:
+    """Run vstack Layer-3 runtime trace conformance check on GPU parity & benchmark JSONs."""
+    from evolith.zstep.trace_conformance import (
+        TraceConformanceError,
+        verify_trace_conformance,
+    )
+
+    p_path = Path(parity).expanduser().resolve()
+    m_path = Path(metrics).expanduser().resolve() if metrics else None
+    try:
+        rep = verify_trace_conformance(
+            p_path,
+            m_path,
+            require_schedule_exposure=not allow_unexposed_schedule,
+            raise_on_failure=True,
+        )
+    except TraceConformanceError as exc:
+        console.print(f"[bold red]TRACE CONFORMANCE FAILED[/bold red]: {markup_escape(str(exc))}")
+        raise typer.Exit(code=1) from None
+
+    table = Table(title=f"vstack Runtime Trace Conformance [{rep.gate_verdict}]", show_lines=True)
+    table.add_column("Clause ID", style="cyan", no_wrap=True)
+    table.add_column("Pillar", style="magenta", no_wrap=True)
+    table.add_column("Verdict", justify="center", no_wrap=True)
+    table.add_column("Detail")
+    for cl in rep.clauses:
+        table.add_row(
+            cl.clause_id,
+            cl.pillar,
+            f"[bold green]{cl.verdict}[/bold green]",
+            markup_escape(cl.detail or "-"),
+        )
+    console.print(table)
+
+
+@app.command("zstep-compose")
+def zstep_compose_cmd(
+    min_gain: float = typer.Option(0.015, "--min-gain", help="Minimum near-miss Verify geomean gain."),
+    max_gain: float = typer.Option(0.0299, "--max-gain", help="Maximum near-miss Verify geomean gain."),
+    output_patch: str | None = typer.Option(
+        None, "--output-patch", "-o", help="Optional output path to write the top composed diff."
+    ),
+) -> None:
+    """Discover orthogonal near-miss stepping-stone pairs & failure clusters in archive.sqlite3."""
+    from evolith.zstep.archive import ZStepArchive
+    from evolith.zstep.composer import (
+        cluster_remote_failures,
+        compose_patch_pair,
+        find_orthogonal_stepping_stone_pairs,
+    )
+
+    db_path = Path.cwd() / ".evolith/zstep-rsi/archive.sqlite3"
+    if not db_path.is_file():
+        console.print("No archive.sqlite3 found.")
+        return
+
+    upstream_sha = _detect_local_upstream_sha()
+    with ZStepArchive(db_path) as archive:
+        parent = archive.current_parent(upstream_sha=upstream_sha)
+        pairs = find_orthogonal_stepping_stone_pairs(
+            archive,
+            upstream_sha=upstream_sha,
+            parent_id=parent,
+            min_gain=min_gain,
+            max_gain=max_gain,
+        )
+        clusters = cluster_remote_failures(archive)
+        if output_patch and pairs:
+            top = pairs[0]
+            left_p = bytes(archive.get_candidate(top.left_id)["patch"] or b"")
+            right_p = bytes(archive.get_candidate(top.right_id)["patch"] or b"")
+            base_tree = Path.cwd() / "targets/zstep/upstream"
+            combined = compose_patch_pair(base_tree, left_p, right_p)
+            out_file = Path(output_patch).expanduser().resolve()
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_bytes(combined)
+            console.print(f"[green]Wrote composed patch ({len(combined)} bytes): {markup_escape(str(out_file))}[/green]")
+
+    table = Table(title="Orthogonal Stepping-Stone Composition Queue", show_lines=True)
+    table.add_column("Left Candidate", style="cyan", no_wrap=True)
+    table.add_column("Right Candidate", style="cyan", no_wrap=True)
+    table.add_column("Est. Combined Gain", justify="right", style="green")
+    table.add_column("LOC", justify="right")
+    table.add_column("Disjoint Files")
+    for p in pairs:
+        table.add_row(
+            f"{p.left_id} ({p.left_gain:+.2%})",
+            f"{p.right_id} ({p.right_gain:+.2%})",
+            f"{p.additive_gain_estimate:+.2%}",
+            str(p.combined_loc),
+            markup_escape(", ".join((*p.left_files, *p.right_files))),
+        )
+    console.print(table)
+
+    if clusters:
+        ctable = Table(title="Evening Gate Failure Clusters", show_lines=True)
+        ctable.add_column("Category", style="yellow")
+        ctable.add_column("Count", justify="right")
+        ctable.add_column("Sample Root Cause")
+        for c in clusters:
+            ctable.add_row(c.category, str(c.count), markup_escape(c.sample_reason[:110]))
+        console.print(ctable)
+
+
+@app.command("workbench-formal-check")
+def workbench_formal_check_cmd() -> None:
+    """Run explicit-state protocol models, directed bug mutants, witnesses, and trace replay."""
+    from evolith.core.formal_replay import run_protocol_verification_suite
+
+    report = run_protocol_verification_suite()
+    console.print(report.model_dump_json(indent=2))
+    if not report.passed:
+        raise typer.Exit(code=1)
+
+
+@app.command("workbench-dry-run")
+def workbench_dry_run_cmd(
+    patch_file: Path = typer.Option(..., "--patch", exists=True, readable=True),
+) -> None:
+    """Compute declarative TargetSurface ActionRung & blast radius for a unified diff."""
+    from evolith.core.surface import analyze_changeset_blast_radius, default_zstep_surface
+
+    patch_text = patch_file.read_text(encoding="utf-8", errors="replace")
+    files = tuple(
+        sorted(
+            {
+                line[6:].strip()
+                for line in patch_text.splitlines()
+                if line.startswith("+++ b/") and line[6:].strip()
+            }
+        )
+    )
+    plan = analyze_changeset_blast_radius(
+        default_zstep_surface(),
+        changed_files=files,
+        patch_text=patch_text,
+    )
+    console.print(plan.model_dump_json(indent=2))
+
+
+@app.command("workbench-daemon")
+def workbench_daemon_cmd(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(18765, "--port"),
+    runner_kind: str = typer.Option("deepseek_v41", "--runner"),
+    world_size: int = typer.Option(8, "--world-size"),
+    worker_root: str = typer.Option("", "--worker-root"),
+    model_dir: str = typer.Option("", "--model-dir"),
+    num_kv_pages: int = typer.Option(2560, "--num-kv-pages"),
+    buckets: str = typer.Option("1,16,32", "--buckets"),
+    envelope_db: str = typer.Option("", "--envelope-db"),
+) -> None:
+    """Start the resident multi-GPU `StateKeeper` workbench daemon (`evolith.workbench`)."""
+    from evolith.workbench.gpu_daemon import WorkbenchDaemonConfig, WorkbenchGpuDaemon
+
+    parsed_buckets = tuple(int(x.strip()) for x in buckets.split(",") if x.strip())
+    cfg = WorkbenchDaemonConfig(
+        host=host,
+        port=port,
+        runner_kind=runner_kind,
+        world_size=world_size,
+        worker_root=worker_root,
+        model_dir=model_dir,
+        num_kv_pages=num_kv_pages,
+        active_decode_buckets=parsed_buckets,
+        envelope_db_path=envelope_db,
+    )
+    daemon = WorkbenchGpuDaemon(cfg)
+    daemon.serve_forever()
+
+
+@app.command("workbench-rpc")
+def workbench_rpc_cmd(
+    method: str = typer.Argument(
+        ...,
+        help="RPC method: ping|status|inner_screen|profile_step|hot_apply|sleep|wake|reattach_shm|shutdown",
+    ),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(18765, "--port"),
+    params_json: str = typer.Option("{}", "--params"),
+) -> None:
+    """Send a JSON-RPC command to a running `evolith workbench-daemon`."""
+    import json
+
+    from evolith.workbench.gpu_daemon import WorkbenchRpcClient
+
+    params = json.loads(params_json)
+    client = WorkbenchRpcClient(host=host, port=port)
+    resp = client.call(method, **params)
+    console.print(json.dumps(resp, indent=2))
+    if not resp.get("ok", False):
+        raise typer.Exit(code=1)
 
 
 register(app)

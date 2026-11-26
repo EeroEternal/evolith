@@ -19,3 +19,11 @@
    - **流水线双缓冲 + 内联 `dspark` 上下文存储**：Stage 0 `in_flight` 深度 `3` + Stage 1 2 槽静态接收缓冲预发 `irecv` 隐藏每微批 `7.8 ms` 跨 Socket P2P；Stage 1 微批循环内直接对纯 prefill 步执行 `store_prefill_microbatch_ctx()`（复用 GPU `positions_full` / `swa_slot_map_full`），将 `578–900 ms` 的 `spec_finish` 隐藏在 Stage 1 `~15 ms/mb` 等流空窗内并省掉 `4.02 GB` `aux_out` 与 `1.34 GB` `hidden_out` 分配。
    - **实测里程碑（`main@a773c4d`，`8 × RTX 6000D`，`dspark k=3`，`36K` parity PASS）**：`PP=2 × TP=4`（`chunk=233472, K=56, SWA=2048, PDL=1`）达成 **`32K_P20_Cold = 456.15 tok/s`**（`max TTFT 29.68s`, `wall 43.84s`, 较 `TP=8` 提速 **`+11.4%`**）与 **`100K_P10_Cold = 177.73 tok/s`**（`max TTFT 46.28s`, 较 `TP=8` 提速 **`+20.8%`**）；而纯高命中短 prefill 场景（`32K_P20_Cache90 1,429.21 tok/s` / `100K_P10_Cache90 688.17 tok/s`）仍由 `PP=1 / TP=8` 领跑（因 `PP=2` 单步 decode Stage 0/1 串行，权重 HBM 读取带宽为 `TP=8` 一半）。
    - **负向试验（严禁重复踩坑）**：① `PP=2` Stage 0 内嵌 Prefill TBO（`4K→2×2K` 降效 MoE、`8K/mb K=16` 气泡翻倍）均慢于纯 `PP2 (4K/mb)`；② `ZSTEP_ENABLE_SM120_DSA_DECODE=1` 会将 `decode_graph_max_seq_len` 截断在 `16K`，长上下文必须保持 `0`；③ 单步内拆 2-microbatch verify（`B=20→10+10`）需 `T(B/2) < 0.667·T(B)` 才能回本，在 memory-BW bound 的 `B=10..20` MoE decode 下不划算，若要进一步加速 `PP=2` decode 需做跨步（inter-step）双流 `1F1B` 流水线。
+
+5. **跨步双微批 `1F1B` 流水线 Decode 打破 `PP=2` Decode 瓶颈（PR #78 实证，单套配置 4/4 通杀）**：
+   - 无需改动 `zs-shm` 协议，直接复用既有 2 槽双缓冲（`step_id & 1`）与 `online.published_ahead`：纯 decode/verify 步且 `active.len() >= 4` 时将活跃请求划分为不相交的 `Cohort A (..mid)` 与 `Cohort B (mid..)` 交替预发（置位 `STEP_FLAG_NEXT_PREPUBLISHED` 但不置位 `STEP_FLAG_DEVICE_TOKENS`）；Stage 0 异步延后 `finish(t)`（配合双槽 `_pp_p2p_hidden[2]` / `_pp_p2p_pre_mix[2]`，仅增 `3.3 MiB`，零额外 CUDAGraph 显存），Stage 1 立即 `finish(t)` 回传 `dspark` 草稿给 Rust。
+   - **单套 `PP=2 × TP=4 + ZSTEP_PP_DECODE_PIPELINE=1`（`chunk=228K, K=56, SWA=2048, PDL=1, L1 GPU`）端到端实测（`PARITY_36K: PASS`，峰值显存 `70,915 MiB`）**：
+     - **`32K_P20_Cold`**: **`479.82 tok/s`**（`TTFT 19.98s`, `TPOT 20.18ms`, `wall 41.68s`，较串行 `PP=2` 再降 `-2.16s` / `+5.2%`，超目标 `+5.6%`）；
+     - **`100K_P10_Cold`**: **`180.82 tok/s`**（`TTFT 28.99s`, `TPOT 25.36ms`, `wall 55.30s`，超目标 `+27.1%`）；
+     - **`32K_P20_Cache90`**: **`1,394.47 tok/s`**（`TPOT 10.04ms / med 9.89ms`，较串行 `PP=2` 暴涨 `+20.0%`，TPOT 甚至优于 `TP=8` 的 `10.29ms` 与 NVFP4 的 `10.88ms`）；
+     - **`100K_P10_Cache90`**: **`691.22 tok/s`**（`TPOT 8.63ms / med 8.32ms`，首次全面压破 `8.99ms` 目标 `-4.0%`！）。

@@ -9,14 +9,17 @@
 ```text
 memory/
 ├── README.md                        # 本协议说明
-├── playbook.md                      # 推理优化全流程实战十律（40 轮 GPU 实测提炼，Core Laws 自动注入 Prompt）
+├── milestone-sm120-dsv41.md         # 第一阶段 (8x RTX 6000D SM120 × DeepSeek-V4.1) 正式结项报告与多 GPU 解耦清单
+├── playbook.md                      # 推理优化全流程实战十律（40+ 轮 GPU 实测提炼，Core Laws 自动注入 Prompt）
 ├── directives.md                    # [人 -> Agent 控制面] 当前高优方向、待验证假设与禁飞区
-├── roadmap-rsi-v3.md                # 融合 EvolvingInfra + TKCC + Agent V 的本地总路线图与 Checklist
+├── roadmap-rsi-v3.md                # 融合 EvolvingInfra + TKCC + Agent V + veriserve 的本地总路线图
 ├── stepping-stones.md               # 正收益惜败踏脚石池（如 +2.8%~+2.9%）与正交合体候选队列
 └── facts/                           # 跨会话、跨 baseline rebase 持久化的子系统实测事实卡
     ├── sm120-collectives.md         # 8x RTX 6000D CX8 PXB / SHM v5 / NCCL CE3 通信铁律
     ├── sm120-moe-b12x.md            # b12x MXFP4/W4A8 N64 对齐、真实专家路由偏斜、C-API 发射铁律
-    └── dsv41-mla-autotune-sched.md  # FlashInfer 缓存陷阱、b12x MLA、HBM 余量与混合步预算铁律
+    ├── dsv41-mla-autotune-sched.md  # FlashInfer 缓存陷阱、b12x MLA、HBM 余量与混合步预算铁律
+    ├── dsv41-tbo-dspark.md          # 8192 Prefill TBO 副流边界、Builder 隔离与 dspark 步内耗时铁律
+    └── dsv41-pp2-tp4.md             # 双路 PP=2×TP=4 唯一合法切分、混合 Engram 与跨步 1F1B 流水线 4/4 通杀实证
 ```
 
 ## 安全与不可变门控原则（遵循 `AGENTS.md`）

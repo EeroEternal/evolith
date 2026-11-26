@@ -93,6 +93,19 @@ _RUST_UNCHECKED_RE = re.compile(
 _SPOOF_RECOMP_RE = re.compile(
     r"triton_recompilations\s*[:=]\s*(?:Some\(\s*0\s*\)|0\b)"
 )
+_PROBE_RESIDUE_RE = re.compile(
+    r"(?:#\s*PROBE\b|//\s*PROBE\b|\bEVOLITH_TEMP_PROBE\b)"
+)
+_UNDECLARED_ENV_READ_RE = re.compile(
+    r"\b(?:os\.getenv\s*\(|os\.environ\s*(?:\.get\s*\(|\[)|std::env::var(?:_os)?\s*\()"
+)
+_ALLOWED_ENV_CONFIG_FILES: frozenset[str] = frozenset(
+    {
+        "worker/zstep_worker/env_config.py",
+        "crates/zs-server/src/main.rs",
+        "crates/zs-server/src/config.rs",
+    }
+)
 _DISABLE_GRAPH_SABOTAGE_RE = re.compile(
     r"\b(?:"
     r"use_cuda_graph(?:\s*:\s*[^=\n]+)?\s*=\s*False\b|"
@@ -187,8 +200,31 @@ def scan_patch_boundaries(patch_stats: PatchStats) -> list[RedTeamFinding]:
     for file_path, added_lines in sorted(added_by_file.items()):
         if not added_lines or file_path.startswith("worker/tests/"):
             continue
+        raw_joined = "\n".join(added_lines)
+        if _PROBE_RESIDUE_RE.search(raw_joined):
+            findings.append(
+                RedTeamFinding(
+                    category="anti_cheat",
+                    severity="blocking",
+                    file_path=file_path,
+                    message="Temporary diagnostic `# PROBE` / `EVOLITH_TEMP_PROBE` marker left in candidate patch",
+                )
+            )
         is_py = file_path.endswith(".py")
         joined = _strip_code_comments(added_lines, is_python=is_py)
+
+        if file_path not in _ALLOWED_ENV_CONFIG_FILES and _UNDECLARED_ENV_READ_RE.search(joined):
+            findings.append(
+                RedTeamFinding(
+                    category="anti_cheat",
+                    severity="blocking",
+                    file_path=file_path,
+                    message=(
+                        "Undeclared raw `os.getenv`/`os.environ`/`std::env::var` read outside "
+                        "declared config modules (breaks deterministic SystemIdentity & baseline cache)"
+                    ),
+                )
+            )
 
         # Anti-cheat: spoofing Triton recompilation counters or skipping greedy gates
         if _SPOOF_RECOMP_RE.search(joined) and (

@@ -32,6 +32,7 @@ class ZStepRemoteRunner:
         self.task = task
         self.executor = executor or self._execute
         self.destination = f"{task.remote_user}@{task.remote_host}"
+        self._use_sudo_docker: bool = False
 
     @staticmethod
     def _execute(
@@ -148,6 +149,51 @@ class ZStepRemoteRunner:
             raise RemoteInfraError(f"{action} exited {result.returncode}: {detail}")
         return result.stdout
 
+    def _expected_gpu_ids(self) -> list[str]:
+        ids = [tok.strip() for tok in self.task.gpu_devices.split(",") if tok.strip()]
+        return ids or ["0", "1", "2", "3", "4", "5", "6", "7"]
+
+    def _sudo_shell_prefix(self) -> str:
+        if not self._use_sudo_docker:
+            return ""
+        pw = os.environ.get("SSHPASS", "")
+        if pw:
+            return f"printf '%s\\n' {shlex.quote(pw)} | sudo -S -p '' "
+        return "sudo -n "
+
+    def _rustup_env_snippet(self) -> str:
+        rustup_prefix = shlex.quote(self.task.remote_rustup_root.strip())
+        return f"""CUSTOM_RUSTUP_ROOT={rustup_prefix}
+if [ -z "$CUSTOM_RUSTUP_ROOT" ] && [ -n "${{EVOLITH_ZSTEP_RUSTUP_ROOT:-}}" ]; then
+  CUSTOM_RUSTUP_ROOT="$EVOLITH_ZSTEP_RUSTUP_ROOT"
+elif [ -z "$CUSTOM_RUSTUP_ROOT" ] && [ -d "$HOME/evolith-rsi/rustup/cargo/bin" ]; then
+  CUSTOM_RUSTUP_ROOT="$HOME/evolith-rsi/rustup"
+elif [ -z "$CUSTOM_RUSTUP_ROOT" ] && [ -d "/data02/zstep-work/rustup/cargo/bin" ]; then
+  CUSTOM_RUSTUP_ROOT="/data02/zstep-work/rustup"
+fi
+if [ -n "$CUSTOM_RUSTUP_ROOT" ] && [ -d "$CUSTOM_RUSTUP_ROOT/cargo/bin" ]; then
+  export CARGO_HOME="${{CARGO_HOME:-$CUSTOM_RUSTUP_ROOT/cargo}}"
+  export RUSTUP_HOME="${{RUSTUP_HOME:-$CUSTOM_RUSTUP_ROOT/rustup}}"
+  export PATH="$CUSTOM_RUSTUP_ROOT/cargo/bin:$HOME/.cargo/bin:$PATH"
+else
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi"""
+
+    def _overlay_env_snippet(self, overlay_dir: str) -> str:
+        hw = self.task.resolved_hardware_profile()
+        if not hw.overlay_script:
+            return "DOCKER_OVERLAY_ARGS=()"
+        ov_script = shlex.quote(f"./{hw.overlay_script.lstrip('./')}")
+        q_ov_dir = shlex.quote(overlay_dir)
+        return (
+            f"if [ -x {ov_script} ]; then\n"
+            f"  {ov_script} {q_ov_dir}\n"
+            f"  DOCKER_OVERLAY_ARGS=($({ov_script} --print-docker-args {q_ov_dir}))\n"
+            f"else\n"
+            f"  DOCKER_OVERLAY_ARGS=()\n"
+            f"fi"
+        )
+
     def _check_gpus(self) -> None:
         result = self._ssh(
             [
@@ -160,40 +206,111 @@ class ZStepRemoteRunner:
             detail = (result.stderr + result.stdout).strip()
             raise RemotePreflightError(f"Unable to inspect remote GPUs: {detail}")
         rows = [line for line in result.stdout.splitlines() if line.strip()]
+        wanted = self._expected_gpu_ids()
+        wanted_set = set(wanted)
+        seen_wanted = 0
         for row in rows:
             index, memory = [part.strip() for part in row.split(",", 1)]
+            if index not in wanted_set:
+                continue
+            seen_wanted += 1
             used_mib = int(memory.split()[0])
             if used_mib > self.task.max_gpu_idle_mib:
                 raise RemotePreflightError(f"GPU {index} is occupied: {memory}")
-        if len(rows) != 8:
-            raise RemotePreflightError(f"Expected 8 GPUs, found {len(rows)}")
+        if len(rows) < len(wanted) or seen_wanted != len(wanted):
+            raise RemotePreflightError(f"Expected {len(wanted)} GPUs, found {len(rows)}")
+
+    def probe_hardware(self, *, prefer_pp2_on_dual_socket_pcie: bool = True):
+        """Auto-probe remote GPU architecture, VRAM, and NUMA/PXB/NVLink topology."""
+        from evolith.zstep.hardware import infer_hardware_profile_from_probe
+
+        smi = self._ssh(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.total,compute_cap",
+                "--format=csv,noheader",
+            ],
+            timeout=30,
+        )
+        if smi.returncode:
+            raise RemotePreflightError(
+                f"Failed to query GPU capabilities on {self.destination}: {(smi.stderr + smi.stdout).strip()}"
+            )
+        topo = self._ssh(["nvidia-smi", "topo", "-m"], timeout=30)
+        topo_txt = topo.stdout if topo.returncode == 0 else ""
+        profile = infer_hardware_profile_from_probe(
+            smi.stdout,
+            topo_txt,
+            prefer_pp2_on_dual_socket_pcie=prefer_pp2_on_dual_socket_pcie,
+        )
+        out_path = self.task.project_root / ".evolith/zstep-rsi/hardware-profile.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
+        return profile
+
+    def _check_docker(self) -> None:
+        docker = self._ssh(["docker", "info", "--format", "{{.ServerVersion}}"])
+        if docker.returncode:
+            if self.task.remote_sudo:
+                pw = os.environ.get("SSHPASS", "")
+                sudo_cmd = (
+                    f"printf '%s\\n' {shlex.quote(pw)} | sudo -S -p '' docker info --format '{{{{.ServerVersion}}}}'"
+                    if pw
+                    else "sudo -n docker info --format '{{.ServerVersion}}'"
+                )
+                sudo_res = self._ssh(["bash", "-lc", sudo_cmd])
+                if sudo_res.returncode == 0:
+                    self._use_sudo_docker = True
+                else:
+                    detail = (sudo_res.stderr + sudo_res.stdout).strip()
+                    raise RemotePreflightError(
+                        f"Docker sudo access failed on {self.destination}: {detail}"
+                    )
+            else:
+                detail = (docker.stderr + docker.stdout).strip()
+                raise RemotePreflightError(
+                    f"Docker access is required for {self.destination}; {detail}. "
+                    "Grant the user Docker access; Evolith will not use sudo."
+                )
 
     def preflight(self) -> None:
         self._check_gpus()
-        docker = self._ssh(["docker", "info", "--format", "{{.ServerVersion}}"])
-        if docker.returncode:
-            detail = (docker.stderr + docker.stdout).strip()
-            raise RemotePreflightError(
-                f"Docker access is required for {self.destination}; {detail}. "
-                "Grant the user Docker access; Evolith will not use sudo."
-            )
-        model_check = self._ssh(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--entrypoint",
-                "python3",
-                "-v",
-                f"{self.task.model_dir}:{self.task.model_dir}:ro",
-                self.task.image,
-                "-c",
-                "import json, pathlib, sys; "
-                "print(json.loads((pathlib.Path(sys.argv[1]) / 'config.json').read_text())['model_type'])",
-                self.task.model_dir,
-            ]
+        self._check_docker()
+        docker_bin = ["sudo", "-n", "docker"] if (self._use_sudo_docker and not os.environ.get("SSHPASS")) else ["docker"]
+        py_expr = (
+            "import json, pathlib, sys; d = pathlib.Path(sys.argv[1]); "
+            "idx = d / 'model.safetensors.index.json'; "
+            "missing = ([f for f in set(json.loads(idx.read_text()).get('weight_map', {}).values()) if not (d / f).is_file()] if idx.is_file() else []); "
+            "sys.exit('missing shards: ' + str(sorted(missing)[:3])) if missing else print(json.loads((d / 'config.json').read_text())['model_type'])"
         )
-        if model_check.returncode or model_check.stdout.strip() != self.task.model_type:
+        if self._use_sudo_docker and os.environ.get("SSHPASS"):
+            pw = os.environ["SSHPASS"]
+            model_check = self._ssh(
+                [
+                    "bash",
+                    "-lc",
+                    f"printf '%s\\n' {shlex.quote(pw)} | sudo -S -p '' docker run --rm --entrypoint python3 "
+                    f"-v {shlex.quote(f'{self.task.model_dir}:{self.task.model_dir}:ro')} "
+                    f"{shlex.quote(self.task.image)} -c {shlex.quote(py_expr)} {shlex.quote(self.task.model_dir)}",
+                ]
+            )
+        else:
+            model_check = self._ssh(
+                [
+                    *docker_bin,
+                    "run",
+                    "--rm",
+                    "--entrypoint",
+                    "python3",
+                    "-v",
+                    f"{self.task.model_dir}:{self.task.model_dir}:ro",
+                    self.task.image,
+                    "-c",
+                    py_expr,
+                    self.task.model_dir,
+                ]
+            )
+        if model_check.returncode or model_check.stdout.strip().splitlines()[-1:] != [self.task.model_type]:
             raise RemotePreflightError(
                 f"Model must be {self.task.model_type} at {self.task.model_dir}"
             )
@@ -218,6 +335,7 @@ class ZStepRemoteRunner:
         repeats: int,
         parity_path: str | None,
     ) -> str:
+        hw = self.task.resolved_hardware_profile()
         metrics_name = PurePosixPath(output_path).name
         parity_name = PurePosixPath(parity_path).name if parity_path else None
         container_name = self._container_name(source_dir, output_path)
@@ -225,7 +343,7 @@ class ZStepRemoteRunner:
         quoted_model_dir = shlex.quote(self.task.model_dir)
         quoted_model_mount = shlex.quote(f"{self.task.model_dir}:{self.task.model_dir}:ro")
         common = (
-            "./target/release/zstep --world-size 8 "
+            f"./target/release/zstep --world-size {hw.world_size} "
             "--python /usr/bin/python3 --worker-root ./worker "
             f"--model-dir {quoted_model_dir} --allreduce-blocks 8 "
             "--num-kv-pages 2560 --max-step-tokens 4096 --max-decoder-rows 4096 "
@@ -251,23 +369,20 @@ class ZStepRemoteRunner:
             + greedy
             + benchmark
         )
-        rustup_prefix = shlex.quote(self.task.remote_rustup_root.strip())
         gpus_spec = self._docker_gpus_spec()
+        rustup_snip = self._rustup_env_snippet()
+        overlay_snip = self._overlay_env_snippet(overlay_dir)
+        sudo_pfx = self._sudo_shell_prefix()
+        pp_env = (
+            f"-e ZSTEP_PIPELINE_PARALLEL_SIZE={hw.pp_size} -e ZSTEP_DECODE_DEVICE_TOKENS=0 "
+            f"-e ZSTEP_PP_PREFILL_MICROBATCHES=1 "
+            f"-e ZSTEP_PP_DECODE_PIPELINE={'1' if hw.decode_pipeline_1f1b else '0'} "
+            if hw.pp_size > 1
+            else ""
+        )
         return f"""set -euo pipefail
 trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
-CUSTOM_RUSTUP_ROOT={rustup_prefix}
-if [ -z "$CUSTOM_RUSTUP_ROOT" ] && [ -n "${{EVOLITH_ZSTEP_RUSTUP_ROOT:-}}" ]; then
-  CUSTOM_RUSTUP_ROOT="$EVOLITH_ZSTEP_RUSTUP_ROOT"
-elif [ -z "$CUSTOM_RUSTUP_ROOT" ] && [ -d "$HOME/evolith-rsi/rustup/cargo/bin" ]; then
-  CUSTOM_RUSTUP_ROOT="$HOME/evolith-rsi/rustup"
-fi
-if [ -n "$CUSTOM_RUSTUP_ROOT" ] && [ -d "$CUSTOM_RUSTUP_ROOT/cargo/bin" ]; then
-  export CARGO_HOME="${{CARGO_HOME:-$CUSTOM_RUSTUP_ROOT/cargo}}"
-  export RUSTUP_HOME="${{RUSTUP_HOME:-$CUSTOM_RUSTUP_ROOT/rustup}}"
-  export PATH="$CUSTOM_RUSTUP_ROOT/cargo/bin:$HOME/.cargo/bin:$PATH"
-else
-  export PATH="$HOME/.cargo/bin:$PATH"
-fi
+{rustup_snip}
 cd {shlex.quote(source_dir)}
 mkdir -p results
 if [ ! -x ./target/release/zstep ]; then
@@ -280,14 +395,13 @@ if [ ! -x ./target/release/zstep ]; then
     cargo build --release -p zs-server
   fi
 fi
-./scripts/prepare_sm120_overlay.sh {shlex.quote(overlay_dir)}
-DOCKER_OVERLAY_ARGS=($(./scripts/prepare_sm120_overlay.sh --print-docker-args {shlex.quote(overlay_dir)}))
-docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
+{overlay_snip}
+{sudo_pfx}docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
   -v "$PWD:/workspace" -v {quoted_model_mount} -w /workspace \\
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \\
   -e OMP_NUM_THREADS=1 -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
   -e VLLM_HOST_IP=127.0.0.1 -e NCCL_SOCKET_IFNAME=lo -e GLOO_SOCKET_IFNAME=lo \\
-  "${{DOCKER_OVERLAY_ARGS[@]}}" {self.task.image} -lc {shlex.quote(inner_cmd)}
+  {pp_env}"${{DOCKER_OVERLAY_ARGS[@]}}" {self.task.image} -lc {shlex.quote(inner_cmd)}
 """
 
     def _remote_run(self, candidate_id: str, stage: str) -> str:
@@ -324,6 +438,8 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         container_name = self._container_name(source_dir, "gpu-probe")
         overlay_dir = f"/tmp/{container_name}-overlay"
         gpus_spec = self._docker_gpus_spec()
+        overlay_snip = self._overlay_env_snippet(overlay_dir)
+        sudo_pfx = self._sudo_shell_prefix()
         inner_cmd = (
             "set -euo pipefail\n"
             'trap \'rm -rf /dev/shm/zstep* >/dev/null 2>&1 || true; chown -R "${HOST_UID}:${HOST_GID}" /workspace >/dev/null 2>&1 || true\' EXIT\n'
@@ -334,9 +450,8 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         return f"""set -euo pipefail
 trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
 cd {shlex.quote(source_dir)}
-./scripts/prepare_sm120_overlay.sh {shlex.quote(overlay_dir)}
-DOCKER_OVERLAY_ARGS=($(./scripts/prepare_sm120_overlay.sh --print-docker-args {shlex.quote(overlay_dir)}))
-docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
+{overlay_snip}
+{sudo_pfx}docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
   -v "$PWD:/workspace" -w /workspace \\
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -e PYTHONDONTWRITEBYTECODE=1 \\
   -e OMP_NUM_THREADS=1 -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
@@ -352,7 +467,8 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         local_output: Path,
     ) -> Path:
         """Execute a fast isolated 8-GPU operator/collective microbenchmark probe without 475 GiB weights."""
-        self.preflight()
+        self._check_gpus()
+        self._check_docker()
         stage = self._remote_run(probe_id, "probe")
         lock = f"{stage}/.lock"
         self._require_success(self._ssh(["mkdir", "-p", stage]), "create probe stage")
@@ -384,8 +500,10 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         container_name = self._container_name(source_dir, "gpu-smoke")
         overlay_dir = f"/tmp/{container_name}-overlay"
         test_args = " ".join(shlex.quote(t) for t in tests)
-        rustup_prefix = shlex.quote(self.task.remote_rustup_root.strip())
         gpus_spec = self._docker_gpus_spec()
+        rustup_snip = self._rustup_env_snippet()
+        overlay_snip = self._overlay_env_snippet(overlay_dir)
+        sudo_pfx = self._sudo_shell_prefix()
         inner_cmd = (
             "set -euo pipefail\n"
             'trap \'rm -rf /dev/shm/zstep* >/dev/null 2>&1 || true; chown -R "${HOST_UID}:${HOST_GID}" /workspace >/dev/null 2>&1 || true\' EXIT\n'
@@ -394,19 +512,7 @@ docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --netw
         )
         return f"""set -euo pipefail
 trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
-CUSTOM_RUSTUP_ROOT={rustup_prefix}
-if [ -z "$CUSTOM_RUSTUP_ROOT" ] && [ -n "${{EVOLITH_ZSTEP_RUSTUP_ROOT:-}}" ]; then
-  CUSTOM_RUSTUP_ROOT="$EVOLITH_ZSTEP_RUSTUP_ROOT"
-elif [ -z "$CUSTOM_RUSTUP_ROOT" ] && [ -d "$HOME/evolith-rsi/rustup/cargo/bin" ]; then
-  CUSTOM_RUSTUP_ROOT="$HOME/evolith-rsi/rustup"
-fi
-if [ -n "$CUSTOM_RUSTUP_ROOT" ] && [ -d "$CUSTOM_RUSTUP_ROOT/cargo/bin" ]; then
-  export CARGO_HOME="${{CARGO_HOME:-$CUSTOM_RUSTUP_ROOT/cargo}}"
-  export RUSTUP_HOME="${{RUSTUP_HOME:-$CUSTOM_RUSTUP_ROOT/rustup}}"
-  export PATH="$CUSTOM_RUSTUP_ROOT/cargo/bin:$HOME/.cargo/bin:$PATH"
-else
-  export PATH="$HOME/.cargo/bin:$PATH"
-fi
+{rustup_snip}
 cd {shlex.quote(source_dir)}
 if [ -f Cargo.toml ]; then
   if [ -d "$HOME/evolith-rsi/cargo-vendor" ]; then
@@ -416,9 +522,8 @@ if [ -f Cargo.toml ]; then
     cargo test --release -p zs-wire -p zs-kv -p zs-shm -p zs-scheduler --lib
   fi
 fi
-./scripts/prepare_sm120_overlay.sh {shlex.quote(overlay_dir)}
-DOCKER_OVERLAY_ARGS=($(./scripts/prepare_sm120_overlay.sh --print-docker-args {shlex.quote(overlay_dir)}))
-docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
+{overlay_snip}
+{sudo_pfx}docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
   -v "$PWD:/workspace" -w /workspace \\
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -e PYTHONDONTWRITEBYTECODE=1 \\
   -e OMP_NUM_THREADS=1 -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
