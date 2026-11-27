@@ -89,3 +89,30 @@ To test whether Round 3's two sub-regime winners (`Track 1` `17 LOC` + `Track 3 
 | **`longctx-tp8` (`8K–32K`)** | `g0002-9e1e9726` (`Track 1` Mixed-Step 16-Aligned TBO) | **`+0.64%`** (`+1.23%` cumulative vs `f2c23b1`) | **`+0.58%`** | `ctx16k_c12`: **`+0.87%`** (TPOT `75.63 → 74.92 ms`), `ctx32k_c4`: **`+0.70%`** (`43.25 → 42.92 ms`), `ctx32k_c8`: **`+0.70%`** (`87.05 → 86.49 ms`), `ctx8k_c16`: **`+0.30%`** | **`CONFORMANT` (`TRITON_RECOMPILATIONS=0`) — LANDED in `zstep`** (with explicit `dspark_drafter` isolation). |
 | **`spec-dspark` (`DSpark5`)** | `g0002-748b7123` (v1 composed) & `g0001-c657e439` (v2 isolated `Track 3 v2`) | **`-0.47%`** (v1) / **`-1.05%`** (v2) | `-0.74%` / `-1.30%` | Public Screen `spec_c8` won **`+0.40%..+1.05%`**, but hidden `spec_c16` (`16:48:1024:256`) regressed **`-1.47%` / `-2.74%`** (`p99_itl +7.53% / +6.83%`) | **REJECTED & EXCLUDED per `AGENTS.md`**: proves public 2-tier Screen wins (`spec_c8 +1.05%`) can mask CPython `np.int32` scalar-boxing + `b=16` transpose overhead on hidden `c16` tiers. |
 
+---
+
+## 7. Round 5: `FlashInfer v0.7.6` Overlay, SM120 On-Chip SMEM `Split-K=32` mHC Fusion & `#8740` 32K Paged DSA (`zstep@651395c` Incumbent)
+
+Raw Round 5 telemetry & 3-regime 3-Round Cold `AB/BA` artifacts:
+- Stage 1 8-GPU Scout Probe (`FlashInfer v0.7.6` `d0cbb476`): [`docs/round5_stage1_fi076_scout_results.json`](round5_stage1_fi076_scout_results.json)
+- Stage 2 SM120 Dynamic-SMEM `Split-K=32` mHC Pre-Screen: [`docs/round5_stage2_mhc_smem_prescreen.json`](round5_stage2_mhc_smem_prescreen.json)
+- Stage 4 3-Suite 3-Round Interleaved Cold `AB/BA` Verification (`192.0 min` across 36 cold 8-GPU containers): [`docs/benchmarks/sm120_6000d_rsi_20261127/round5_multi_regime_abba_verify.json`](benchmarks/sm120_6000d_rsi_20261127/round5_multi_regime_abba_verify.json)
+
+### 7.1 Hardware Scout & Rejected Negative Trials (Preserved per `AGENTS.md`)
+1. **`FlashInfer v0.7.6` (`d0cbb476`) Deterministic Overlay + SHA256 Persistent Host JIT Cache**:
+   - Upgraded SM120 overlay (`2.28 MiB`, `SHA256 = e09f7c10503e...`) and added SHA256-keyed host JIT caching (`FI_CACHE_DIR`), reducing cold container `b12x` preparation from `197 s` to **`15 s`**.
+   - **Rejected Trial — `FlashInfer 0.7.6 pcie_ipc_ar` (`profile="pcieswitch-pairs"`)**: Measured `5,867 µs` at `M=4096` vs `zstep shm_pxb_bfp1` **`1,168 µs`** (`5.0×` slower due to `slow_hops=136` across dual-socket NUMA). Excluded; retained `shm_pxb_bfp1`.
+   - **Rejected Trial — `70 MiB` Persisting L2 Cache Window (`cudaStreamAttrAccessPolicyWindow`)**: Pinning `70 MiB` of `fn` matrices in SM120's `112 MiB` L2 cache regressed `M=4..16` sub-layer execution (`0.984×`) by shrinking non-persisting L2 ways needed by activations/KV. Excluded; added `persisting_l2_cache_max_size_bytes` introspection to `HardwareTopologySnapshot` with explicit empirical guard.
+2. **Landed Mechanisms (`297 LOC` Candidate)**:
+   - **SM120 On-Chip SMEM `Split-K=32` `mHC Prenorm + Sinkhorn` Single-Kernel Fusion (`sm120_mhc_prenorm_sinkhorn_smem_kernel<MAX_M>`)**: Stages `640` BF16s per split once in SMEM, streams `fn [24, 20480]` via `__ldcs`, matches `cvt.rna.tf32.f32` (`max_diff <= 2.47e-5`, bit-exact deterministic), and eliminates register spills via compile-time `#pragma unroll` (`1.44×–1.83×` faster standalone at `M=1..8`; saves `0.33–0.49 ms/step` in overlapped 8-GPU sub-layers).
+   - **`#8740` Two-Stage `candidate_blocks` 32K Paged DSA Indexer + `long_decode_graphs`**: Wires `candidate_out` (`layer 20`) and `candidate_blocks` (`layers 24, 28, 32, 36`) in `b12x_dsv41.py` plus `long_decode_graphs` (`buckets [1..32]` at `max_seq_len = max_model_len`, sharing `graph_pool`) in `deepseek_v41.py`, unlocking full 40-layer CUDA Graph paged sparse decode beyond `16K` up to `524K` tokens.
+
+### 7.2 3-Regime 3-Round Interleaved Cold `AB/BA` Verification & Piecewise Crossover Synthesis
+
+| Suite / Regime | Candidate ID | Screen Gain | 3-Round Cold `AB/BA` Geomean | `paired_lcb_2se` | Per-Tier 3-Round Measured Deltas (vs `zstep@651395c`) | Multi-Regime Gate & Piecewise Action |
+|---|---|---:|---:|---:|---|---|
+| **`longctx-tp8` (`8K–32K` Target)** | `g0001-01817706` | **`+10.31%`** (`ctx16k_c8 +21.26%`, `ctx8k_c2 +0.34%`) | **`+10.77%`** (`+12.13%` vs `f2c23b1`) | **`+10.55%`** | `ctx32k_c4`: **`+18.82%`** (TPOT `42.88 → 30.38 ms`, **`-29.2%`**)<br>`ctx16k_c12`: **`+17.37%`** (TPOT `75.10 → 65.82 ms`, **`-12.4%`**)<br>`ctx32k_c8`: **`+7.92%`** (TPOT `86.48 → 77.42 ms`, **`-10.5%`**)<br>`ctx8k_c16`: **`+0.04%`** (`49.22 → 49.16 ms`) | **`ACCEPTED` (`CONFORMANT`, `TRITON_RECOMPILATIONS=0`, 100% Greedy match)** |
+| **`spec-dspark` (`DSpark5` Guard)** | `g0001-882aa453` | **`+0.76%`** (`spec_c1 +0.74%`, `spec_c8 +0.78%`) | **`+0.56%`** (positive guard) | `-0.25%` | `spec_c4` (`n=24`): **`+1.68%`** (`6.66 → 6.54 ms`)<br>`spec_c2` (`n=12`): **`+0.42%`** (`5.69 → 5.67 ms`)<br>`spec_c16` (`n=96`): `-0.42%` | **Guard PASSED (`+0.56% > 0%`, 100% Greedy match)** |
+| **`short-throughput` (`512–1K` Guard)** | `g0001-07bb4dc0` | **`+0.15%`** (`in512_c1 +0.70%`, `in512_c32 -0.40%`) | **`-0.42%`** (with `n <= 64`) | `-0.47%` | `in512_c1` (`n=1`): **`+0.70%`**, `in1024_c32`: **`+0.38%`**<br>`in512_c16` (`n=16`): `-1.02%`, `in512_c128`: `-0.31%`, `in1024_c128`: `-0.72%` | **Crossover Caught**: `Split-K=32` (`32` CTAs on `mhc_stream`) wins for `1 <= n <= 12` (`c1 +0.70%`, `ctx32k_c4 +18.82%`, `ctx16k_c12 +17.37%`) and contends with main-stream GEMMs at `n >= 16` (`c16 -1.02%`). Tightened dispatch in `b12x_dsv41.py` from `1 <= n <= 64` to **`1 <= n <= 12`**. |
+
+

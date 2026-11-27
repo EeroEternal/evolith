@@ -73,6 +73,8 @@ class HardwareTopologySnapshot(BaseModel):
     world_size: int = Field(default=1, ge=1)
     compute_units_per_device: int = Field( ge=1)  # SMs on NVIDIA, CUs on AMD
     l2_cache_bytes: int = Field(default=0, ge=0)
+    persisting_l2_cache_max_bytes: int = Field(default=0, ge=0)
+    shared_mem_per_block_optin_bytes: int = Field(default=0, ge=0)
     vram_bytes: int = Field(default=0, ge=0)
     numa_islands: tuple[tuple[int, ...], ...] = ()
     peer_p2p_matrix: tuple[tuple[bool, ...], ...] = ()
@@ -186,5 +188,17 @@ class HardwareTopologySnapshot(BaseModel):
             notes.append(
                 "Hardware DMA Copy Engine available on non-NVSwitch fabric: offload large-payload "
                 "collectives to CE so SMs remain free for GEMM/TBO overlap."
+            )
+        if self.shared_mem_per_block_optin_bytes >= 65536:
+            smem_kb = self.shared_mem_per_block_optin_bytes // 1024
+            notes.append(
+                f"Per-block opt-in shared memory = {smem_kb} KiB: stage intermediate decode "
+                "activations on-chip across producer/consumer epilogues to avoid HBM/GDDR round-trips."
+            )
+        if self.persisting_l2_cache_max_bytes > 0:
+            l2_p_mib = self.persisting_l2_cache_max_bytes / (1024 * 1024)
+            notes.append(
+                f"Persisting L2 cache window cap = {l2_p_mib:.1f} MiB: pin small high-reuse decode "
+                "projections or collective ring buffers in L2 while keeping streaming loads bypass-cached."
             )
         return tuple(notes)
