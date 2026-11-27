@@ -62,8 +62,13 @@ Raw campaign data: [`docs/benchmarks/sm120_6000d_rsi_20261127/round1_round2_camp
 
 ---
 
-## 5. Next-Stage Parallel Evolution Tracks (Round 3)
+## 5. Round 3 Parallel 3-Track Multi-Regime Results (vs Evolved `zstep@8ad676f`)
 
-1. **Track 1 — Mixed-Step 128-Aligned TBO / Scheduler Prefill-Decode Separation**: Extend TBO comm/compute overlap to high-concurrency mixed steps (`c8..c16`, where 60–75% of steps have `1..15` decode tokens + `2048` prefill tokens) via 128-token-aligned microbatch splitting and/or pure-prefill step batching in `zs-scheduler`.
-2. **Track 2 — Dual-NUMA Topology Parallelism (`sm120-8x6000d-pp2tp4`)**: Eliminate cross-socket Xeon PCIe `AllReduce` hops by running `PP=2 × TP=4` inside each 4-GPU `106.1 GB/s` PXB switch island with multi-microbatch prefill pipelining (`ZSTEP_PP_PREFILL_MICROBATCHES >= 2`) and `1F1B` decode overlap.
-3. **Track 3 — Speculative Decoding (`spec-dspark`)**: Optimize `DeepSeekV41DSparkDrafter` and speculative verification graphs under `ZSTEP_SPEC_METHOD=dspark`, `ZSTEP_NUM_SPEC_TOKENS=5`.
+Raw Round 3 data: [`docs/benchmarks/sm120_6000d_rsi_20261127/round3_3track_results.json`](benchmarks/sm120_6000d_rsi_20261127/round3_3track_results.json)
+
+| Track | Hardware / Regime | Candidate (`LOC`) | Baseline (`zstep@8ad676f`) | Candidate Measured | Key Finding |
+|---|---|---|---|---|---|
+| **Track 1 — Mixed-Step 16-Aligned TBO** | `sm120-8x6000d-tp8` / `longctx-tp8` | `g0001-39015493` (`17 LOC`) | `ctx8k_c2`: `12,749.5` tok/s (`98.83` out)<br>`ctx16k_c8`: `12,996.2` tok/s (`50.57` out) | `ctx8k_c2`: `12,746.6` (`-0.02%`)<br>**`ctx16k_c8`: `13,069.5` (`+0.56%`, `+1.00%` vs `f2c23b1`)** | 16-token-aligned mixed-step TBO unlocks `+0.56%` additional gain on mixed decode+prefill steps (`TRITON_RECOMPILATIONS=0`, 100% Greedy parity). |
+| **Track 2 — Dual-NUMA `PP=2×TP=4` Wave-mHC & P2P** | `sm120-8x6000d-pp2tp4` / `longctx-tp8` | `g0001-e8908ee6` (`46 LOC`) | `ctx8k_c2`: `8,586.3` tok/s (`66.56` out)<br>`ctx16k_c8`: `7,620.1` tok/s (`29.65` out) | **`ctx8k_c2`: `8,647.2` (`+0.71%`)**<br>`ctx16k_c8`: `7,570.0` (`-0.66%`) | Definitively proves `TP=8` (`12.75–13.07K` tok/s) beats `PP=2×TP=4` (`7.62–8.65K` tok/s) by **`+47%` to `+71%`** on `zstep` because `shm_pxb_bfp1` (`914 µs`) + TBO already eliminated stock vLLM's `~3 ms` NCCL bottleneck. |
+| **Track 3 — `spec-dspark` (`DSpark5`) Contiguous DMA** | `sm120-8x6000d-tp8` / `spec-dspark` | `g0002-8ab5e8ef` (`72 LOC`, after RedTeam `.tolist()` catch on `g0001`) | `spec_c1`: **`177.61` out tok/s (`5.29 ms` TPOT)**<br>`spec_c8`: **`820.38` out tok/s (`8.08 ms` TPOT)** | `spec_c1`: `177.60` (`-0.01%`)<br>**`spec_c8`: `825.20` out tok/s (`+0.59%`, `8.02 ms` TPOT `-0.74%`)** | In-graph `(b, k)` contiguous pack + single DMA + zero-`.tolist()` NumPy slicing improves batched `DSpark5` throughput by `+0.59%` and cuts TPOT by `-0.74%` (`TRITON_RECOMPILATIONS=0`, 100% Greedy parity). |
+
