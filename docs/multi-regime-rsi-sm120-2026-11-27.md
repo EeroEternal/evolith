@@ -25,6 +25,10 @@ All infrastructure changes preserve GPU/vendor generality (SM120, SM90, SM100, R
    - `BenchmarkProfile` adds `regime_phase`, `num_kv_pages`, `max_pages_per_seq`, and validated `env_overrides` (`longctx-tp8`, `longctx-agent` with `ZSTEP_MAX_MODEL_LEN=33792` matching `max_pages_per_seq=264`; `spec-dspark` with `ZSTEP_SPEC_METHOD=dspark`, `ZSTEP_NUM_SPEC_TOKENS=5`).
 5. **Streaming `GeminiProposer` & Multi-Hunk `SEARCH/REPLACE` (`src/evolith/zstep/proposer.py`)**:
    - Uses SSE streaming (`streamGenerateContent?alt=sse`) with thought-part filtering (`not p.get("thought", False)`) to prevent HTTP read timeouts on large model/kernel files, and supports multiple `<<<<<<< SEARCH ... >>>>>>> REPLACE` blocks under a single `FILE:` header.
+6. **Automated Google Drive Statistical Benchmark Archiving (`src/evolith/zstep/gdrive_sync.py`)**:
+   - Adds `GDriveBenchmarkSync`, `ZStepRSITask.gdrive_folder_id` (`--gdrive-folder-id` / `EVOLITH_GDRIVE_FOLDER_ID`), and `evolith zstep-sync-gdrive` so every campaign automatically exports append-only lineage CSVs (including rejected/failed trials) and syncs structured JSON/CSV/Markdown/patch artifacts to Google Drive idempotently.
+   - Canonical Google Drive Archive Folder: `https://drive.google.com/drive/folders/1iKYeTEqklUeSbzb6sitYEpdDwwg1CO_0`
+   - Canonical 5-Tab Statistical Ledger Sheet: `https://docs.google.com/spreadsheets/d/1CZbmhI_PLPvDLanYDPfvPcdEj10z5SP4-esOVGER_Z0/edit`
 
 ---
 

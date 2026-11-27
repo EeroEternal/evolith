@@ -150,6 +150,9 @@ class ZStepRSITask(BaseModel):
     hot_prescreen_script: Path | None = None
     min_hot_prescreen_speedup: float = Field(default=1.01, ge=0.0)
     secondary_benchmark_profiles: tuple[str, ...] = ()
+    gdrive_folder_id: str = Field(
+        default_factory=lambda: os.environ.get("EVOLITH_GDRIVE_FOLDER_ID", "")
+    )
     num_kv_pages: int = Field(default=2560, ge=64)
     max_pages_per_seq: int = Field(default=256, ge=16)
     worker_env_overrides: dict[str, str] = Field(default_factory=dict)

@@ -70,6 +70,47 @@ class ZStepRSILoop:
             return str(self.workspace.upstream_head_sha())
         return ""
 
+    def _maybe_sync_gdrive(
+        self,
+        candidate_id: str,
+        evidence_dir: Path,
+        active_task: ZStepRSITask | None = None,
+    ) -> None:
+        task = active_task or self.task
+        folder_id = task.gdrive_folder_id.strip()
+        if not folder_id or not evidence_dir.is_dir():
+            return
+        from evolith.zstep.gdrive_sync import GDriveBenchmarkSync
+
+        hw = task.resolved_hardware_profile()
+        campaign_folder = f"{hw.profile_id}_{task.benchmark_profile}"
+        patch_path = task.state_dir / "patches" / f"{candidate_id}.patch"
+        try:
+            syncer = GDriveBenchmarkSync(folder_id)
+            report = syncer.sync_candidate_evidence(
+                candidate_id,
+                evidence_dir,
+                campaign_folder_name=campaign_folder,
+                patch_path=patch_path if patch_path.is_file() else None,
+                archive_rows=self.archive.list_candidates(),
+            )
+            (evidence_dir / "gdrive-sync.json").write_text(
+                json.dumps(report.to_dict(), indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            (evidence_dir / "gdrive-sync.json").write_text(
+                json.dumps(
+                    {
+                        "root_folder_id": folder_id,
+                        "synced": False,
+                        "error": str(exc),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
     def _find_cached_baseline_screen(self, baseline_hash: str | None = None) -> Path | None:
         if baseline_hash:
             exact = self.task.baseline_cache_dir / f"{baseline_hash[:16]}-screen-metrics.json"
@@ -639,6 +680,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     active_task=active_task,
                     expected_baseline_hash=baseline_hash,
                 )
+                self._maybe_sync_gdrive(candidate_id, evidence_dir, active_task)
                 statuses.append(final_status)
             except Exception as error:
                 is_infra = isinstance(error, (RemotePreflightError, RemoteInfraError))
@@ -656,6 +698,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 self.archive.finish_candidate(
                     candidate_id, status, str(evidence_dir), str(error)
                 )
+                self._maybe_sync_gdrive(candidate_id, evidence_dir, active_task)
                 statuses.append(status)
                 if is_infra or stage in {
                     "preflight",
@@ -773,7 +816,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
 
             stage = "verify"
             self.archive.update_stage(candidate_id, "verify")
-            return self._finalize_verification(
+            resumed_status = self._finalize_verification(
                 candidate_id,
                 baseline_archive,
                 candidate_archive,
@@ -783,6 +826,8 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 active_task=active_task,
                 expected_baseline_hash=baseline_hash,
             )
+            self._maybe_sync_gdrive(candidate_id, evidence_dir, active_task)
+            return resumed_status
         except Exception as error:
             status = (
                 CandidateStatus.FAILED
@@ -797,4 +842,5 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
             self.archive.finish_candidate(
                 candidate_id, status, str(evidence_dir), str(error)
             )
+            self._maybe_sync_gdrive(candidate_id, evidence_dir, active_task)
             return status
