@@ -42,7 +42,9 @@ def test_hardware_topology_classifies_sm120_sm90_sm100_and_rocm() -> None:
         device_name="NVIDIA RTX 6000D",
         world_size=8,
         compute_units_per_device=156,
-        l2_cache_bytes=96 * 1024 * 1024,
+        l2_cache_bytes=112 * 1024 * 1024,
+        persisting_l2_cache_max_bytes=70 * 1024 * 1024,
+        shared_mem_per_block_optin_bytes=99 * 1024,
         vram_bytes=85 * 1024**3,
         numa_islands=((0, 1, 2, 3), (4, 5, 6, 7)),
         peer_p2p_matrix=_pair_p2p_matrix(8),
@@ -57,6 +59,8 @@ def test_hardware_topology_classifies_sm120_sm90_sm100_and_rocm() -> None:
     notes = " ".join(sm120.collective_guidance_notes())
     assert "All-to-all BAR1 IPC is unavailable" in notes
     assert "Copy Engine" in notes
+    assert "Per-block opt-in shared memory = 99 KiB" in notes
+    assert "Persisting L2 cache window cap = 70.0 MiB" in notes
 
     sm100 = HardwareTopologySnapshot(
         vendor="nvidia",
