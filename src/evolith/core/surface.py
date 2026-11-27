@@ -49,6 +49,7 @@ class StateResourceDecl(BaseModel):
     name: str
     budget_bytes: int | None = None
     description: str = ""
+    patch_patterns: tuple[str, ...] = ()
 
 
 class UnitDecl(BaseModel):
@@ -155,18 +156,19 @@ def build_python_import_reverse_graph(
     return rev
 
 
-def _extract_patch_touched_resources(patch_text: str) -> set[str]:
+def _extract_patch_touched_resources(
+    patch_text: str,
+    surface: TargetSurface | None = None,
+) -> set[str]:
+    """Match declarative `StateResourceDecl.patch_patterns` from `surface` against a patch."""
     resources: set[str] = set()
-    resource_markers: tuple[tuple[str, str], ...] = (
-        (r"\bHostMappedShmAllReduce\b|\bpxb_max_elements\b|\benable_pxb_p2p\b", "pxb_ring_budget"),
-        (r"\battach_sm120_mhc_shm_ar\b|\b_prepare_sm120_mhc_overlap\b|\bshm_ar_dec", "mhc_overlap_state"),
-        (r"\bpack_weight\b|\bprocess_weights_after_loading\b|\b_b12x_wo_a_packed\b", "packed_weights"),
-        (r"\bCUDAGraph\b|\bcapture_decode_graphs\b|\bpiecewise\b", "cuda_graph_pool"),
-        (r"\bswa_page_pool\b|\bnum_kv_pages\b|\bkv_leases\b|\bprefix_lease\b", "kv_swa_page_pool"),
-    )
-    for pattern, res_name in resource_markers:
-        if re.search(pattern, patch_text):
-            resources.add(res_name)
+    if not patch_text or surface is None:
+        return resources
+    for res in surface.state_resources:
+        for pattern in res.patch_patterns:
+            if re.search(pattern, patch_text):
+                resources.add(res.name)
+                break
     return resources
 
 
@@ -240,7 +242,7 @@ def analyze_changeset_blast_radius(
     rung = ActionRung.RUNG_0_SIM_ONLY
     recapture_graphs = False
     requires_drain = False
-    touched_resources = _extract_patch_touched_resources(patch_text)
+    touched_resources = _extract_patch_touched_resources(patch_text, surface)
 
     for key in changed_config_keys:
         decl = cfg_decl_map.get(key)
@@ -348,9 +350,9 @@ def are_patches_closure_orthogonal(
     if overlap_direct:
         return False, f"Both patches mutate the same logical unit(s): {overlap_direct}"
 
-    # Extract explicit patch-level shared state resource mutations (e.g. both growing PXB ring)
-    left_explicit_res = _extract_patch_touched_resources(left_patch_text)
-    right_explicit_res = _extract_patch_touched_resources(right_patch_text)
+    # Extract explicit patch-level shared state resource mutations (e.g. both growing ring budget)
+    left_explicit_res = _extract_patch_touched_resources(left_patch_text, surface)
+    right_explicit_res = _extract_patch_touched_resources(right_patch_text, surface)
     overlap_res = sorted(left_explicit_res & right_explicit_res)
     if overlap_res:
         return False, f"Implicit conflict on shared state resource(s): {overlap_res}"
@@ -445,22 +447,35 @@ def default_zstep_surface() -> TargetSurface:
                 name="pxb_ring_budget",
                 budget_bytes=256 * 1024 * 1024,
                 description="PP=1 static PXB IPC ring ceiling (256 MiB)",
+                patch_patterns=(
+                    r"\bHostMappedShmAllReduce\b|\bpxb_max_elements\b|\benable_pxb_p2p\b",
+                ),
             ),
             StateResourceDecl(
                 name="mhc_overlap_state",
                 description="SM120 mHC stream/allreduce overlap binding table",
+                patch_patterns=(
+                    r"\battach_sm120_mhc_shm_ar\b|\b_prepare_sm120_mhc_overlap\b|\bshm_ar_dec",
+                ),
             ),
             StateResourceDecl(
                 name="packed_weights",
                 description="GPU-resident MXFP4/MXFP8 packed linear & expert weights",
+                patch_patterns=(
+                    r"\bpack_weight\b|\bprocess_weights_after_loading\b|\b_b12x_wo_a_packed\b",
+                ),
             ),
             StateResourceDecl(
                 name="cuda_graph_pool",
                 description="Captured decode & piecewise CUDA graph pool",
+                patch_patterns=(r"\bCUDAGraph\b|\bcapture_decode_graphs\b|\bpiecewise\b",),
             ),
             StateResourceDecl(
                 name="kv_swa_page_pool",
                 description="Physical paged KV, MLA, SWA, and Indexer buffers",
+                patch_patterns=(
+                    r"\bswa_page_pool\b|\bnum_kv_pages\b|\bkv_leases\b|\bprefix_lease\b",
+                ),
             ),
         ),
     )

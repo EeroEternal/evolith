@@ -8,9 +8,11 @@ import httpx
 import pytest
 
 from evolith.zstep.proposer import (
+    GeminiProposer,
     KimiCodeProposer,
     OpenAICompatibleProposer,
     PatchProposer,
+    apply_search_replace_blocks,
     build_proposer,
     extract_unified_diff,
     parse_proposal_metadata,
@@ -272,3 +274,119 @@ def test_extract_unified_diff_concatenates_multiple_blocks_and_preserves_inner_f
     assert "/// ```" in extracted
     assert "diff --git a/worker/zstep_worker/runtime_loop.py" in extracted
     assert "+X = 2" in extracted
+
+
+def test_gemini_proposer_includes_cuda_sources_and_applies_neon_diff(tmp_path: Path) -> None:
+    repo = tmp_path / "candidate"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    cu_file = repo / "worker/zstep_worker/kernels_sm120/csrc/shm_ar.cu"
+    cu_file.parent.mkdir(parents=True)
+    cu_file.write_text("__global__ void k() {}\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+
+    cu_file.write_text("__global__ void __launch_bounds__(256) k() {}\n", encoding="utf-8")
+    diff_text = subprocess.run(
+        ["git", "diff"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout
+    subprocess.run(["git", "checkout", "--", "."], cwd=repo, check=True)
+
+    seen_req: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_req["url"] = str(request.url)
+        seen_req["api_key_hdr"] = request.headers.get("x-goog-api-key")
+        seen_req["json"] = json.loads(request.content.decode("utf-8"))
+        text = (
+            f"```diff\n{diff_text}```\n"
+            'EVOLITH_PROPOSAL_JSON: {"hypothesis": "Add launch bounds", '
+            '"niche_key": "(plane=l1_kernel,focus=cu_bounds)", "patch_summary": "Launch bounds"}\n'
+        )
+        return httpx.Response(
+            200,
+            json={"candidates": [{"content": {"parts": [{"text": text}]}}]},
+        )
+
+    task = make_task(tmp_path, proposer_backend="gemini", proposer_model="models/gemini-4-neon")
+    assert isinstance(build_proposer(task), GeminiProposer)
+
+    out = GeminiProposer(task, api_key="gem-key", transport=httpx.MockTransport(handler)).propose(
+        repo, "Optimize shm_ar.cu", tmp_path / "ev-gemini"
+    )
+    assert "__launch_bounds__(256)" in cu_file.read_text(encoding="utf-8")
+    assert seen_req["url"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-neon:generateContent"
+    assert seen_req["api_key_hdr"] == "gem-key"
+    body = seen_req["json"]
+    assert isinstance(body, dict)
+    user_text = body["contents"][0]["parts"][0]["text"]
+    assert "=== FILE: worker/zstep_worker/kernels_sm120/csrc/shm_ar.cu ===" in user_text
+    assert parse_proposal_metadata(out).hypothesis == "Add launch bounds"
+
+
+def test_gemini_proposer_supports_search_replace_and_filters_thought_parts(tmp_path: Path) -> None:
+    repo = tmp_path / "candidate"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    py_file = repo / "worker/zstep_worker/models/deepseek_v41_dspark.py"
+    py_file.parent.mkdir(parents=True)
+    py_file.write_text("def step():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        visible = (
+            "FILE: worker/zstep_worker/models/deepseek_v41_dspark.py\n"
+            "<<<<<<< SEARCH\n"
+            "def step():\n"
+            "    return 1\n"
+            "=======\n"
+            "def step():\n"
+            "    return 2\n"
+            ">>>>>>> REPLACE\n"
+            'EVOLITH_PROPOSAL_JSON: {"hypothesis": "Fast step", '
+            '"niche_key": "(plane=l1_kernel,focus=dspark)", "patch_summary": "Fast step"}\n'
+        )
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "finishReason": "STOP",
+                        "content": {
+                            "parts": [
+                                {"thought": True, "text": "internal chain of thought..."},
+                                {"text": visible},
+                            ]
+                        },
+                    }
+                ]
+            },
+        )
+
+    task = make_task(tmp_path, proposer_backend="gemini", proposer_model="gemini-4-neon")
+    out = GeminiProposer(task, api_key="gem-key", transport=httpx.MockTransport(handler)).propose(
+        repo, "Optimize dspark", tmp_path / "ev-sr"
+    )
+    assert "return 2" in py_file.read_text(encoding="utf-8")
+    assert "internal chain of thought" not in out
+
+
+def test_apply_search_replace_multiple_blocks_under_single_file_header(tmp_path: Path) -> None:
+    py_file = tmp_path / "worker/zstep_worker/models/deepseek_v41.py"
+    py_file.parent.mkdir(parents=True)
+    py_file.write_text("A = 1\nB = 2\nC = 3\n", encoding="utf-8")
+
+    response = (
+        "FILE: worker/zstep_worker/models/deepseek_v41.py\n"
+        "<<<<<<< SEARCH\nA = 1\n=======\nA = 10\n>>>>>>> REPLACE\n"
+        "<<<<<<< SEARCH\nC = 3\n=======\nC = 30\n>>>>>>> REPLACE\n"
+    )
+    count = apply_search_replace_blocks(tmp_path, response)
+    assert count == 2
+    assert py_file.read_text(encoding="utf-8") == "A = 10\nB = 2\nC = 30\n"
+

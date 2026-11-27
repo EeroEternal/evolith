@@ -356,10 +356,142 @@ def evaluate_screen(
             delta_parts.append(f"{label}:{cand_tp:.1f} tok/s")
 
     geomean_gain = _safe_geomean_gain(gains, empty_default=0.0)
+    if (
+        baseline_metrics_path is not None
+        and baseline_metrics_path.is_file()
+        and gains
+        and task.min_screen_gain is not None
+        and geomean_gain < task.min_screen_gain
+    ):
+        reasons.append(
+            f"screen geomean gain {geomean_gain:+.2%} below required min_screen_gain "
+            f"{task.min_screen_gain:+.2%}"
+        )
     return ScreenDecision(
         passed=not reasons,
         gain=geomean_gain,
         metric_delta="screen[" + ", ".join(delta_parts) + "]",
+        reasons=reasons,
+    )
+
+
+def evaluate_hot_prescreen(
+    probe_json_path: Path,
+    *,
+    min_speedup: float = 1.01,
+) -> ScreenDecision:
+    """Validate fast isolated GPU operator/collective hot pre-screen before 475 GiB cold loads."""
+    if not probe_json_path.is_file():
+        return ScreenDecision(
+            passed=False,
+            gain=-1.0,
+            reasons=[f"hot pre-screen output missing at {probe_json_path.name}"],
+        )
+    try:
+        payload = json.loads(probe_json_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return ScreenDecision(
+            passed=False,
+            gain=-1.0,
+            reasons=[f"hot pre-screen output malformed JSON: {exc}"],
+        )
+    if not isinstance(payload, dict):
+        return ScreenDecision(
+            passed=False,
+            gain=-1.0,
+            reasons=["hot pre-screen JSON root must be an object"],
+        )
+    reasons: list[str] = []
+    if payload.get("passed") is False:
+        err = str(payload.get("error") or payload.get("reason") or "correctness/smoke failed")
+        reasons.append(f"hot pre-screen failed check: {err}")
+    raw_speedup = payload.get("geomean_speedup")
+    if not isinstance(raw_speedup, (int, float)) or not math.isfinite(float(raw_speedup)) or float(raw_speedup) <= 0.0:
+        reasons.append(f"hot pre-screen missing positive geomean_speedup (got {raw_speedup!r})")
+        speedup = 0.0
+    else:
+        speedup = float(raw_speedup)
+        if speedup < min_speedup:
+            reasons.append(
+                f"hot pre-screen geomean_speedup {speedup:.4f}x below min_hot_prescreen_speedup {min_speedup:.4f}x"
+            )
+    gain = speedup - 1.0 if speedup > 0.0 else -1.0
+    summary = str(payload.get("summary") or f"speedup={speedup:.4f}x")
+    return ScreenDecision(
+        passed=not reasons,
+        gain=gain,
+        metric_delta=f"hot_prescreen[{summary}]",
+        reasons=reasons,
+    )
+
+
+def evaluate_secondary_guard(
+    baseline: dict[str, list[TierMetric]],
+    candidate: dict[str, list[TierMetric]],
+    parity_path: Path | None,
+    task: ZStepRSITask,
+    *,
+    profile_id: str = "secondary",
+) -> VerificationDecision:
+    """Enforce zero-regression and greedy parity on secondary guard regimes without requiring primary gain."""
+    guard_task = task.model_copy(
+        update={
+            "min_geomean_gain": -task.max_tier_throughput_regression,
+            "complexity_penalty_weight": 0.0,
+            "min_paired_se_z": 0.0,
+        }
+    )
+    reasons: list[str] = []
+    if not baseline:
+        reasons.append(f"{profile_id}: baseline benchmark produced no tier metrics")
+    if not candidate:
+        reasons.append(f"{profile_id}: candidate benchmark produced no tier metrics")
+    labels = sorted(set(baseline) & set(candidate))
+    for label in sorted(set(baseline) - set(candidate)):
+        reasons.append(f"{profile_id}: candidate missing tier {label}")
+    gains: list[float] = []
+    deltas: list[str] = []
+    latency_limits = {
+        "median_ttft_ms": guard_task.max_ttft_regression,
+        "mean_tpot_ms": guard_task.max_tpot_regression,
+        "p99_itl_ms": guard_task.max_p99_itl_regression,
+    }
+    for label in labels:
+        b_tp = _median_metric(baseline[label], "output_throughput_tok_s")
+        c_tp = _median_metric(candidate[label], "output_throughput_tok_s")
+        if not (
+            _validate_positive_finite(b_tp, f"{profile_id} baseline {label}", "output_throughput_tok_s", reasons)
+            and _validate_positive_finite(c_tp, f"{profile_id} {label}", "output_throughput_tok_s", reasons)
+        ):
+            continue
+        gain = c_tp / b_tp - 1.0
+        gains.append(gain)
+        deltas.append(f"{label}:{gain:+.2%}")
+        if gain < -guard_task.max_tier_throughput_regression:
+            reasons.append(
+                f"{profile_id} {label} throughput regressed {gain:.2%} "
+                f"(limit {-guard_task.max_tier_throughput_regression:.2%})"
+            )
+        for field, limit in latency_limits.items():
+            b_lat = _median_metric(baseline[label], field)
+            c_lat = _median_metric(candidate[label], field)
+            if not (math.isfinite(b_lat) and b_lat > 0 and math.isfinite(c_lat) and c_lat > 0):
+                continue
+            reg = c_lat / b_lat - 1.0
+            if reg > limit:
+                reasons.append(f"{profile_id} {label} {field} regressed {reg:.2%} (limit {limit:.2%})")
+    if parity_path is not None:
+        _check_parity_guards(
+            parity_path,
+            reasons,
+            max_cross_mode_logit_drift=guard_task.max_cross_mode_logit_drift,
+        )
+    geomean_gain = _safe_geomean_gain(gains, empty_default=0.0)
+    return VerificationDecision(
+        accepted=not reasons,
+        geomean_gain=geomean_gain,
+        net_gate_ratio=1.0 + geomean_gain,
+        metric_delta=f"{profile_id}_guard={geomean_gain:+.2%} [{', '.join(deltas)}]",
         reasons=reasons,
     )
 

@@ -21,7 +21,9 @@ from evolith.zstep.formal_verifier import (
 )
 from evolith.zstep.gates import (
     evaluate_candidate,
+    evaluate_hot_prescreen,
     evaluate_screen,
+    evaluate_secondary_guard,
     load_benchmark,
     run_local_gates,
 )
@@ -222,6 +224,93 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
             if has_prop_task:
                 self.proposer.task = prev_prop_task
 
+    def _run_hot_prescreen_and_gate(
+        self,
+        candidate_id: str,
+        candidate_archive: Path,
+        evidence_dir: Path,
+        active_task: ZStepRSITask,
+    ) -> None:
+        if active_task.hot_prescreen_script is None or not hasattr(self.remote, "run_probe"):
+            return
+        probe_out = evidence_dir / "hot-prescreen.json"
+        self.remote.run_probe(
+            f"{candidate_id}-hotscreen",
+            candidate_archive,
+            active_task.hot_prescreen_script,
+            probe_out,
+        )
+        decision = evaluate_hot_prescreen(
+            probe_out,
+            min_speedup=active_task.min_hot_prescreen_speedup,
+        )
+        (evidence_dir / "hot-prescreen-decision.json").write_text(
+            decision.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        if not decision.passed:
+            self.archive.update_stage(
+                candidate_id,
+                "screen",
+                screen_gain=decision.gain,
+                metric_delta=decision.metric_delta,
+            )
+            raise ScreenRejectedError("; ".join(decision.reasons))
+
+    def _run_secondary_profile_guards(
+        self,
+        candidate_id: str,
+        baseline_archive: Path,
+        candidate_archive: Path,
+        baseline_hash: str,
+        evidence_dir: Path,
+        eff_task: ZStepRSITask,
+    ) -> list[str]:
+        from evolith.zstep.hardware import resolve_benchmark_profile
+
+        guard_reasons: list[str] = []
+        for prof_key in eff_task.secondary_benchmark_profiles:
+            preset = resolve_benchmark_profile(prof_key)
+            guard_task = eff_task.model_copy(
+                update={
+                    "benchmark_profile": preset.profile_id,
+                    "screen_tiers": preset.screen_tiers,
+                    "verify_tiers": preset.verify_tiers,
+                    "num_kv_pages": preset.num_kv_pages,
+                    "max_pages_per_seq": preset.max_pages_per_seq,
+                    "worker_env_overrides": dict(preset.env_overrides),
+                }
+            )
+            sec_ev = evidence_dir / f"secondary-{preset.profile_id}"
+            sec_ev.mkdir(parents=True, exist_ok=True)
+            prev_remote_task = getattr(self.remote, "task", None)
+            if prev_remote_task is not None:
+                self.remote.task = guard_task
+            try:
+                base_hash_tag = f"{baseline_hash[:12]}-{preset.profile_id}"
+                base_screen = self.remote.screen_baseline(base_hash_tag, baseline_archive)
+                cand_screen = self.remote.screen(
+                    f"{candidate_id}-{preset.profile_id}", candidate_archive, sec_ev
+                )
+            finally:
+                if prev_remote_task is not None:
+                    self.remote.task = prev_remote_task
+            parity_file = sec_ev / "screen-parity.json"
+            sec_decision = evaluate_secondary_guard(
+                load_benchmark(base_screen),
+                load_benchmark(cand_screen),
+                parity_file if parity_file.is_file() else None,
+                guard_task,
+                profile_id=preset.profile_id,
+            )
+            (evidence_dir / f"secondary-{preset.profile_id}-decision.json").write_text(
+                sec_decision.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+            if not sec_decision.accepted:
+                guard_reasons.extend(sec_decision.reasons)
+        return guard_reasons
+
     def _run_screen_and_gate(
         self,
         candidate_id: str,
@@ -300,6 +389,22 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 require_schedule_exposure=("chunked_schedule" in raw_parity),
                 raise_on_failure=False,
             )
+        if decision.accepted and eff_task.secondary_benchmark_profiles:
+            sec_reasons = self._run_secondary_profile_guards(
+                candidate_id,
+                baseline_archive,
+                candidate_archive,
+                expected_baseline_hash or hashlib.sha256(baseline_archive.read_bytes()).hexdigest(),
+                evidence_dir,
+                eff_task,
+            )
+            if sec_reasons:
+                decision = decision.model_copy(
+                    update={
+                        "accepted": False,
+                        "reasons": [*decision.reasons, *sec_reasons],
+                    }
+                )
         (evidence_dir / "decision.json").write_text(
             decision.model_dump_json(indent=2),
             encoding="utf-8",
@@ -499,6 +604,14 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 if active_task.enable_gpu_smoke and hasattr(self.remote, "gpu_smoke"):
                     stage = "screen"
                     self.remote.gpu_smoke(candidate_id, candidate_archive)
+                if active_task.hot_prescreen_script is not None and hasattr(self.remote, "run_probe"):
+                    stage = "screen"
+                    self._run_hot_prescreen_and_gate(
+                        candidate_id,
+                        candidate_archive,
+                        evidence_dir,
+                        active_task,
+                    )
                 baseline_screen: Path | None = None
                 if hasattr(self.remote, "screen_baseline"):
                     stage = "baseline_screen"
@@ -623,6 +736,14 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                 if active_task.enable_gpu_smoke and hasattr(self.remote, "gpu_smoke"):
                     stage = "screen"
                     self.remote.gpu_smoke(candidate_id, candidate_archive)
+                if active_task.hot_prescreen_script is not None and hasattr(self.remote, "run_probe"):
+                    stage = "screen"
+                    self._run_hot_prescreen_and_gate(
+                        candidate_id,
+                        candidate_archive,
+                        evidence_dir,
+                        active_task,
+                    )
                 baseline_screen: Path | None = None
                 if hasattr(self.remote, "screen_baseline"):
                     stage = "baseline_screen"

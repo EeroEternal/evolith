@@ -1,0 +1,69 @@
+# Multi-Regime Hardware-Aware RSI & SM120 8×RTX 6000D Campaign Report (2026-11-27)
+
+## 1. Overview & Governing Principles
+
+This document records the general multi-GPU Recursive Self-Improvement (RSI) infrastructure upgrades added to `evolith` alongside real 8-GPU empirical validation on `8 × NVIDIA RTX 6000D` (`SM120`, `156 SMs`, `85,651 MiB` GDDR7/GPU, `CUDA 13.0`, Dual-Socket Xeon `4+4` PCIe Gen5 Switch topology at `106.1 GB/s` bidirectional PXB bandwidth) running `DeepSeek-V4.1-Flash` (`475.25 GiB` checkpoint) on `zstep`.
+
+All infrastructure changes preserve GPU/vendor generality (SM120, SM90, SM100, ROCm/XGMI, Ascend/HCCS) and strictly enforce `AGENTS.md`:
+- **No hardcoded shapes as permanent objectives**: Crossover thresholds (such as `K >= 2048` vs stock `K <= 1024`) are derived from live hardware scout probes via `PiecewisePolicySynthesizer`.
+- **Trusted admission gates**: `min_geomean_gain = +1.50%`, 3-round interleaved cold `AB/BA` verification, 100% greedy token parity, `TRITON_RECOMPILATIONS == 0`, Z3 formal resource/soundness checks, and RedTeam spec-pin verification remain immutable.
+- **Explicit capability & precision tracks**: `PrecisionTrack.LOSSLESS` vs `PrecisionTrack.CALIBRATED_LOSSY` (`LossyQualityGateSpec`) prevent lossy approximations from silently entering lossless tracks.
+
+---
+
+## 2. General Multi-GPU RSI Primitives Added to Evolith
+
+1. **Hardware Topology & Precision Contracts (`src/evolith/core/topology.py`)**:
+   - `HardwareTopologySnapshot`, `InterconnectTier` (`INTRA_SWITCH_P2P`, `INTER_SOCKET_HOST`, `NVSWITCH_FABRIC`, `RDMA_FABRIC`), `PrecisionTrack`, and `LossyQualityGateSpec`.
+2. **Multi-Regime Ledger & Piecewise Crossover Synthesis (`src/evolith/core/regime.py`)**:
+   - `RegimeSpec`, `MultiRegimeLedger` (requiring positive target-regime gain and zero-regression across guard regimes), `audit_operator_dispatch`, and `PiecewisePolicySynthesizer`.
+3. **Declarative Resource Surfaces (`src/evolith/core/surface.py`)**:
+   - Replaces engine-specific regexes with `StateResourceDecl.patch_patterns` for target-agnostic closure-orthogonality checks (`are_patches_closure_orthogonal`).
+4. **Fast 20-Second GPU Operator Pre-Screen & Secondary Guard Regimes (`src/evolith/zstep/{task,gates,remote,loop,hardware}.py`)**:
+   - `hot_prescreen_script` + `evaluate_hot_prescreen(...)` runs unit tests, GPU numerical parity, and interleaved `AB/BA` operator microbenchmarks in ~20 seconds *before* committing 8 × 475 GiB cold model loads (~75 min).
+   - `secondary_benchmark_profiles` + `evaluate_secondary_guard(...)` enforces zero throughput regression and 100% greedy parity on secondary regimes after primary verification.
+   - `BenchmarkProfile` adds `regime_phase`, `num_kv_pages`, `max_pages_per_seq`, and validated `env_overrides` (`longctx-tp8`, `longctx-agent` with `ZSTEP_MAX_MODEL_LEN=33792` matching `max_pages_per_seq=264`; `spec-dspark` with `ZSTEP_SPEC_METHOD=dspark`, `ZSTEP_NUM_SPEC_TOKENS=5`).
+5. **Streaming `GeminiProposer` & Multi-Hunk `SEARCH/REPLACE` (`src/evolith/zstep/proposer.py`)**:
+   - Uses SSE streaming (`streamGenerateContent?alt=sse`) with thought-part filtering (`not p.get("thought", False)`) to prevent HTTP read timeouts on large model/kernel files, and supports multiple `<<<<<<< SEARCH ... >>>>>>> REPLACE` blocks under a single `FILE:` header.
+
+---
+
+## 3. Empirical 8×RTX 6000D Scout Probe Findings
+
+Raw probe data: [`docs/benchmarks/sm120_6000d_rsi_20261127/round2_8gpu_scout_probe.json`](benchmarks/sm120_6000d_rsi_20261127/round2_8gpu_scout_probe.json)
+
+| Subsystem | Key Live Hardware Measurement (`8 × RTX 6000D`, `CUDA 13.0`) | Architectural Implication |
+|---|---|---|
+| **Intra-Switch PXB P2P** | `p2p_enabled=True`, `pxb_shm_enabled=True`, **`106.1 GB/s`** bi-dir | Intra-island GPU 0..3 and GPU 4..7 communicate via direct CUDA IPC BAR1/PXB. |
+| **`TP=8` AllReduce (`M=4096`, `40 MiB`)** | `zstep shm_pxb_bfp1`: **`914.4 µs`** vs `NCCL`: `2,986.6 µs` (**`3.27×` faster**) vs `flashinfer 0.7.0.post1 pcie_ipc_ar STAGED_RING`: `5,544.4 µs` (**`6.06×` faster**); `ws.tune()` deadlocks on cross-socket `UNSTAGED` BAR writes | Blindly replacing `shm_pxb_bfp1` with `pcie_ipc_ar` regresses 6× or deadlocks. However, 80 AllReduces/step × `914.4 µs` = **`73.15 ms`/step**, making two-stream **Prefill Two-Batch Overlap (TBO)** the primary communication opportunity. |
+| **`sm120_dsa_indexer` Ragged Prefill** | Stock wins at `K=512` (`35.0 vs 39.6 µs`, `0.88×`); `dsa_indexer_det_topk` wins for `K >= 2048` (`1.302×` @ `2K`, `1.117×` @ `8K`, `1.041–1.064×` @ `16K–32K`, 10/10 exact top-k set match) | Despite `1.15–1.27×` isolated operator speedup, DSA Indexer accounts for `< 0.5%` of total `DeepSeek-V4.1-Flash` step latency; end-to-end ablation (`g0006`) measured **`-0.31%`** due to Python dispatch overhead, confirming microbenchmark wins alone do not justify admission. |
+
+---
+
+## 4. Round 1 & Round 2 End-to-End 8-GPU Campaign Results
+
+Raw campaign data: [`docs/benchmarks/sm120_6000d_rsi_20261127/round1_round2_campaign_summary.json`](benchmarks/sm120_6000d_rsi_20261127/round1_round2_campaign_summary.json)
+
+### 4.1 Closed-Loop Root Causes Caught & Repaired by Evolith Gates
+1. **Sequential Microbenchmark Boost-Clock Drift (`g0001`, `g0002`)**: Fixed in `round2_hot_prescreen.py` via interleaved `AB/BA` median event timing.
+2. **Runtime Triton Recompilation (`g0003`, `g0004` -> `TRITON_RECOMPILATIONS=4` on `dsv41_comp_ring_slot`) & TileLang JIT Stall**:
+   - `self.comp_bt_gpu` has shape `(ms, 1)` (`int32`, 4 bytes/row), so slicing `self.comp_bt_gpu[r_start:r_end]` at `r_start % 4 != 0` produced `block_table_ptr % 16 != 0`; fixed via 16-byte-aligned `self._tbo_comp_bt_gpu[u][:u_reqs]`.
+   - Mixed decode+prefill steps (`total_tokens = 2049..2055`) split at odd `mid` produced 8-byte-aligned `positions_full[mid:]`; fixed by gating pure 256-aligned prefill steps (`min_q_len > 1 and total_tokens % 256 == 0`) and pre-warming `_run_prefill_tbo` inside `_warmup_and_capture_decode_graphs`, achieving **`TRITON_RECOMPILATIONS=0`** and jumping `ctx8k_c2` gain from `+1.05%` to **`+2.67%`**.
+3. **32K Page-Table Truncation (`g0005` -> `IndexError: index 256`)**: Fixed in `BenchmarkProfile("longctx-tp8")` by pairing `max_pages_per_seq=264` with `ZSTEP_MAX_MODEL_LEN=33792` (`264 × 128`).
+
+### 4.2 3-Round Interleaved Cold `AB/BA` Verification Summary (vs `zstep@f2c23b1`)
+
+| Candidate | Regime | LOC | Screen Gain | 3-Round `AB/BA` Verify Geomean | `paired_lcb_2se` | Per-Tier 3-Round Mean Throughput & TTFT Delta | Parity & Triton Audit |
+|---|---|---:|---:|---:|---:|---|---|
+| **R1 `g0002-e1ad0d86`** (`156-SM MegaGate PDL` + `ld_cv SHM tree FP32` + `DSpark` zero-alloc) | `short-throughput` | 73 | `+0.49%` | **`+0.45%`** | **`+0.33%`** | `in512_c16: +1.03%`, `in512_c128: +0.68%`, `in1024_c32: +0.06%`, `in1024_c128: +0.05%` | 100% Greedy match, `TRITON_RECOMPILATIONS=0` |
+| **R2 `g0006-606c82ae`** (`DSA Ragged Prefill K>=2048` + `__ldcs SHM`, no TBO) | `longctx-tp8` | 204 | **`-0.31%`** | — (screen rejected) | — | `ctx8k_c2: -0.10%`, `ctx16k_c8: -0.52%` | 100% Greedy match |
+| **R2 `g0010-8c4c252e`** (Pure Aligned+Warmed Prefill TBO) | `longctx-tp8` | 52 | **`+1.68%`** (`ctx8k_c2 +2.67%`) | **`+0.33%`** | **`+0.26%`** | `ctx8k_c16: +0.35%`, `ctx16k_c12: +0.16%`, `ctx32k_c4: +0.48%` (`-1.5%` TTFT), `ctx32k_c8: +0.33%` (`-1.1%` TTFT) | 100% Greedy match, `TRITON_RECOMPILATIONS=0` |
+| **R2 `g0009-fe01dea3`** (Combined 4-Way: Aligned+Warmed TBO + R1 `g0002`) | `longctx-tp8` | 125 | **`+1.44%`** (`ctx8k_c2 +2.50%`) | **`+0.59%`** (12/12 positive) | **`+0.48%`** | `ctx8k_c16: +0.48%` (`-0.71%` TTFT), `ctx16k_c12: +0.37%` (`-0.66%` TTFT), **`ctx32k_c4: +0.91%` (`-1.58%` TTFT)**, **`ctx32k_c8: +0.60%` (`-1.15%` TTFT)** | 100% Greedy & Trace match, `TRITON_RECOMPILATIONS=0` |
+
+---
+
+## 5. Next-Stage Parallel Evolution Tracks (Round 3)
+
+1. **Track 1 — Mixed-Step 128-Aligned TBO / Scheduler Prefill-Decode Separation**: Extend TBO comm/compute overlap to high-concurrency mixed steps (`c8..c16`, where 60–75% of steps have `1..15` decode tokens + `2048` prefill tokens) via 128-token-aligned microbatch splitting and/or pure-prefill step batching in `zs-scheduler`.
+2. **Track 2 — Dual-NUMA Topology Parallelism (`sm120-8x6000d-pp2tp4`)**: Eliminate cross-socket Xeon PCIe `AllReduce` hops by running `PP=2 × TP=4` inside each 4-GPU `106.1 GB/s` PXB switch island with multi-microbatch prefill pipelining (`ZSTEP_PP_PREFILL_MICROBATCHES >= 2`) and `1F1B` decode overlap.
+3. **Track 3 — Speculative Decoding (`spec-dspark`)**: Optimize `DeepSeekV41DSparkDrafter` and speculative verification graphs under `ZSTEP_SPEC_METHOD=dspark`, `ZSTEP_NUM_SPEC_TOKENS=5`.
