@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 from dataclasses import dataclass
 import json
@@ -79,6 +80,32 @@ def export_archive_summary_csv(rows: list[dict[str, Any]], output_path: Path) ->
     return output_path
 
 
+def export_evidence_ledger_json(state_dir: Path, output_path: Path) -> Path:
+    """Consolidate all candidate JSON statistical artifacts under `state_dir/evidence` into one ledger."""
+    evidence_root = state_dir / "evidence"
+    ledger: dict[str, dict[str, Any]] = {}
+    if evidence_root.is_dir():
+        for cand_dir in sorted(p for p in evidence_root.iterdir() if p.is_dir()):
+            cand_entry: dict[str, Any] = {}
+            for jf in sorted(cand_dir.glob("*.json")):
+                if jf.name == "gdrive-sync.json":
+                    continue
+                try:
+                    cand_entry[jf.stem] = json.loads(jf.read_text(encoding="utf-8"))
+                except ValueError:
+                    continue
+            patch_file = state_dir / "patches" / f"{cand_dir.name}.patch"
+            if patch_file.is_file():
+                cand_entry["patch_lines"] = len(
+                    patch_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                )
+            if cand_entry:
+                ledger[cand_dir.name] = cand_entry
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
+    return output_path
+
+
 class GDriveBenchmarkSync:
     """Idempotent Google Drive archiver for Evolith statistical benchmark artifacts.
 
@@ -94,8 +121,9 @@ class GDriveBenchmarkSync:
         *,
         gdrive_bin: str = "gdrive",
         max_retries: int = 4,
-        base_backoff_sec: float = 1.0,
+        base_backoff_sec: float = 1.5,
         timeout_sec: int = 120,
+        max_workers: int = 2,
         runner: CommandRunner | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -107,6 +135,7 @@ class GDriveBenchmarkSync:
         self.max_retries = max(1, max_retries)
         self.base_backoff_sec = max(0.0, base_backoff_sec)
         self.timeout_sec = max(5, timeout_sec)
+        self.max_workers = max(1, max_workers)
         self._runner = runner or _default_runner
         self._sleep = sleep_fn
 
@@ -187,19 +216,34 @@ class GDriveBenchmarkSync:
             if self.is_statistical_artifact(extra):
                 candidates.append(extra)
 
-        uploaded: list[str] = []
-        updated: list[str] = []
+        deduped: list[Path] = []
         seen_names: set[str] = set()
         for fpath in candidates:
-            if fpath.name in seen_names:
-                continue
-            seen_names.add(fpath.name)
+            if fpath.name not in seen_names:
+                seen_names.add(fpath.name)
+                deduped.append(fpath)
+
+        def _sync_one(fpath: Path) -> tuple[str, bool]:
             if fpath.name in existing:
                 self._run_gdrive(["mutate", "update", existing[fpath.name], str(fpath)])
-                updated.append(fpath.name)
-            else:
-                self._run_gdrive(["mutate", "upload", str(fpath), "--parent", target_folder_id])
-                uploaded.append(fpath.name)
+                return fpath.name, True
+            self._run_gdrive(["mutate", "upload", str(fpath), "--parent", target_folder_id])
+            return fpath.name, False
+
+        uploaded: list[str] = []
+        updated: list[str] = []
+        if self.max_workers <= 1 or len(deduped) <= 1:
+            for fp in deduped:
+                fname, was_update = _sync_one(fp)
+                (updated if was_update else uploaded).append(fname)
+        else:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+                futs = [pool.submit(_sync_one, fp) for fp in deduped]
+                for fut in as_completed(futs):
+                    fname, was_update = fut.result()
+                    (updated if was_update else uploaded).append(fname)
+            uploaded.sort()
+            updated.sort()
         return uploaded, updated
 
     def sync_candidate_evidence(
@@ -249,10 +293,19 @@ class GDriveBenchmarkSync:
         errors: list[str] = []
 
         campaign_id = self.ensure_subfolder(campaign_folder_name, self.root_folder_id)
+        summary_extras: list[Path] = []
         if archive_rows is not None:
             csv_path = state_dir / "lineage_summary.csv"
             export_archive_summary_csv(archive_rows, csv_path)
-            up, upd = self.sync_directory(Path("/nonexistent"), campaign_id, extra_files=(csv_path,))
+            summary_extras.append(csv_path)
+        if (state_dir / "evidence").is_dir():
+            ledger_path = state_dir / "evidence_ledger.json"
+            export_evidence_ledger_json(state_dir, ledger_path)
+            summary_extras.append(ledger_path)
+        if summary_extras:
+            up, upd = self.sync_directory(
+                Path("/nonexistent"), campaign_id, extra_files=tuple(summary_extras)
+            )
             uploaded_all.extend(up)
             updated_all.extend(upd)
 
@@ -263,27 +316,16 @@ class GDriveBenchmarkSync:
             uploaded_all.extend(f"baseline-cache/{x}" for x in up)
             updated_all.extend(f"baseline-cache/{x}" for x in upd)
 
-        evidence_root = state_dir / "evidence"
-        if evidence_root.is_dir():
-            ev_root_id = self.ensure_subfolder("evidence", campaign_id)
-            for cand_dir in sorted(p for p in evidence_root.iterdir() if p.is_dir()):
-                try:
-                    c_id = self.ensure_subfolder(cand_dir.name, ev_root_id)
-                    patch_file = state_dir / "patches" / f"{cand_dir.name}.patch"
-                    extras = (patch_file,) if patch_file.is_file() else ()
-                    up, upd = self.sync_directory(cand_dir, c_id, extra_files=extras)
-                    uploaded_all.extend(f"evidence/{cand_dir.name}/{x}" for x in up)
-                    updated_all.extend(f"evidence/{cand_dir.name}/{x}" for x in upd)
-                except Exception as exc:
-                    errors.append(f"{cand_dir.name}: {exc}")
-
         for bdir in benchmark_dirs:
             if not bdir.is_dir():
                 continue
-            b_folder_id = self.ensure_subfolder(bdir.name, self.root_folder_id)
-            up, upd = self.sync_directory(bdir, b_folder_id)
-            uploaded_all.extend(f"{bdir.name}/{x}" for x in up)
-            updated_all.extend(f"{bdir.name}/{x}" for x in upd)
+            try:
+                b_folder_id = self.ensure_subfolder(bdir.name, self.root_folder_id)
+                up, upd = self.sync_directory(bdir, b_folder_id)
+                uploaded_all.extend(f"{bdir.name}/{x}" for x in up)
+                updated_all.extend(f"{bdir.name}/{x}" for x in upd)
+            except Exception as exc:
+                errors.append(f"{bdir.name}: {exc}")
 
         return GDriveSyncReport(
             root_folder_id=self.root_folder_id,

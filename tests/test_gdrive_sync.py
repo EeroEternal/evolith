@@ -11,6 +11,7 @@ import pytest
 from evolith.zstep.gdrive_sync import (
     GDriveBenchmarkSync,
     export_archive_summary_csv,
+    export_evidence_ledger_json,
 )
 
 
@@ -136,6 +137,7 @@ def test_gdrive_sync_candidate_idempotent_and_skips_tarballs(tmp_path: Path) -> 
         runner=backend,
         sleep_fn=sleeps.append,
         base_backoff_sec=0.25,
+        max_workers=1,
     )
 
     first = syncer.sync_candidate_evidence(
@@ -171,3 +173,21 @@ def test_gdrive_sync_candidate_idempotent_and_skips_tarballs(tmp_path: Path) -> 
 def test_gdrive_sync_rejects_empty_folder_id() -> None:
     with pytest.raises(ValueError, match="root_folder_id"):
         GDriveBenchmarkSync("   ")
+
+
+def test_export_evidence_ledger_consolidates_json_artifacts(tmp_path: Path) -> None:
+    ev = tmp_path / "evidence" / "g0002-e1ad0d86"
+    ev.mkdir(parents=True)
+    (ev / "decision.json").write_text('{"accepted": false, "geomean_gain": 0.0045}', encoding="utf-8")
+    (ev / "gdrive-sync.json").write_text('{"ignored": true}', encoding="utf-8")
+    patch_dir = tmp_path / "patches"
+    patch_dir.mkdir()
+    (patch_dir / "g0002-e1ad0d86.patch").write_text("line1\nline2\n", encoding="utf-8")
+
+    out = export_evidence_ledger_json(tmp_path, tmp_path / "evidence_ledger.json")
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert "g0002-e1ad0d86" in data
+    assert data["g0002-e1ad0d86"]["decision"]["geomean_gain"] == 0.0045
+    assert "gdrive-sync" not in data["g0002-e1ad0d86"]
+    assert data["g0002-e1ad0d86"]["patch_lines"] == 2
+
