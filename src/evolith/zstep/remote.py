@@ -346,8 +346,8 @@ fi"""
             f"./target/release/zstep --world-size {hw.world_size} "
             "--python /usr/bin/python3 --worker-root ./worker "
             f"--model-dir {quoted_model_dir} --allreduce-blocks 8 "
-            "--num-kv-pages 2560 --max-step-tokens 4096 --max-decoder-rows 4096 "
-            "--max-pages-per-seq 256 --ready-timeout-secs 900 --step-timeout-secs 180"
+            f"--num-kv-pages {self.task.num_kv_pages} --max-step-tokens 4096 --max-decoder-rows 4096 "
+            f"--max-pages-per-seq {self.task.max_pages_per_seq} --ready-timeout-secs 900 --step-timeout-secs 180"
         )
         greedy = ""
         if parity_name:
@@ -380,6 +380,10 @@ fi"""
             if hw.pp_size > 1
             else ""
         )
+        worker_env = "".join(
+            f"-e {shlex.quote(f'{k}={v}')} "
+            for k, v in sorted(self.task.worker_env_overrides.items())
+        )
         return f"""set -euo pipefail
 trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
 {rustup_snip}
@@ -401,7 +405,7 @@ fi
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \\
   -e OMP_NUM_THREADS=1 -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
   -e VLLM_HOST_IP=127.0.0.1 -e NCCL_SOCKET_IFNAME=lo -e GLOO_SOCKET_IFNAME=lo \\
-  {pp_env}"${{DOCKER_OVERLAY_ARGS[@]}}" {self.task.image} -lc {shlex.quote(inner_cmd)}
+  {pp_env}{worker_env}"${{DOCKER_OVERLAY_ARGS[@]}}" {self.task.image} -lc {shlex.quote(inner_cmd)}
 """
 
     def _remote_run(self, candidate_id: str, stage: str) -> str:

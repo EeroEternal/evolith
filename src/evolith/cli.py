@@ -342,6 +342,12 @@ def zstep_evolve_cmd(
         "--scout-probe",
         help="Enable endogenous Stage-1 Scout GPU microbenchmark probe before final patch synthesis.",
     ),
+    gdrive_folder_id: str | None = typer.Option(
+        None,
+        "--gdrive-folder-id",
+        envvar="EVOLITH_GDRIVE_FOLDER_ID",
+        help="Optional Google Drive folder ID to automatically archive statistical benchmark artifacts.",
+    ),
 ) -> None:
     """Run isolated zstep source evolution; no deployment or upstream commit occurs."""
     from evolith.zstep.archive import ZStepArchive
@@ -367,6 +373,7 @@ def zstep_evolve_cmd(
             "benchmark_profile": bench_profile,
             "remote_sudo": sudo,
             "enable_scout_probe": scout_probe,
+            "gdrive_folder_id": gdrive_folder_id,
         },
     )
     with ZStepArchive(task.state_dir / "archive.sqlite3") as archive:
@@ -444,6 +451,12 @@ def zstep_submit_cmd(
         envvar="EVOLITH_ZSTEP_SUDO",
         help="Allow remote sudo fallback for Docker when SSH user is not in the docker group.",
     ),
+    gdrive_folder_id: str | None = typer.Option(
+        None,
+        "--gdrive-folder-id",
+        envvar="EVOLITH_GDRIVE_FOLDER_ID",
+        help="Optional Google Drive folder ID to automatically archive statistical benchmark artifacts.",
+    ),
 ) -> None:
     """Submit a unified diff directly through Evolith's full Coordinator gates, screen, and 3-round verify."""
     from evolith.zstep.archive import ZStepArchive
@@ -466,6 +479,7 @@ def zstep_submit_cmd(
             "hardware_profile": hw_profile,
             "benchmark_profile": bench_profile,
             "remote_sudo": sudo,
+            "gdrive_folder_id": gdrive_folder_id,
         },
     )
     proposer = PatchProposer(
@@ -478,6 +492,57 @@ def zstep_submit_cmd(
         statuses = ZStepRSILoop(task, archive=archive, proposer=proposer).run()
     for status in statuses:
         console.print(f"zstep candidate: {status.value}")
+
+
+@app.command("zstep-sync-gdrive")
+def zstep_sync_gdrive_cmd(
+    folder_id: str = typer.Option(
+        ...,
+        "--folder-id",
+        envvar="EVOLITH_GDRIVE_FOLDER_ID",
+        help="Destination Google Drive folder ID for statistical benchmark archiving.",
+    ),
+    state_dir: str = typer.Option(
+        ".evolith/zstep-rsi",
+        "--state-dir",
+        help="Local Evolith RSI state directory containing archive.sqlite3 and evidence/.",
+    ),
+    benchmark_dir: list[str] = typer.Option(
+        [],
+        "--benchmark-dir",
+        "-b",
+        help="Additional benchmark artifact directory (e.g., docs/benchmarks/...) to sync.",
+    ),
+    campaign_folder: str = typer.Option(
+        "evolith_rsi_runs",
+        "--campaign-folder",
+        help="Subfolder name under the Google Drive root folder for state_dir artifacts.",
+    ),
+) -> None:
+    """Sync local Evolith statistical benchmark telemetry, lineage CSV, and reports to Google Drive."""
+    from evolith.zstep.archive import ZStepArchive
+    from evolith.zstep.gdrive_sync import GDriveBenchmarkSync
+
+    resolved_state = Path(state_dir).expanduser().resolve()
+    rows = None
+    db_file = resolved_state / "archive.sqlite3"
+    if db_file.is_file():
+        with ZStepArchive(db_file) as archive:
+            rows = archive.list_candidates()
+    syncer = GDriveBenchmarkSync(folder_id)
+    report = syncer.sync_state_and_benchmarks(
+        resolved_state,
+        archive_rows=rows,
+        benchmark_dirs=tuple(Path(p).expanduser().resolve() for p in benchmark_dir),
+        campaign_folder_name=campaign_folder,
+    )
+    console.print(
+        f"Synced to {report.folder_url}: "
+        f"{len(report.uploaded_files)} uploaded, {len(report.updated_files)} updated"
+    )
+    if report.errors:
+        for err in report.errors:
+            console.print(f"[yellow]warn:[/yellow] {markup_escape(err)}")
 
 
 def _detect_local_upstream_sha() -> str:

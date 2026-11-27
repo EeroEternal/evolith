@@ -203,11 +203,60 @@ _RAW_DIFF_RE = re.compile(
 
 _SELF_HOSTED_SYSTEM_PROMPT = (
     "You are Evolith's Self-Referential Inference Engine Optimizer. "
-    "Output a clean, minimal unified git diff (`diff --git a/... b/...`) inside a ```diff``` "
-    "fenced block that applies cleanly with `git apply`, followed on the final line by:\n"
+    "Output EITHER exact search/replace edit blocks:\n"
+    "FILE: <relative/path/to/file>\n"
+    "<<<<<<< SEARCH\n"
+    "<exact existing lines>\n"
+    "=======\n"
+    "<replacement lines>\n"
+    ">>>>>>> REPLACE\n"
+    "OR a clean unified git diff (`diff --git a/... b/...`) inside a ```diff``` fenced block, "
+    "followed on the final line by:\n"
     'EVOLITH_PROPOSAL_JSON: {"hypothesis": "...", "niche_key": "...", "patch_summary": "..."}\n'
     "Never modify files outside the allowlisted roots."
 )
+
+_SEARCH_REPLACE_TOKEN_RE = re.compile(
+    r"(?:^|\n)(?:"
+    r"FILE:\s*([^\r\n]+)"
+    r"|<<<<<<< SEARCH\r?\n(.*?)\r?\n=======\r?\n(.*?)\r?\n>>>>>>> REPLACE"
+    r")",
+    flags=re.DOTALL,
+)
+
+
+def apply_search_replace_blocks(candidate_dir: Path, response_text: str) -> int:
+    """Applies one or more `<<<<<<< SEARCH ... >>>>>>> REPLACE` blocks per `FILE: <path>` header."""
+    edits: list[tuple[str, str, str]] = []
+    current_rel: str | None = None
+    for match in _SEARCH_REPLACE_TOKEN_RE.finditer(response_text):
+        file_hdr = match.group(1)
+        if file_hdr is not None:
+            current_rel = file_hdr.strip().strip("`\"'")
+            continue
+        if not current_rel:
+            raise RuntimeError("SEARCH/REPLACE block missing preceding `FILE: <path>` header")
+        edits.append((current_rel, match.group(2), match.group(3)))
+
+    if not edits:
+        return 0
+    root_resolved = candidate_dir.resolve()
+    applied = 0
+    for rel, search_body, replace_body in edits:
+        target = (candidate_dir / rel).resolve()
+        if root_resolved not in target.parents or not target.is_file():
+            raise RuntimeError(f"SEARCH/REPLACE target `{rel}` is invalid or missing")
+        original = target.read_text(encoding="utf-8")
+        if search_body not in original:
+            raise RuntimeError(
+                f"SEARCH block did not match verbatim in `{rel}` (first line: {search_body.splitlines()[:1]})"
+            )
+        if original.count(search_body) > 1:
+            raise RuntimeError(f"SEARCH block matched multiple locations in `{rel}`; include more context")
+        updated = original.replace(search_body, replace_body, 1)
+        target.write_text(updated, encoding="utf-8")
+        applied += 1
+    return applied
 
 
 def extract_unified_diff(response_text: str) -> bytes:
@@ -248,7 +297,7 @@ def _collect_apc_aligned_context(
                 sorted(
                     p
                     for p in target.rglob("*")
-                    if p.is_file() and p.suffix in {".py", ".rs"}
+                    if p.is_file() and p.suffix in {".py", ".rs", ".cu", ".cuh", ".cpp", ".h"}
                 )
             )
     seen: set[str] = set()
@@ -363,12 +412,160 @@ class OpenAICompatibleProposer:
         return content
 
 
-def build_proposer(task: ZStepRSITask) -> KimiCodeProposer | OpenAICompatibleProposer:
+class GeminiProposer:
+    """Gemini `generateContent` proposer (e.g. `gemini-4-neon`) using `x-goog-api-key`."""
+
+    def __init__(
+        self,
+        task: ZStepRSITask,
+        *,
+        api_base: str = "https://generativelanguage.googleapis.com/v1beta",
+        model: str | None = None,
+        api_key: str | None = None,
+        max_output_tokens: int = 32768,
+        thinking_level: str | None = "MEDIUM",
+        include_apc_snapshot: bool = True,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self.task = task
+        base = api_base.rstrip("/")
+        if task.proposer_api_base and "googleapis.com" in task.proposer_api_base:
+            base = task.proposer_api_base.rstrip("/")
+        self.api_base = base
+        raw_model = (model or task.proposer_model or "gemini-4-neon").strip()
+        self.model = raw_model.removeprefix("models/")
+        self.api_key = (
+            api_key
+            if api_key is not None
+            else (
+                os.environ.get("GEMINI_API_KEY")
+                or os.environ.get("EVOLITH_PROPOSER_API_KEY", "")
+            )
+        )
+        self.max_output_tokens = max_output_tokens
+        self.thinking_level = thinking_level
+        self.include_apc_snapshot = include_apc_snapshot
+        self.transport = transport
+
+    def propose(self, candidate_dir: Path, prompt: str, evidence_dir: Path) -> str:
+        if not self.api_key:
+            raise RuntimeError("GeminiProposer requires GEMINI_API_KEY or EVOLITH_PROPOSER_API_KEY")
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        (evidence_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+
+        user_body = prompt
+        if self.include_apc_snapshot:
+            static_snapshot = _collect_apc_aligned_context(
+                candidate_dir, self.task.allowed_roots
+            )
+            user_body = f"{static_snapshot}\n\n{prompt}"
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
+        gen_cfg: dict[str, object] = {
+            "temperature": 0.1,
+            "maxOutputTokens": self.max_output_tokens,
+        }
+        if self.thinking_level:
+            gen_cfg["thinkingConfig"] = {
+                "thinkingLevel": self.thinking_level,
+                "includeThoughts": True,
+            }
+
+        payload = {
+            "systemInstruction": {"parts": [{"text": _SELF_HOSTED_SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": user_body}]}],
+            "generationConfig": gen_cfg,
+        }
+
+        visible_parts: list[str] = []
+        finish_reason = ""
+        if self.transport is not None:
+            url = f"{self.api_base}/models/{self.model}:generateContent"
+            with httpx.Client(timeout=float(self.task.local_timeout_sec), transport=self.transport) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                body = resp.json()
+            candidates = body.get("candidates") or []
+            if not candidates or not isinstance(candidates[0], dict):
+                raise RuntimeError(f"Gemini proposer response missing `candidates[0]`: {str(body)[:300]}")
+            cand0 = candidates[0]
+            finish_reason = str(cand0.get("finishReason") or "")
+            for p in ((cand0.get("content") or {}).get("parts")) or []:
+                if isinstance(p, dict) and p.get("text") and not p.get("thought", False):
+                    visible_parts.append(str(p.get("text") or ""))
+            content = "\n".join(visible_parts)
+        else:
+            url = f"{self.api_base}/models/{self.model}:streamGenerateContent?alt=sse"
+            read_s = max(360.0, float(self.task.local_timeout_sec))
+            timeout = httpx.Timeout(connect=30.0, read=read_s, write=30.0, pool=30.0)
+            with httpx.Client(timeout=timeout) as client:
+                for attempt in range(3):
+                    visible_parts.clear()
+                    try:
+                        with client.stream("POST", url, headers=headers, json=payload) as resp:
+                            if resp.status_code == 400 and attempt == 0 and "thinkingConfig" in gen_cfg:
+                                gen_cfg.pop("thinkingConfig", None)
+                                continue
+                            resp.raise_for_status()
+                            for raw_line in resp.iter_lines():
+                                if raw_line.startswith("data: "):
+                                    chunk = json.loads(raw_line[6:])
+                                    for c in chunk.get("candidates") or []:
+                                        if c.get("finishReason"):
+                                            finish_reason = str(c["finishReason"])
+                                        for p in ((c.get("content") or {}).get("parts")) or []:
+                                            if isinstance(p, dict) and p.get("text") and not p.get("thought", False):
+                                                visible_parts.append(str(p["text"]))
+                            break
+                    except (httpx.ReadTimeout, httpx.RemoteProtocolError):
+                        if attempt >= 2:
+                            raise
+            content = "".join(visible_parts)
+
+        (evidence_dir / "proposer.log").write_text(content, encoding="utf-8")
+        if not content.strip():
+            raise RuntimeError(f"Gemini proposer returned empty visible text (finishReason={finish_reason})")
+
+        if apply_search_replace_blocks(candidate_dir, content) > 0:
+            return content
+
+        patch_bytes = extract_unified_diff(content)
+        check = subprocess.run(
+            ["git", "apply", "--check", "-"],
+            input=patch_bytes,
+            cwd=candidate_dir,
+            capture_output=True,
+        )
+        if check.returncode != 0:
+            err = check.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Gemini proposer diff failed `git apply --check`: {err}")
+
+        applied = subprocess.run(
+            ["git", "apply", "-"],
+            input=patch_bytes,
+            cwd=candidate_dir,
+            capture_output=True,
+        )
+        if applied.returncode != 0:
+            err = applied.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Gemini proposer diff failed `git apply`: {err}")
+
+        return content
+
+
+def build_proposer(
+    task: ZStepRSITask,
+) -> KimiCodeProposer | OpenAICompatibleProposer | GeminiProposer:
     backend = task.proposer_backend.strip().lower()
     if backend == "kimi":
         return KimiCodeProposer(task)
     if backend == "openai":
         return OpenAICompatibleProposer(task)
+    if backend == "gemini":
+        return GeminiProposer(task)
     raise ValueError(
-        f"Unknown proposer_backend `{task.proposer_backend}`; expected 'kimi' or 'openai'"
+        f"Unknown proposer_backend `{task.proposer_backend}`; expected 'kimi', 'openai', or 'gemini'"
     )

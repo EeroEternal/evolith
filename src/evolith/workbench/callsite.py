@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 from pydantic import BaseModel, Field
 
+from evolith.core.topology import PrecisionTrack
 from evolith.models import EvolutionPlane
 
 
@@ -30,6 +31,10 @@ class StepOperatorSample(BaseModel):
     shapes: tuple[tuple[int, ...], ...] = ()
     strides: tuple[tuple[int, ...], ...] = ()
     dtype: str = "bfloat16"
+    selected_tactic: str = ""
+    is_fallback_route: bool = False
+    tuned_compute_units: tuple[int, ...] = ()
+    precision_track: PrecisionTrack = PrecisionTrack.LOSSLESS
 
 
 class RankedBottleneck(BaseModel):
@@ -64,6 +69,9 @@ class CallSiteContract(BaseModel):
     action_rung: str = ""
     hotswap_extern_c: bool = False
     niche_key: str = ""
+    selected_tactic: str = ""
+    is_fallback_route: bool = False
+    precision_track: PrecisionTrack = PrecisionTrack.LOSSLESS
 
 
 class StepProfileReport(BaseModel):
@@ -181,6 +189,9 @@ class StepBottleneckLedger:
                     action_rung=item.action_rung,
                     hotswap_extern_c=item.hotswap_extern_c,
                     niche_key=item.niche_key,
+                    selected_tactic=src.selected_tactic if src else "",
+                    is_fallback_route=src.is_fallback_route if src else False,
+                    precision_track=src.precision_track if src else PrecisionTrack.LOSSLESS,
                 )
             )
         return contracts

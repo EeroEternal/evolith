@@ -19,6 +19,10 @@ class BenchmarkProfile(BaseModel):
     description: str
     screen_tiers: str
     verify_tiers: str
+    regime_phase: Literal["decode", "prefill", "mixed", "speculative"] = "mixed"
+    num_kv_pages: int = Field(default=2560, ge=64)
+    max_pages_per_seq: int = Field(default=256, ge=16)
+    env_overrides: dict[str, str] = Field(default_factory=dict)
 
 
 BUILTIN_BENCHMARK_PROFILES: dict[str, BenchmarkProfile] = {
@@ -30,6 +34,24 @@ BUILTIN_BENCHMARK_PROFILES: dict[str, BenchmarkProfile] = {
             "in512_c16:16:48:512:256;in512_c128:128:256:512:256;"
             "in1024_c32:32:200:1024:256;in1024_c128:128:400:1024:256"
         ),
+        regime_phase="mixed",
+        num_kv_pages=2560,
+        max_pages_per_seq=256,
+    ),
+    "longctx-tp8": BenchmarkProfile(
+        profile_id="longctx-tp8",
+        description="TP=8 8K–32K long-context prefill & decode ladder within single-stage KV budget",
+        screen_tiers="ctx8k_c2:2:4:8192:64;ctx16k_c8:8:16:16384:64",
+        verify_tiers=(
+            "ctx8k_c16:16:32:8192:128;ctx16k_c12:12:24:16384:128;"
+            "ctx32k_c4:4:8:32768:128;ctx32k_c8:8:16:32768:128"
+        ),
+        regime_phase="prefill",
+        num_kv_pages=2560,
+        max_pages_per_seq=264,
+        env_overrides={
+            "ZSTEP_MAX_MODEL_LEN": "33792",
+        },
     ),
     "longctx-agent": BenchmarkProfile(
         profile_id="longctx-agent",
@@ -39,6 +61,27 @@ BUILTIN_BENCHMARK_PROFILES: dict[str, BenchmarkProfile] = {
             "ctx8k_c16:16:32:8192:128;ctx16k_c20:20:40:16384:128;"
             "ctx32k_c10:10:20:32768:128;ctx32k_c20:20:40:32768:128"
         ),
+        regime_phase="prefill",
+        num_kv_pages=6144,
+        max_pages_per_seq=264,
+        env_overrides={
+            "ZSTEP_MAX_MODEL_LEN": "33792",
+        },
+    ),
+    "spec-dspark": BenchmarkProfile(
+        profile_id="spec-dspark",
+        description="Low-to-medium concurrency speculative decoding ladder (DSpark draft+verify)",
+        screen_tiers="spec_c1:1:8:512:128;spec_c8:8:24:512:128",
+        verify_tiers=(
+            "spec_c2:2:12:512:256;spec_c4:4:16:512:256;spec_c16:16:48:1024:256"
+        ),
+        regime_phase="speculative",
+        num_kv_pages=2560,
+        max_pages_per_seq=256,
+        env_overrides={
+            "ZSTEP_SPEC_METHOD": "dspark",
+            "ZSTEP_NUM_SPEC_TOKENS": "5",
+        },
     ),
 }
 

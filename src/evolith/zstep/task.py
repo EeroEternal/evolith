@@ -3,10 +3,24 @@ from __future__ import annotations
 from enum import Enum
 import os
 from pathlib import Path
+import re
 
 from pydantic import BaseModel, Field, model_validator
 
 from evolith.models import EvolutionPlane
+
+_ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_FORBIDDEN_ENV_KEYS = frozenset(
+    {
+        "PATH",
+        "PYTHONPATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "HOME",
+        "HOST_UID",
+        "HOST_GID",
+    }
+)
 
 
 class CandidateStatus(str, Enum):
@@ -132,6 +146,16 @@ class ZStepRSITask(BaseModel):
     min_paired_se_z: float = Field(default=0.0, ge=0.0)
     max_screen_throughput_regression: float = 0.02
     max_screen_latency_regression: float = 0.08
+    min_screen_gain: float | None = None
+    hot_prescreen_script: Path | None = None
+    min_hot_prescreen_speedup: float = Field(default=1.01, ge=0.0)
+    secondary_benchmark_profiles: tuple[str, ...] = ()
+    gdrive_folder_id: str = Field(
+        default_factory=lambda: os.environ.get("EVOLITH_GDRIVE_FOLDER_ID", "")
+    )
+    num_kv_pages: int = Field(default=2560, ge=64)
+    max_pages_per_seq: int = Field(default=256, ge=16)
+    worker_env_overrides: dict[str, str] = Field(default_factory=dict)
     keep_remote_stage: bool = False
     sandbox_root: Path | None = None
     campaign: str = "none"
@@ -214,6 +238,17 @@ class ZStepRSITask(BaseModel):
                 self.screen_tiers = preset.screen_tiers
             if "verify_tiers" not in self.model_fields_set:
                 self.verify_tiers = preset.verify_tiers
+            if "num_kv_pages" not in self.model_fields_set:
+                self.num_kv_pages = preset.num_kv_pages
+            if "max_pages_per_seq" not in self.model_fields_set:
+                self.max_pages_per_seq = preset.max_pages_per_seq
+            if "worker_env_overrides" not in self.model_fields_set and preset.env_overrides:
+                self.worker_env_overrides = dict(preset.env_overrides)
+        for env_key in self.worker_env_overrides:
+            if not _ENV_KEY_RE.match(env_key) or env_key in _FORBIDDEN_ENV_KEYS:
+                raise ValueError(
+                    f"Forbidden or malformed worker_env_overrides key `{env_key}`"
+                )
         public = {item.split(":", 1)[0] for item in self.screen_tiers.split(";") if item}
         hidden = {item.split(":", 1)[0] for item in self.verify_tiers.split(";") if item}
         if not public or not hidden:
