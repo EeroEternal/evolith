@@ -76,3 +76,16 @@ Raw Round 3 data: [`docs/benchmarks/sm120_6000d_rsi_20261127/round3_3track_resul
 | **Track 2 — Dual-NUMA `PP=2×TP=4` Wave-mHC & P2P** | `sm120-8x6000d-pp2tp4` / `longctx-tp8` | `g0001-e8908ee6` (`46 LOC`) | `ctx8k_c2`: `8,586.3` tok/s (`66.56` out)<br>`ctx16k_c8`: `7,620.1` tok/s (`29.65` out) | **`ctx8k_c2`: `8,647.2` (`+0.71%`)**<br>`ctx16k_c8`: `7,570.0` (`-0.66%`) | Definitively proves `TP=8` (`12.75–13.07K` tok/s) beats `PP=2×TP=4` (`7.62–8.65K` tok/s) by **`+47%` to `+71%`** on `zstep` because `shm_pxb_bfp1` (`914 µs`) + TBO already eliminated stock vLLM's `~3 ms` NCCL bottleneck. |
 | **Track 3 — `spec-dspark` (`DSpark5`) Contiguous DMA** | `sm120-8x6000d-tp8` / `spec-dspark` | `g0002-8ab5e8ef` (`72 LOC`, after RedTeam `.tolist()` catch on `g0001`) | `spec_c1`: **`177.61` out tok/s (`5.29 ms` TPOT)**<br>`spec_c8`: **`820.38` out tok/s (`8.08 ms` TPOT)** | `spec_c1`: `177.60` (`-0.01%`)<br>**`spec_c8`: `825.20` out tok/s (`+0.59%`, `8.02 ms` TPOT `-0.74%`)** | In-graph `(b, k)` contiguous pack + single DMA + zero-`.tolist()` NumPy slicing improves batched `DSpark5` throughput by `+0.59%` and cuts TPOT by `-0.74%` (`TRITON_RECOMPILATIONS=0`, 100% Greedy parity). |
 
+---
+
+## 6. Round 4 Orthogonal Composition 3-Round `AB/BA` Verification (`zstep@5fbcdbe` Incumbent)
+
+Raw Round 4 data: [`docs/benchmarks/sm120_6000d_rsi_20261127/round4_composed_abba_verify.json`](benchmarks/sm120_6000d_rsi_20261127/round4_composed_abba_verify.json)
+
+To test whether Round 3's two sub-regime winners (`Track 1` `17 LOC` + `Track 3 v2` `72 LOC` = `89 LOC`) generalize across hidden high-concurrency multi-tier verification without cross-regime regressions, we ran full 3-Round Interleaved Cold `AB/BA` Verification (`repeats=3`, 12 cold 8-GPU containers per iteration) across both `longctx-tp8` and `spec-dspark`:
+
+| Verification Suite | Candidate | 3-Round `AB/BA` Geomean | `paired_lcb_2se` | Per-Tier 3-Round Mean Delta (vs `zstep@5fbcdbe`) | Gate Verdict & Action |
+|---|---|---:|---:|---|---|
+| **`longctx-tp8` (`8K–32K`)** | `g0002-9e1e9726` (`Track 1` Mixed-Step 16-Aligned TBO) | **`+0.64%`** (`+1.23%` cumulative vs `f2c23b1`) | **`+0.58%`** | `ctx16k_c12`: **`+0.87%`** (TPOT `75.63 → 74.92 ms`), `ctx32k_c4`: **`+0.70%`** (`43.25 → 42.92 ms`), `ctx32k_c8`: **`+0.70%`** (`87.05 → 86.49 ms`), `ctx8k_c16`: **`+0.30%`** | **`CONFORMANT` (`TRITON_RECOMPILATIONS=0`) — LANDED in `zstep`** (with explicit `dspark_drafter` isolation). |
+| **`spec-dspark` (`DSpark5`)** | `g0002-748b7123` (v1 composed) & `g0001-c657e439` (v2 isolated `Track 3 v2`) | **`-0.47%`** (v1) / **`-1.05%`** (v2) | `-0.74%` / `-1.30%` | Public Screen `spec_c8` won **`+0.40%..+1.05%`**, but hidden `spec_c16` (`16:48:1024:256`) regressed **`-1.47%` / `-2.74%`** (`p99_itl +7.53% / +6.83%`) | **REJECTED & EXCLUDED per `AGENTS.md`**: proves public 2-tier Screen wins (`spec_c8 +1.05%`) can mask CPython `np.int32` scalar-boxing + `b=16` transpose overhead on hidden `c16` tiers. |
+
