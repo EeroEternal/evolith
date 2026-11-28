@@ -153,6 +153,72 @@ def register(app: typer.Typer) -> None:
             emit(refusal(str(exc)))
             raise typer.Exit(2) from exc
 
+    @app.command("zstep-sail-evolve")
+    def zstep_sail_evolve(
+        remote: Annotated[str, typer.Option(help="SSH destination, e.g. root@10.8.141.36.")],
+        local_zstep_repo: Annotated[Path, typer.Option(exists=True, file_okay=False)],
+        remote_root: Annotated[Path, typer.Option()],
+        model_dir: Annotated[Path, typer.Option()],
+        output: Annotated[Path, typer.Option()] = Path("results"),
+        port: Annotated[int, typer.Option(min=1, max=65535)] = 22,
+        container_image: Annotated[str | None, typer.Option()] = None,
+        control_path: Annotated[Path | None, typer.Option()] = None,
+        initial_policy_path: Annotated[Path | None, typer.Option(exists=True, dir_okay=False)] = None,
+        parent_run: Annotated[str | None, typer.Option()] = None,
+        prompt_ids: Annotated[str, typer.Option()] = "671,6102,294,8760,344",
+        decode_tokens: Annotated[int, typer.Option()] = 32,
+        bench_tier: Annotated[str, typer.Option()] = "evolve:8:16:256:64",
+        observe_bench_tier: Annotated[str, typer.Option()] = "observe:4:4:256:16",
+        cycles: Annotated[int, typer.Option(min=1, max=8)] = 2,
+        evaluations: Annotated[int, typer.Option(min=1, max=64)] = 12,
+        model_evaluations: Annotated[int, typer.Option(min=1, max=12)] = 3,
+        families_per_cycle: Annotated[int, typer.Option(min=1, max=6)] = 2,
+        rounds: Annotated[int, typer.Option(min=5, max=101)] = 11,
+        iterations: Annotated[int, typer.Option(min=1, max=1000)] = 25,
+        model_pairs: Annotated[int, typer.Option(min=5, max=19)] = 5,
+        min_share: Annotated[float, typer.Option(min=0.01, max=0.99)] = 0.03,
+        time_budget: Annotated[int, typer.Option(min=60, max=7200)] = 3600,
+    ):
+        """Observe 8x810E SAIL operator costs, confirm micro-winners, and verify against incumbent."""
+        try:
+            from evolith.lab.zstep_sail import (
+                DEFAULT_SAIL_CONTAINER_IMAGE,
+                ZstepSailEvolution,
+                ZstepSailEvolutionConfig,
+            )
+
+            result = ZstepSailEvolution(
+                ZstepSailEvolutionConfig(
+                    remote=remote,
+                    port=port,
+                    local_zstep_repo=local_zstep_repo,
+                    remote_root=remote_root,
+                    model_dir=model_dir,
+                    output=output,
+                    container_image=container_image or DEFAULT_SAIL_CONTAINER_IMAGE,
+                    control_path=control_path,
+                    initial_policy_path=initial_policy_path,
+                    parent_run=parent_run,
+                    prompt_ids=prompt_ids,
+                    decode_tokens=decode_tokens,
+                    bench_tier=bench_tier,
+                    observe_bench_tier=observe_bench_tier,
+                    cycles=cycles,
+                    evaluations=evaluations,
+                    model_evaluations=model_evaluations,
+                    families_per_cycle=families_per_cycle,
+                    rounds=rounds,
+                    iterations=iterations,
+                    model_pairs=model_pairs,
+                    min_share=min_share,
+                    seconds=time_budget,
+                )
+            ).run()
+            emit(result)
+        except (ImportError, RuntimeError, ValueError, TypeError, OSError) as exc:
+            emit(refusal(str(exc)))
+            raise typer.Exit(2) from exc
+
     @app.command("archive")
     def archive(
         db: Annotated[Path, typer.Option(exists=True, dir_okay=False)] = Path("results/runs.sqlite3"),

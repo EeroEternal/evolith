@@ -1,0 +1,2519 @@
+{
+  "run_id": "20261127T180449Z-f8f4fa4884f4",
+  "status": "stopped",
+  "deployment_approved": true,
+  "scope": "Observed PPU/SAIL operator-family parameter & backend policy evolution on 8x PPU-ZW810E; bounded selection among verified implementations, not source mutation.",
+  "cycles": [
+    {
+      "cycle": 0,
+      "incumbent_at_start": {
+        "version": 1,
+        "ar_blocks": 8,
+        "ar_threads": 256,
+        "ar_oneshot_max_bytes": 131072,
+        "moe_gemv_max_rows": 16,
+        "moe_gemv_threads": 256,
+        "moe_block_m": 32,
+        "moe_num_warps": 4,
+        "sparse_attn_backend": "auto"
+      },
+      "observation": {
+        "policy": {
+          "version": 1,
+          "ar_blocks": 8,
+          "ar_threads": 256,
+          "ar_oneshot_max_bytes": 131072,
+          "moe_gemv_max_rows": 16,
+          "moe_gemv_threads": 256,
+          "moe_block_m": 32,
+          "moe_num_warps": 4,
+          "sparse_attn_backend": "auto"
+        },
+        "applied_policy": {
+          "backend": "sail",
+          "ar_blocks": 8,
+          "ar_threads": 256,
+          "ar_oneshot_max_bytes": 131072,
+          "ar_pccl_min_bytes": 4194304,
+          "moe_gemv_max_rows": 16,
+          "moe_gemv_threads": 256,
+          "moe_block_m": 32,
+          "moe_num_warps": 4,
+          "sparse_attn_backend": "auto"
+        },
+        "tokens": [
+          280,
+          31,
+          25,
+          14,
+          280,
+          64,
+          20,
+          31,
+          2505,
+          14,
+          223,
+          20,
+          82,
+          13,
+          19,
+          31,
+          856,
+          201,
+          23,
+          16,
+          280,
+          31,
+          779,
+          14,
+          280,
+          64,
+          20,
+          31,
+          8245,
+          14,
+          223,
+          20,
+          82,
+          13,
+          19,
+          31,
+          1349,
+          201,
+          24,
+          16,
+          280,
+          31,
+          907,
+          14,
+          280,
+          64,
+          20,
+          31,
+          11508,
+          14,
+          223,
+          20,
+          82,
+          13,
+          19,
+          31,
+          1477,
+          201,
+          25,
+          16,
+          280,
+          31,
+          1002,
+          14
+        ],
+        "output_throughput_tok_s": 36.05,
+        "total_estimated_us": 41848416.24,
+        "families": [
+          {
+            "name": "engram_indexer_mhc",
+            "supported": false,
+            "calls_per_rank": 28036,
+            "estimated_total_us": 18509624.88,
+            "reason": "Stateless Engram/Indexer/mHC kernels have no parameterized policy family yet",
+            "share": 0.442302
+          },
+          {
+            "name": "icn_allreduce",
+            "supported": true,
+            "calls_per_rank": 14670,
+            "estimated_total_us": 6957932.004,
+            "reason": null,
+            "share": 0.166265
+          },
+          {
+            "name": "mxfp4_moe_decode",
+            "supported": true,
+            "calls_per_rank": 6280,
+            "estimated_total_us": 4970564.076,
+            "reason": null,
+            "share": 0.118775
+          },
+          {
+            "name": "mxfp4_moe_prefill",
+            "supported": true,
+            "calls_per_rank": 240,
+            "estimated_total_us": 8851292.258,
+            "reason": null,
+            "share": 0.211508
+          },
+          {
+            "name": "sparse_attn_tp8",
+            "supported": true,
+            "calls_per_rank": 6520,
+            "estimated_total_us": 2559003.021,
+            "reason": null,
+            "share": 0.061149
+          }
+        ]
+      },
+      "capability_gaps": [
+        {
+          "name": "engram_indexer_mhc",
+          "supported": false,
+          "calls_per_rank": 28036,
+          "estimated_total_us": 18509624.88,
+          "reason": "Stateless Engram/Indexer/mHC kernels have no parameterized policy family yet",
+          "share": 0.442302
+        }
+      ],
+      "selected_targets": [
+        "mxfp4_moe_prefill",
+        "icn_allreduce",
+        "mxfp4_moe_decode",
+        "sparse_attn_tp8"
+      ],
+      "micro": [
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "568e91d81a73d097379ae51f8a4b829642106e657635f22a5bcfaecca49f4a03",
+          "family": "mxfp4_moe_prefill",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 16,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": true,
+          "benchmark": {
+            "family": "mxfp4_moe_prefill",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 16,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              3538.10791015625,
+              3537.2665405273438,
+              3526.3888549804688,
+              3536.1032104492188,
+              3534.2999267578125,
+              3538.5336303710938,
+              3516.1544799804688,
+              3536.0223388671875,
+              3538.475341796875,
+              3533.8656616210938,
+              3535.0015258789062
+            ],
+            "candidate_us": [
+              2772.4639892578125,
+              2770.220947265625,
+              2775.4336547851562,
+              2766.116943359375,
+              2774.0182495117188,
+              2774.119873046875,
+              2773.3056640625,
+              2778.5928344726562,
+              2772.3959350585938,
+              2766.6351318359375,
+              2775.6271362304688
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              3538.10791015625,
+              3537.2665405273438,
+              3526.3888549804688,
+              3536.1032104492188,
+              3534.2999267578125,
+              3538.5336303710938,
+              3516.1544799804688,
+              3536.0223388671875,
+              3538.475341796875,
+              3533.8656616210938,
+              3535.0015258789062
+            ],
+            "candidate_us": [
+              2772.4639892578125,
+              2770.220947265625,
+              2775.4336547851562,
+              2766.116943359375,
+              2774.0182495117188,
+              2774.119873046875,
+              2773.3056640625,
+              2778.5928344726562,
+              2772.3959350585938,
+              2766.6351318359375,
+              2775.6271362304688
+            ],
+            "speedup": 1.2755518118561497,
+            "lower_bound": 1.2725946367519092,
+            "baseline_cv": 0.0019043660149046238,
+            "candidate_cv": 0.0013554914760877902,
+            "accepted": true,
+            "reasons": []
+          },
+          "confirmation": {
+            "family": "mxfp4_moe_prefill",
+            "seed": 73,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 16,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              3531.1935424804688,
+              3519.3032836914062,
+              3528.5488891601562,
+              3523.8528442382812,
+              3535.5975341796875,
+              3528.06884765625,
+              3533.653564453125,
+              3524.8208618164062,
+              3514.8696899414062,
+              3521.2033081054688,
+              3518.7008666992188
+            ],
+            "candidate_us": [
+              2770.4791259765625,
+              2760.4888916015625,
+              2763.2904052734375,
+              2772.5656127929688,
+              2765.0735473632812,
+              2761.6656494140625,
+              2773.5592651367188,
+              2766.961669921875,
+              2761.27197265625,
+              2763.3248901367188,
+              2767.6681518554688
+            ]
+          },
+          "confirmation_measurement": {
+            "baseline_us": [
+              3531.1935424804688,
+              3519.3032836914062,
+              3528.5488891601562,
+              3523.8528442382812,
+              3535.5975341796875,
+              3528.06884765625,
+              3533.653564453125,
+              3524.8208618164062,
+              3514.8696899414062,
+              3521.2033081054688,
+              3518.7008666992188
+            ],
+            "candidate_us": [
+              2770.4791259765625,
+              2760.4888916015625,
+              2763.2904052734375,
+              2772.5656127929688,
+              2765.0735473632812,
+              2761.6656494140625,
+              2773.5592651367188,
+              2766.961669921875,
+              2761.27197265625,
+              2763.3248901367188,
+              2767.6681518554688
+            ],
+            "speedup": 1.2742632329169419,
+            "lower_bound": 1.2729168748126687,
+            "baseline_cv": 0.0018729157835582978,
+            "candidate_cv": 0.0016601940682988354,
+            "accepted": true,
+            "reasons": []
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "2e7a7646388528adf568936d857cd7c145064164c2a450222cca08a58c1a5edb",
+          "family": "mxfp4_moe_prefill",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 64,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": false,
+          "benchmark": {
+            "family": "mxfp4_moe_prefill",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 64,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              3552.02880859375,
+              3526.03515625,
+              3537.2576904296875,
+              3523.7823486328125,
+              3534.0151977539062,
+              3534.935302734375,
+              3528.604736328125,
+              3539.56787109375,
+              3540.1992797851562,
+              3538.9047241210938,
+              3525.2377319335938
+            ],
+            "candidate_us": [
+              5592.8472900390625,
+              5589.227294921875,
+              5574.0289306640625,
+              5585.650634765625,
+              5571.0736083984375,
+              5585.029296875,
+              5584.8126220703125,
+              5583.92333984375,
+              5587.4298095703125,
+              5581.1175537109375,
+              5582.9534912109375
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              3552.02880859375,
+              3526.03515625,
+              3537.2576904296875,
+              3523.7823486328125,
+              3534.0151977539062,
+              3534.935302734375,
+              3528.604736328125,
+              3539.56787109375,
+              3540.1992797851562,
+              3538.9047241210938,
+              3525.2377319335938
+            ],
+            "candidate_us": [
+              5592.8472900390625,
+              5589.227294921875,
+              5574.0289306640625,
+              5585.650634765625,
+              5571.0736083984375,
+              5585.029296875,
+              5584.8126220703125,
+              5583.92333984375,
+              5587.4298095703125,
+              5581.1175537109375,
+              5582.9534912109375
+            ],
+            "speedup": 0.6336006715863168,
+            "lower_bound": 0.6314288194381811,
+            "baseline_cv": 0.002366749174523946,
+            "candidate_cv": 0.0011250000730758825,
+            "accepted": false,
+            "reasons": [
+              "99% bootstrap lower bound 0.6314 <= 1.0300"
+            ]
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "cd84c21184a01c028709499702ded727f7f85b7a101fef7fe00f968ac73ed1aa",
+          "family": "mxfp4_moe_prefill",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 8,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": true,
+          "benchmark": {
+            "family": "mxfp4_moe_prefill",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 8,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              3544.7695922851562,
+              3536.3223266601562,
+              3533.02734375,
+              3539.05029296875,
+              3538.5696411132812,
+              3541.5576171875,
+              3546.6055297851562,
+              3536.915283203125,
+              3545.7809448242188,
+              3543.8311767578125,
+              3539.3624877929688
+            ],
+            "candidate_us": [
+              3411.253662109375,
+              3409.5022583007812,
+              3412.293701171875,
+              3410.6201171875,
+              3412.5054931640625,
+              3426.2353515625,
+              3409.3527221679688,
+              3427.5711059570312,
+              3410.5416870117188,
+              3406.6281127929688,
+              3413.1814575195312
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              3544.7695922851562,
+              3536.3223266601562,
+              3533.02734375,
+              3539.05029296875,
+              3538.5696411132812,
+              3541.5576171875,
+              3546.6055297851562,
+              3536.915283203125,
+              3545.7809448242188,
+              3543.8311767578125,
+              3539.3624877929688
+            ],
+            "candidate_us": [
+              3411.253662109375,
+              3409.5022583007812,
+              3412.293701171875,
+              3410.6201171875,
+              3412.5054931640625,
+              3426.2353515625,
+              3409.3527221679688,
+              3427.5711059570312,
+              3410.5416870117188,
+              3406.6281127929688,
+              3413.1814575195312
+            ],
+            "speedup": 1.0371960652176189,
+            "lower_bound": 1.0353819609773514,
+            "baseline_cv": 0.0012274726588814976,
+            "candidate_cv": 0.0019978328218407046,
+            "accepted": true,
+            "reasons": []
+          },
+          "confirmation": {
+            "family": "mxfp4_moe_prefill",
+            "seed": 73,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 8,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              3535.347900390625,
+              3525.5807495117188,
+              3517.335205078125,
+              3522.1200561523438,
+              3521.5872192382812,
+              3522.4575805664062,
+              3526.787109375,
+              3518.4768676757812,
+              3521.6598510742188,
+              3519.0744018554688,
+              3519.9368286132812
+            ],
+            "candidate_us": [
+              3402.6327514648438,
+              3406.6232299804688,
+              3412.6815795898438,
+              3397.3568725585938,
+              3402.0697021484375,
+              3400.7568359375,
+              3383.2159423828125,
+              3400.9640502929688,
+              3398.2888793945312,
+              3407.07763671875,
+              3409.7207641601562
+            ]
+          },
+          "confirmation_measurement": {
+            "baseline_us": [
+              3535.347900390625,
+              3525.5807495117188,
+              3517.335205078125,
+              3522.1200561523438,
+              3521.5872192382812,
+              3522.4575805664062,
+              3526.787109375,
+              3518.4768676757812,
+              3521.6598510742188,
+              3519.0744018554688,
+              3519.9368286132812
+            ],
+            "candidate_us": [
+              3402.6327514648438,
+              3406.6232299804688,
+              3412.6815795898438,
+              3397.3568725585938,
+              3402.0697021484375,
+              3400.7568359375,
+              3383.2159423828125,
+              3400.9640502929688,
+              3398.2888793945312,
+              3407.07763671875,
+              3409.7207641601562
+            ],
+            "speedup": 1.0351308255131773,
+            "lower_bound": 1.0328717972052375,
+            "baseline_cv": 0.0014335876368557138,
+            "candidate_cv": 0.0022996263294356033,
+            "accepted": true,
+            "reasons": []
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "4f37bc1006f7fc0ab3320c2c72f848f833bf830ea2a7c904776d64ea3d3bf3bf",
+          "family": "mxfp4_moe_prefill",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 64,
+            "moe_num_warps": 8,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": false,
+          "benchmark": {
+            "family": "mxfp4_moe_prefill",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 64,
+              "moe_num_warps": 8,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              3537.0095825195312,
+              3531.4456176757812,
+              3537.4990844726562,
+              3519.654541015625,
+              3540.5999755859375,
+              3541.2423706054688,
+              3535.61767578125,
+              3535.394287109375,
+              3537.659912109375,
+              3533.6318969726562,
+              3535.4208374023438
+            ],
+            "candidate_us": [
+              5466.33056640625,
+              5469.2474365234375,
+              5461.318359375,
+              5468.4063720703125,
+              5474.6319580078125,
+              5473.4478759765625,
+              5459.083251953125,
+              5467.8936767578125,
+              5478.66943359375,
+              5463.4381103515625,
+              5461.65283203125
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              3537.0095825195312,
+              3531.4456176757812,
+              3537.4990844726562,
+              3519.654541015625,
+              3540.5999755859375,
+              3541.2423706054688,
+              3535.61767578125,
+              3535.394287109375,
+              3537.659912109375,
+              3533.6318969726562,
+              3535.4208374023438
+            ],
+            "candidate_us": [
+              5466.33056640625,
+              5469.2474365234375,
+              5461.318359375,
+              5468.4063720703125,
+              5474.6319580078125,
+              5473.4478759765625,
+              5459.083251953125,
+              5467.8936767578125,
+              5478.66943359375,
+              5463.4381103515625,
+              5461.65283203125
+            ],
+            "speedup": 0.6467780590902078,
+            "lower_bound": 0.6457151604032507,
+            "baseline_cv": 0.0016455632221931242,
+            "candidate_cv": 0.0011213357741261623,
+            "accepted": false,
+            "reasons": [
+              "99% bootstrap lower bound 0.6457 <= 1.0300"
+            ]
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "e6558fcd49807ebb7579129b65a44c6feac30d7bd323b431426a5d80cbcecab7",
+          "family": "icn_allreduce",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 16,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 262144,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": false,
+          "benchmark": {
+            "family": "icn_allreduce",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 8,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 16,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 262144,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              87.08639780680339,
+              36.30400021870931,
+              36.383466720581055,
+              36.068267822265625,
+              36.22933387756348,
+              35.97599983215332,
+              36.769065856933594,
+              36.24426523844401,
+              36.572265625,
+              36.27840042114258,
+              36.0698668162028
+            ],
+            "candidate_us": [
+              59.75733439127604,
+              58.46346537272135,
+              66.63946787516277,
+              58.798936208089195,
+              58.40319951375326,
+              58.86079788208008,
+              60.040531158447266,
+              58.554134368896484,
+              58.870932261149086,
+              58.333333333333336,
+              58.73919804890951
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              87.08639780680339,
+              36.30400021870931,
+              36.383466720581055,
+              36.068267822265625,
+              36.22933387756348,
+              35.97599983215332,
+              36.769065856933594,
+              36.24426523844401,
+              36.572265625,
+              36.27840042114258,
+              36.0698668162028
+            ],
+            "candidate_us": [
+              59.75733439127604,
+              58.46346537272135,
+              66.63946787516277,
+              58.798936208089195,
+              58.40319951375326,
+              58.86079788208008,
+              60.040531158447266,
+              58.554134368896484,
+              58.870932261149086,
+              58.333333333333336,
+              58.73919804890951
+            ],
+            "speedup": 0.6189872949039221,
+            "lower_bound": 0.6124040735066091,
+            "baseline_cv": 0.3744443212801217,
+            "candidate_cv": 0.040295902056947684,
+            "accepted": false,
+            "reasons": [
+              "99% bootstrap lower bound 0.6124 <= 1.0300",
+              "Timing CV exceeds 10.0%; rerun on an idle GPU."
+            ]
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "26b99e5f269fcf1611e3de57db3f2e561512a30c8948c4b7a19e776118d49ef5",
+          "family": "icn_allreduce",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 262144,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": false,
+          "benchmark": {
+            "family": "icn_allreduce",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 8,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 262144,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              41.774400075276695,
+              37.02293395996094,
+              36.468801498413086,
+              37.372798919677734,
+              36.2224006652832,
+              36.65013313293457,
+              36.66826566060384,
+              36.966400146484375,
+              36.49493217468262,
+              38.121067682902016,
+              36.4575990041097
+            ],
+            "candidate_us": [
+              59.9882698059082,
+              59.47359720865885,
+              61.48266474405924,
+              59.45066452026367,
+              59.725869496663414,
+              59.731197357177734,
+              59.40213521321615,
+              59.503466288248696,
+              59.62560017903646,
+              59.54986572265625,
+              59.54079945882162
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              41.774400075276695,
+              37.02293395996094,
+              36.468801498413086,
+              37.372798919677734,
+              36.2224006652832,
+              36.65013313293457,
+              36.66826566060384,
+              36.966400146484375,
+              36.49493217468262,
+              38.121067682902016,
+              36.4575990041097
+            ],
+            "candidate_us": [
+              59.9882698059082,
+              59.47359720865885,
+              61.48266474405924,
+              59.45066452026367,
+              59.725869496663414,
+              59.731197357177734,
+              59.40213521321615,
+              59.503466288248696,
+              59.62560017903646,
+              59.54986572265625,
+              59.54079945882162
+            ],
+            "speedup": 0.6172886804319059,
+            "lower_bound": 0.6064775778158703,
+            "baseline_cv": 0.04232889027501182,
+            "candidate_cv": 0.009901338041994244,
+            "accepted": false,
+            "reasons": [
+              "99% bootstrap lower bound 0.6065 <= 1.0300"
+            ]
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "0ccf9a445413ddbdbcfd84b365e3ddb1b3cae4f2b2692468d588e968a393adae",
+          "family": "icn_allreduce",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 16,
+            "ar_threads": 512,
+            "ar_oneshot_max_bytes": 262144,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": false,
+          "benchmark": {
+            "family": "icn_allreduce",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 8,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 16,
+              "ar_threads": 512,
+              "ar_oneshot_max_bytes": 262144,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              46.68586730957031,
+              35.946667989095054,
+              36.506665547688804,
+              36.23573303222656,
+              36.24693234761556,
+              36.633599599202476,
+              36.0421339670817,
+              36.06719970703125,
+              36.57279968261719,
+              36.79999987284342,
+              36.40159924825033
+            ],
+            "candidate_us": [
+              62.306130727132164,
+              62.37759908040365,
+              61.83680216471354,
+              62.22026824951172,
+              62.29759852091471,
+              62.33013153076172,
+              62.8602663675944,
+              61.98560078938802,
+              62.53013610839844,
+              61.679464975992836,
+              62.37866719563802
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              46.68586730957031,
+              35.946667989095054,
+              36.506665547688804,
+              36.23573303222656,
+              36.24693234761556,
+              36.633599599202476,
+              36.0421339670817,
+              36.06719970703125,
+              36.57279968261719,
+              36.79999987284342,
+              36.40159924825033
+            ],
+            "candidate_us": [
+              62.306130727132164,
+              62.37759908040365,
+              61.83680216471354,
+              62.22026824951172,
+              62.29759852091471,
+              62.33013153076172,
+              62.8602663675944,
+              61.98560078938802,
+              62.53013610839844,
+              61.679464975992836,
+              62.37866719563802
+            ],
+            "speedup": 0.583558464532179,
+            "lower_bound": 0.5762752738007826,
+            "baseline_cv": 0.08392899044521646,
+            "candidate_cv": 0.005235551653512544,
+            "accepted": false,
+            "reasons": [
+              "99% bootstrap lower bound 0.5763 <= 1.0300"
+            ]
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "963fe89afd628d937f9f114c1483b3b950e8a1d57b4ecf032db06a310a4d82da",
+          "family": "icn_allreduce",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 4,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": false,
+          "benchmark": {
+            "family": "icn_allreduce",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 8,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 4,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              41.622934341430664,
+              36.521600087483726,
+              36.00053469340006,
+              36.26666704813639,
+              36.1733341217041,
+              36.91306749979655,
+              57.3088010152181,
+              36.49226824442545,
+              36.05973243713379,
+              37.01333363850912,
+              36.011199951171875
+            ],
+            "candidate_us": [
+              37.64320055643717,
+              37.36000061035156,
+              39.769598642985024,
+              37.536001205444336,
+              40.92906634012858,
+              37.66613324483236,
+              49.35200055440267,
+              37.24853197733561,
+              37.57866541544596,
+              37.21439997355143,
+              39.01813189188639
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              41.622934341430664,
+              36.521600087483726,
+              36.00053469340006,
+              36.26666704813639,
+              36.1733341217041,
+              36.91306749979655,
+              57.3088010152181,
+              36.49226824442545,
+              36.05973243713379,
+              37.01333363850912,
+              36.011199951171875
+            ],
+            "candidate_us": [
+              37.64320055643717,
+              37.36000061035156,
+              39.769598642985024,
+              37.536001205444336,
+              40.92906634012858,
+              37.66613324483236,
+              49.35200055440267,
+              37.24853197733561,
+              37.57866541544596,
+              37.21439997355143,
+              39.01813189188639
+            ],
+            "speedup": 0.9775588728808656,
+            "lower_bound": 0.9052275084941098,
+            "baseline_cv": 0.16402551189394443,
+            "candidate_cv": 0.09114356416895888,
+            "accepted": false,
+            "reasons": [
+              "99% bootstrap lower bound 0.9052 <= 1.0300",
+              "Timing CV exceeds 10.0%; rerun on an idle GPU."
+            ]
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "341477ed3e762bf67f5ac2813fa59e8625475af97ce65740d0e9a0829cc9abd9",
+          "family": "mxfp4_moe_decode",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 128,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": false,
+          "benchmark": {
+            "family": "mxfp4_moe_decode",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 128,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              1707.4639892578125,
+              1703.6631774902344,
+              1699.6528625488281,
+              1698.939208984375,
+              1701.7552185058594,
+              1700.540771484375,
+              1703.5159301757812,
+              1703.203125,
+              1701.9279479980469,
+              1699.8304748535156,
+              1704.925537109375
+            ],
+            "candidate_us": [
+              1700.9367370605469,
+              1701.2583923339844,
+              1702.4903869628906,
+              1706.32080078125,
+              1701.650390625,
+              1704.8231506347656,
+              1702.9840087890625,
+              1703.3720397949219,
+              1703.5615539550781,
+              1705.1104736328125,
+              1705.1144409179688
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              1707.4639892578125,
+              1703.6631774902344,
+              1699.6528625488281,
+              1698.939208984375,
+              1701.7552185058594,
+              1700.540771484375,
+              1703.5159301757812,
+              1703.203125,
+              1701.9279479980469,
+              1699.8304748535156,
+              1704.925537109375
+            ],
+            "candidate_us": [
+              1700.9367370605469,
+              1701.2583923339844,
+              1702.4903869628906,
+              1706.32080078125,
+              1701.650390625,
+              1704.8231506347656,
+              1702.9840087890625,
+              1703.3720397949219,
+              1703.5615539550781,
+              1705.1104736328125,
+              1705.1144409179688
+            ],
+            "speedup": 0.9998892134134457,
+            "lower_bound": 0.9974880801279615,
+            "baseline_cv": 0.0015050566182439025,
+            "candidate_cv": 0.0010362724618953718,
+            "accepted": false,
+            "reasons": [
+              "99% bootstrap lower bound 0.9975 <= 1.0300"
+            ]
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "fcd93e3a7ae08793ecdb20b8844b0d6a7c2eac2cc6a6ee9721459ae0b7646956",
+          "family": "mxfp4_moe_decode",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 512,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": false,
+          "benchmark": {
+            "family": "mxfp4_moe_decode",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 512,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              1710.7368469238281,
+              1701.4791870117188,
+              1702.4639892578125,
+              1701.5583801269531,
+              1699.0144348144531,
+              1699.0391540527344,
+              1702.3887634277344,
+              1703.4759521484375,
+              1701.2344360351562,
+              1699.3879699707031,
+              1701.5536499023438
+            ],
+            "candidate_us": [
+              1699.4767761230469,
+              1699.7880554199219,
+              1699.8080444335938,
+              1697.2639465332031,
+              1696.8280029296875,
+              1700.9544372558594,
+              1698.4231567382812,
+              1694.6232604980469,
+              1698.7936401367188,
+              1697.7767944335938,
+              1699.0519714355469
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              1710.7368469238281,
+              1701.4791870117188,
+              1702.4639892578125,
+              1701.5583801269531,
+              1699.0144348144531,
+              1699.0391540527344,
+              1702.3887634277344,
+              1703.4759521484375,
+              1701.2344360351562,
+              1699.3879699707031,
+              1701.5536499023438
+            ],
+            "candidate_us": [
+              1699.4767761230469,
+              1699.7880554199219,
+              1699.8080444335938,
+              1697.2639465332031,
+              1696.8280029296875,
+              1700.9544372558594,
+              1698.4231567382812,
+              1694.6232604980469,
+              1698.7936401367188,
+              1697.7767944335938,
+              1699.0519714355469
+            ],
+            "speedup": 1.0014723966711172,
+            "lower_bound": 1.0009949073276545,
+            "baseline_cv": 0.0019003946044820375,
+            "candidate_cv": 0.001029513389397378,
+            "accepted": false,
+            "reasons": [
+              "99% bootstrap lower bound 1.0010 <= 1.0300"
+            ]
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "0ae004603c71a3bcacc6a20a428353c2c4ee847baa16d01596cb02fd6ab6d144",
+          "family": "mxfp4_moe_decode",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 32,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": true,
+          "benchmark": {
+            "family": "mxfp4_moe_decode",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 32,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              1715.2279663085938,
+              1703.5568237304688,
+              1701.6831970214844,
+              1700.3271484375,
+              1702.1383666992188,
+              1702.7471923828125,
+              1703.0320739746094,
+              1702.8799438476562,
+              1697.7928161621094,
+              1700.2264404296875,
+              1701.1239624023438
+            ],
+            "candidate_us": [
+              540.9415817260742,
+              541.3087844848633,
+              540.75439453125,
+              539.6672058105469,
+              541.2416076660156,
+              541.7375946044922,
+              542.2175979614258,
+              546.6128158569336,
+              541.5760040283203,
+              541.1608123779297,
+              541.5200042724609
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              1715.2279663085938,
+              1703.5568237304688,
+              1701.6831970214844,
+              1700.3271484375,
+              1702.1383666992188,
+              1702.7471923828125,
+              1703.0320739746094,
+              1702.8799438476562,
+              1697.7928161621094,
+              1700.2264404296875,
+              1701.1239624023438
+            ],
+            "candidate_us": [
+              540.9415817260742,
+              541.3087844848633,
+              540.75439453125,
+              539.6672058105469,
+              541.2416076660156,
+              541.7375946044922,
+              542.2175979614258,
+              546.6128158569336,
+              541.5760040283203,
+              541.1608123779297,
+              541.5200042724609
+            ],
+            "speedup": 3.1431217056773426,
+            "lower_bound": 3.140864627738928,
+            "baseline_cv": 0.0026091846467073713,
+            "candidate_cv": 0.003234936832275272,
+            "accepted": true,
+            "reasons": []
+          },
+          "confirmation": {
+            "family": "mxfp4_moe_decode",
+            "seed": 73,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 32,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              1644.5088195800781,
+              1636.1488342285156,
+              1633.9920043945312,
+              1633.0072021484375,
+              1636.297607421875,
+              1640.1544189453125,
+              1641.6351318359375,
+              1641.2263488769531,
+              1638.5679626464844,
+              1638.6015319824219,
+              1638.4103393554688
+            ],
+            "candidate_us": [
+              541.5935897827148,
+              541.3536071777344,
+              542.1416091918945,
+              541.7440032958984,
+              544.111213684082,
+              541.9095993041992,
+              542.8071975708008,
+              541.6136169433594,
+              542.2927856445312,
+              541.6999816894531,
+              542.1327972412109
+            ]
+          },
+          "confirmation_measurement": {
+            "baseline_us": [
+              1644.5088195800781,
+              1636.1488342285156,
+              1633.9920043945312,
+              1633.0072021484375,
+              1636.297607421875,
+              1640.1544189453125,
+              1641.6351318359375,
+              1641.2263488769531,
+              1638.5679626464844,
+              1638.6015319824219,
+              1638.4103393554688
+            ],
+            "candidate_us": [
+              541.5935897827148,
+              541.3536071777344,
+              542.1416091918945,
+              541.7440032958984,
+              544.111213684082,
+              541.9095993041992,
+              542.8071975708008,
+              541.6136169433594,
+              542.2927856445312,
+              541.6999816894531,
+              542.1327972412109
+            ],
+            "speedup": 3.0223292364455308,
+            "lower_bound": 3.0139579340352185,
+            "baseline_cv": 0.0020869687887496145,
+            "candidate_cv": 0.0014228465576467085,
+            "accepted": true,
+            "reasons": []
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "6f45494366eed4d492af0305c3d1a0f66dfc572654c2bb1c6f925f7b642ed2ee",
+          "family": "mxfp4_moe_decode",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 8,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "accepted": false,
+          "benchmark": {
+            "family": "mxfp4_moe_decode",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 8,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              1727.9312133789062,
+              1702.4607849121094,
+              1700.8175659179688,
+              1708.179931640625,
+              1701.8400573730469,
+              1699.320068359375,
+              1701.1520385742188,
+              1702.6719665527344,
+              1704.5559692382812,
+              1700.162353515625,
+              1698.326416015625
+            ],
+            "candidate_us": [
+              1698.0072021484375,
+              1702.3768615722656,
+              1701.3888549804688,
+              1700.8096313476562,
+              1698.6279296875,
+              1702.9423522949219,
+              1704.2703247070312,
+              1705.821533203125,
+              1698.6824035644531,
+              1701.1296081542969,
+              1703.4423828125
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              1727.9312133789062,
+              1702.4607849121094,
+              1700.8175659179688,
+              1708.179931640625,
+              1701.8400573730469,
+              1699.320068359375,
+              1701.1520385742188,
+              1702.6719665527344,
+              1704.5559692382812,
+              1700.162353515625,
+              1698.326416015625
+            ],
+            "candidate_us": [
+              1698.0072021484375,
+              1702.3768615722656,
+              1701.3888549804688,
+              1700.8096313476562,
+              1698.6279296875,
+              1702.9423522949219,
+              1704.2703247070312,
+              1705.821533203125,
+              1698.6824035644531,
+              1701.1296081542969,
+              1703.4423828125
+            ],
+            "speedup": 0.9996642219320835,
+            "lower_bound": 0.9981536364800856,
+            "baseline_cv": 0.004857182594679036,
+            "candidate_cv": 0.0014620868549035377,
+            "accepted": false,
+            "reasons": [
+              "99% bootstrap lower bound 0.9982 <= 1.0300"
+            ]
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "41ebc2aed7c695b9dfc4d0cac0a5a52d872f65d85482ad367184f0527e490cc0",
+          "family": "sparse_attn_tp8",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "triton_tp8"
+          },
+          "accepted": true,
+          "benchmark": {
+            "family": "sparse_attn_tp8",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "triton_tp8"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              216.45200729370117,
+              196.1359977722168,
+              194.9456024169922,
+              194.77840423583984,
+              195.25360107421875,
+              195.23359298706055,
+              208.08080673217773,
+              195.2280044555664,
+              196.59360885620117,
+              194.74960327148438,
+              194.34240341186523
+            ],
+            "candidate_us": [
+              82.1183967590332,
+              80.3872013092041,
+              80.96240043640137,
+              80.6991958618164,
+              80.73840141296387,
+              80.57920455932617,
+              80.82400321960449,
+              80.51039695739746,
+              80.94240188598633,
+              80.71999549865723,
+              80.75920104980469
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              216.45200729370117,
+              196.1359977722168,
+              194.9456024169922,
+              194.77840423583984,
+              195.25360107421875,
+              195.23359298706055,
+              208.08080673217773,
+              195.2280044555664,
+              196.59360885620117,
+              194.74960327148438,
+              194.34240341186523
+            ],
+            "candidate_us": [
+              82.1183967590332,
+              80.3872013092041,
+              80.96240043640137,
+              80.6991958618164,
+              80.73840141296387,
+              80.57920455932617,
+              80.82400321960449,
+              80.51039695739746,
+              80.94240188598633,
+              80.71999549865723,
+              80.75920104980469
+            ],
+            "speedup": 2.4228781365460175,
+            "lower_bound": 2.4126562702140393,
+            "baseline_cv": 0.036102898548246394,
+            "candidate_cv": 0.005658938476565853,
+            "accepted": true,
+            "reasons": []
+          },
+          "confirmation": {
+            "family": "sparse_attn_tp8",
+            "seed": 73,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "triton_tp8"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              216.39360427856445,
+              207.44720458984375,
+              206.60640716552734,
+              206.3991928100586,
+              206.30159378051758,
+              206.6983985900879,
+              206.26399993896484,
+              206.8199920654297,
+              207.36000061035156,
+              207.41039276123047,
+              206.40079498291016
+            ],
+            "candidate_us": [
+              81.78560256958008,
+              80.80400466918945,
+              80.82559585571289,
+              80.56320190429688,
+              80.79360008239746,
+              80.76560020446777,
+              80.72319984436035,
+              80.5247974395752,
+              80.69199562072754,
+              80.57040214538574,
+              80.79919815063477
+            ]
+          },
+          "confirmation_measurement": {
+            "baseline_us": [
+              216.39360427856445,
+              207.44720458984375,
+              206.60640716552734,
+              206.3991928100586,
+              206.30159378051758,
+              206.6983985900879,
+              206.26399993896484,
+              206.8199920654297,
+              207.36000061035156,
+              207.41039276123047,
+              206.40079498291016
+            ],
+            "candidate_us": [
+              81.78560256958008,
+              80.80400466918945,
+              80.82559585571289,
+              80.56320190429688,
+              80.79360008239746,
+              80.76560020446777,
+              80.72319984436035,
+              80.5247974395752,
+              80.69199562072754,
+              80.57040214538574,
+              80.79919815063477
+            ],
+            "speedup": 2.5619536951280257,
+            "lower_bound": 2.555200987283153,
+            "baseline_cv": 0.014137823664420266,
+            "candidate_cv": 0.004242485818052332,
+            "accepted": true,
+            "reasons": []
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "e0d8cea5d9b036003c3e6fcd9763bdd974a42eef6868d9225477131f01297a43",
+          "family": "sparse_attn_tp8",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "hggc_tp8"
+          },
+          "accepted": false,
+          "benchmark": {
+            "family": "sparse_attn_tp8",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "hggc_tp8"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              203.50160598754883,
+              195.79439163208008,
+              195.03759384155273,
+              195.27999877929688,
+              194.95599746704102,
+              195.0632095336914,
+              194.55999374389648,
+              196.55439376831055,
+              194.44799423217773,
+              194.8695945739746,
+              194.47599411010742
+            ],
+            "candidate_us": [
+              320.0672149658203,
+              320.0263977050781,
+              320.25440216064453,
+              320.0151824951172,
+              320.06160736083984,
+              319.89599227905273,
+              320.1327896118164,
+              320.11600494384766,
+              320.1679992675781,
+              319.9600028991699,
+              319.99040603637695
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              203.50160598754883,
+              195.79439163208008,
+              195.03759384155273,
+              195.27999877929688,
+              194.95599746704102,
+              195.0632095336914,
+              194.55999374389648,
+              196.55439376831055,
+              194.44799423217773,
+              194.8695945739746,
+              194.47599411010742
+            ],
+            "candidate_us": [
+              320.0672149658203,
+              320.0263977050781,
+              320.25440216064453,
+              320.0151824951172,
+              320.06160736083984,
+              319.89599227905273,
+              320.1327896118164,
+              320.11600494384766,
+              320.1679992675781,
+              319.9600028991699,
+              319.99040603637695
+            ],
+            "speedup": 0.6091202224303216,
+            "lower_bound": 0.6077557028006618,
+            "baseline_cv": 0.013306165184453279,
+            "candidate_cv": 0.0003167108969131459,
+            "accepted": false,
+            "reasons": [
+              "99% bootstrap lower bound 0.6078 <= 1.0300"
+            ]
+          }
+        },
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "58a7caacc2e507987f62fbf327e57f02de2d1b2fc37d1e8729fcf329586e931a",
+          "family": "sparse_attn_tp8",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "flash_mla"
+          },
+          "accepted": false,
+          "benchmark": {
+            "family": "sparse_attn_tp8",
+            "seed": 31,
+            "rounds": 11,
+            "iterations": 25,
+            "world_size": 1,
+            "baseline_config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "auto"
+            },
+            "config": {
+              "ar_blocks": 8,
+              "ar_threads": 256,
+              "ar_oneshot_max_bytes": 131072,
+              "moe_gemv_max_rows": 16,
+              "moe_gemv_threads": 256,
+              "moe_block_m": 32,
+              "moe_num_warps": 4,
+              "sparse_attn_backend": "flash_mla"
+            },
+            "inputs_unchanged": true,
+            "reference_ok": true,
+            "ranks_agree": true,
+            "baseline_us": [
+              208.85919570922852,
+              201.89119338989258,
+              201.42160415649414,
+              202.09840774536133,
+              201.99520111083984,
+              201.12720489501953,
+              215.82399368286133,
+              201.76080703735352,
+              201.82479858398438,
+              201.83439254760742,
+              201.6152000427246
+            ],
+            "candidate_us": [
+              356.9432067871094,
+              384.5423889160156,
+              355.95760345458984,
+              356.78958892822266,
+              356.7144012451172,
+              356.13040924072266,
+              356.1824035644531,
+              356.5856170654297,
+              355.54561614990234,
+              355.70640563964844,
+              376.30001068115234
+            ]
+          },
+          "measurement": {
+            "baseline_us": [
+              208.85919570922852,
+              201.89119338989258,
+              201.42160415649414,
+              202.09840774536133,
+              201.99520111083984,
+              201.12720489501953,
+              215.82399368286133,
+              201.76080703735352,
+              201.82479858398438,
+              201.83439254760742,
+              201.6152000427246
+            ],
+            "candidate_us": [
+              356.9432067871094,
+              384.5423889160156,
+              355.95760345458984,
+              356.78958892822266,
+              356.7144012451172,
+              356.13040924072266,
+              356.1824035644531,
+              356.5856170654297,
+              355.54561614990234,
+              355.70640563964844,
+              376.30001068115234
+            ],
+            "speedup": 0.566265899009887,
+            "lower_bound": 0.5647571779220619,
+            "baseline_cv": 0.022460842559021855,
+            "candidate_cv": 0.027577435557183127,
+            "accepted": false,
+            "reasons": [
+              "99% bootstrap lower bound 0.5648 <= 1.0300"
+            ]
+          }
+        }
+      ],
+      "proposals": [
+        {
+          "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+          "key": "00c9ba3a08a0ac94eac299425864fd1a9b56fff35f9481965c482e15810511b7",
+          "incumbent": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "candidate": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 32,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 16,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "triton_tp8"
+          },
+          "approved": true,
+          "tokens_match": true,
+          "trials": [
+            {
+              "order": [
+                "baseline",
+                "candidate"
+              ],
+              "tokens_match": true,
+              "baseline_tier_wall_us": 46543680.0,
+              "candidate_tier_wall_us": 29452863.0,
+              "baseline_out_tok_s": 66.0,
+              "candidate_out_tok_s": 104.3
+            },
+            {
+              "order": [
+                "candidate",
+                "baseline"
+              ],
+              "tokens_match": true,
+              "baseline_tier_wall_us": 46793763.0,
+              "candidate_tier_wall_us": 29429467.0,
+              "baseline_out_tok_s": 65.65,
+              "candidate_out_tok_s": 104.39
+            },
+            {
+              "order": [
+                "baseline",
+                "candidate"
+              ],
+              "tokens_match": true,
+              "baseline_tier_wall_us": 47193615.0,
+              "candidate_tier_wall_us": 29416225.0,
+              "baseline_out_tok_s": 65.09,
+              "candidate_out_tok_s": 104.43
+            },
+            {
+              "order": [
+                "candidate",
+                "baseline"
+              ],
+              "tokens_match": true,
+              "baseline_tier_wall_us": 46151001.0,
+              "candidate_tier_wall_us": 29402168.0,
+              "baseline_out_tok_s": 66.56,
+              "candidate_out_tok_s": 104.48
+            },
+            {
+              "order": [
+                "baseline",
+                "candidate"
+              ],
+              "tokens_match": true,
+              "baseline_tier_wall_us": 46642181.0,
+              "candidate_tier_wall_us": 29436376.0,
+              "baseline_out_tok_s": 65.86,
+              "candidate_out_tok_s": 104.36
+            }
+          ],
+          "measurement": {
+            "baseline_us": [
+              46543680.0,
+              46793763.0,
+              47193615.0,
+              46151001.0,
+              46642181.0
+            ],
+            "candidate_us": [
+              29452863.0,
+              29429467.0,
+              29416225.0,
+              29402168.0,
+              29436376.0
+            ],
+            "speedup": 1.5845082628377896,
+            "lower_bound": 1.5696461907162764,
+            "baseline_cv": 0.008127989401675093,
+            "candidate_cv": 0.0006569016399898277,
+            "accepted": true,
+            "reasons": []
+          }
+        }
+      ],
+      "winners": [
+        {
+          "family": "mxfp4_moe_prefill",
+          "policy": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 16,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "speedup": 1.2742632329169419,
+          "predicted_saving_us": 1905088.3423943315
+        },
+        {
+          "family": "mxfp4_moe_decode",
+          "policy": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 32,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "auto"
+          },
+          "speedup": 3.0223292364455308,
+          "predicted_saving_us": 3325950.373408905
+        },
+        {
+          "family": "sparse_attn_tp8",
+          "policy": {
+            "version": 1,
+            "ar_blocks": 8,
+            "ar_threads": 256,
+            "ar_oneshot_max_bytes": 131072,
+            "moe_gemv_max_rows": 16,
+            "moe_gemv_threads": 256,
+            "moe_block_m": 32,
+            "moe_num_warps": 4,
+            "sparse_attn_backend": "triton_tp8"
+          },
+          "speedup": 2.5619536951280257,
+          "predicted_saving_us": 1560154.7491259363
+        }
+      ]
+    }
+  ],
+  "capability_gaps": [
+    {
+      "name": "engram_indexer_mhc",
+      "supported": false,
+      "calls_per_rank": 28036,
+      "estimated_total_us": 18509624.88,
+      "reason": "Stateless Engram/Indexer/mHC kernels have no parameterized policy family yet",
+      "share": 0.442302
+    }
+  ],
+  "evaluations": 15,
+  "model_evaluations": 1,
+  "incumbent": {
+    "version": 1,
+    "ar_blocks": 8,
+    "ar_threads": 256,
+    "ar_oneshot_max_bytes": 131072,
+    "moe_gemv_max_rows": 32,
+    "moe_gemv_threads": 256,
+    "moe_block_m": 16,
+    "moe_num_warps": 4,
+    "sparse_attn_backend": "triton_tp8"
+  },
+  "stop_reason": "cycle_budget",
+  "provenance": {
+    "source": "b82a36ab0d5f9f0584f2c79def905669e0f87cea294dbd237a722d7d185b8d15",
+    "controller": "efb4d05bc3d650f26b8bd4df2bdcbbdcd07c915e6027a6785fc3bdf74ce6879b",
+    "environment": "PPU 0: PPU-ZW810E (UUID: GPU-019e2226-8390-0608-0000-0000a0e50426)\nPPU 1: PPU-ZW810E (UUID: GPU-019e2226-0311-041a-0000-000060ae215f)\nPPU 2: PPU-ZW810E (UUID: GPU-019e4205-0711-0428-0000-00004051b377)\nPPU 3: PPU-ZW810E (UUID: GPU-019e2226-8310-022c-0000-0000a03e8007)\nPPU 4: PPU-ZW810E (UUID: GPU-019e2226-01e1-0810-0000-0000e07d6a4a)\nPPU 5: PPU-ZW810E (UUID: GPU-019e2226-0101-090c-0000-0000e047ef17)\nPPU 6: PPU-ZW810E (UUID: GPU-019e2226-0620-050a-0000-000080d79844)\nPPU 7: PPU-ZW810E (UUID: GPU-019e2226-8320-002c-0000-0000c0f9de47)"
+  },
+  "context": "28d865032c733d52af53bcaf654304432e6e9bcd43e0da6d03732bc1a82dce19",
+  "elapsed_sec": 3121.3620920050016
+}
