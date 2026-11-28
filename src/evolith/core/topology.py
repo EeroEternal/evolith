@@ -54,6 +54,36 @@ class LossyQualityGateSpec(BaseModel):
         return (len(reasons) == 0), tuple(reasons)
 
 
+class LosslessKvCodecGateSpec(BaseModel):
+    """Strict bit-exactness and compression contract for `LOSSLESS` KV-cache codecs (`P4`)."""
+
+    min_compression_ratio: float = Field(default=1.15, gt=1.0)
+    require_crc32_verification: bool = True
+
+    def evaluate(
+        self,
+        *,
+        mismatched_bytes: int,
+        decode_err_flag: int = 0,
+        crc32_verified: bool = True,
+        measured_compression_ratio: float,
+    ) -> tuple[bool, tuple[str, ...]]:
+        reasons: list[str] = []
+        if mismatched_bytes != 0:
+            reasons.append(
+                f"Lossless KV codec violated 0-ULP roundtrip ({mismatched_bytes} mismatched bytes)"
+            )
+        if decode_err_flag != 0:
+            reasons.append(f"Lossless KV codec reported non-zero decode_err_flag={decode_err_flag}")
+        if self.require_crc32_verification and not crc32_verified:
+            reasons.append("Lossless KV codec missing CRC32 packet verification")
+        if measured_compression_ratio < self.min_compression_ratio:
+            reasons.append(
+                f"KV compression ratio {measured_compression_ratio:.4f}x < {self.min_compression_ratio:.4f}x"
+            )
+        return (len(reasons) == 0), tuple(reasons)
+
+
 class InterconnectTier(StrEnum):
     """Topology class derived purely from peer P2P graph and NUMA island layout."""
 
@@ -84,6 +114,8 @@ class HardwareTopologySnapshot(BaseModel):
     green_context_supported: bool = False  # Hardware CU/SM partitioning (CUDA 13 GreenCtx / ROCm CU mask)
     min_sm_partition_size: int = Field(default=0, ge=0)
     sm_coscheduled_alignment: int = Field(default=0, ge=0)
+    vmm_peer_arena_supported: bool = False  # Fixed-VA cuMemCreate/cuMemMap POSIX-FD peer arena
+    vmm_granularity_bytes: int = Field(default=0, ge=0)
     toolchain_version: str = ""  # e.g. "cuda-13.0", "cuda-12.9", "rocm-6.3"
 
     @model_validator(mode="after")
@@ -210,5 +242,16 @@ class HardwareTopologySnapshot(BaseModel):
                 f"Hardware compute-unit partitioning supported (min_partition={self.min_sm_partition_size}, "
                 f"coscheduled_align={align} out of {self.compute_units_per_device}): isolate TBO/async "
                 "collective streams in a small partition only where empirically faster than shared scheduling."
+            )
+        if self.vmm_peer_arena_supported:
+            gran_mib = (
+                f"{self.vmm_granularity_bytes / (1024 * 1024):.1f} MiB"
+                if self.vmm_granularity_bytes > 0
+                else "driver-default"
+            )
+            notes.append(
+                f"VMM POSIX-FD peer arena supported (granularity={gran_mib}): map P2P-connected peer "
+                "buffers at fixed virtual addresses via cuMemCreate/cuMemMap while preserving SHM fallback "
+                "across non-P2P hops."
             )
         return tuple(notes)

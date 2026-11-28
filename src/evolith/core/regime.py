@@ -16,7 +16,11 @@ from collections.abc import Sequence
 
 from pydantic import BaseModel, Field
 
-from evolith.core.topology import HardwareTopologySnapshot, PrecisionTrack
+from evolith.core.topology import (
+    HardwareTopologySnapshot,
+    LossyQualityGateSpec,
+    PrecisionTrack,
+)
 from evolith.models import EvolutionPlane
 
 
@@ -232,6 +236,9 @@ class BackendCellMeasurement(BaseModel):
     vram_used_mib: float | None = Field(default=None, ge=0.0)
     p99_itl_ms: float | None = Field(default=None, ge=0.0)
     ttft_ms: float | None = Field(default=None, ge=0.0)
+    kv_compression_ratio: float | None = Field(default=None, gt=0.0)
+    lossy_kl_divergence: float | None = Field(default=None, ge=0.0)
+    lossy_ppl_delta: float | None = Field(default=None, ge=0.0)
     passed_correctness: bool = True
     precision_track: PrecisionTrack = PrecisionTrack.LOSSLESS
 
@@ -285,6 +292,7 @@ class PiecewisePolicySynthesizer:
         max_vram_used_mib: float | None = None,
         max_p99_itl_ms: float | None = None,
         max_ttft_ms: float | None = None,
+        lossy_quality_gate: LossyQualityGateSpec | None = None,
     ) -> None:
         if min_speedup_guardband < 1.0:
             raise ValueError("min_speedup_guardband must be >= 1.0 to forbid regressions")
@@ -294,12 +302,15 @@ class PiecewisePolicySynthesizer:
             raise ValueError("max_p99_itl_ms must be > 0.0 when specified")
         if max_ttft_ms is not None and max_ttft_ms <= 0.0:
             raise ValueError("max_ttft_ms must be > 0.0 when specified")
+        if allowed_track == PrecisionTrack.CALIBRATED_LOSSY and lossy_quality_gate is None:
+            lossy_quality_gate = LossyQualityGateSpec()
         self.incumbent_backend = incumbent_backend
         self.allowed_track = allowed_track
         self.min_speedup_guardband = min_speedup_guardband
         self.max_vram_used_mib = max_vram_used_mib
         self.max_p99_itl_ms = max_p99_itl_ms
         self.max_ttft_ms = max_ttft_ms
+        self.lossy_quality_gate = lossy_quality_gate
 
     def synthesize(
         self,
@@ -342,6 +353,22 @@ class PiecewisePolicySynthesizer:
                         f"{cand.backend_id}@({phase},B={batch_tokens},L={seq_len}):lossy_track_blocked"
                     )
                     continue
+                if cand.precision_track == PrecisionTrack.CALIBRATED_LOSSY:
+                    assert self.lossy_quality_gate is not None
+                    if cand.lossy_kl_divergence is None or cand.lossy_ppl_delta is None:
+                        rejected.add(
+                            f"{cand.backend_id}@({phase},B={batch_tokens},L={seq_len}):lossy_quality_metrics_missing"
+                        )
+                        continue
+                    q_ok, _ = self.lossy_quality_gate.evaluate(
+                        measured_kl=cand.lossy_kl_divergence,
+                        measured_ppl_delta=cand.lossy_ppl_delta,
+                    )
+                    if not q_ok:
+                        rejected.add(
+                            f"{cand.backend_id}@({phase},B={batch_tokens},L={seq_len}):lossy_quality_gate_failed"
+                        )
+                        continue
                 if (
                     self.max_vram_used_mib is not None
                     and cand.vram_used_mib is not None

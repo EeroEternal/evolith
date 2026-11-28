@@ -205,6 +205,52 @@ Raw Round 7 hardware scout, closed-loop 5-generation evolution lineage (`g0001..
 
 > **Capability-Boundary Note (`LOSSLESS TP=8` vs `CALIBRATED_LOSSY NVFP4 TP=4`)**: On lossless `475.25 GiB` `DeepSeek-V4.1-Flash` across `8 × RTX 6000D` (`TP=8` spanning dual-socket Xeon UPI), pure GPU 40-layer `8K` chunk execution now runs in `287.87 ms` (`28,457 tok/s` kernel rate) and end-to-end HTTP serving reaches `15,864.5 total tok/s` (`TTFT 462.7 ms` @ `8K`, `1,901.2 ms` @ `32K`). Reaching the `43.8K–58.0K tok/s` single-island workstation curve (`4 × RTX PRO 6000` running `NVFP4 + CSF` `TP=4` with zero cross-socket UPI, `--row-shard-attention`, and `16K` prepared prefill graphs) crosses into `PrecisionTrack.CALIBRATED_LOSSY` + `DP=2 × TP=4` single-socket topology, scheduled as an explicitly separated track in **Round 8 (`P7`)** alongside lossless `Latent576` GPU rANS KV compression (`P4`).
 
+---
+
+## 10. Round 8: SM120 Multi-Plane GPU rANS Lossless KV Codec, CUDA 13 VMM Fixed-VA Peer Arena, Dual-Island `DP=2 × TP=4` Disaggregation Audit & Isolated `CALIBRATED_LOSSY` `NVFP4` Track (`zstep@e9f2b63` Incumbent)
+
+Raw Round 8 8-GPU hardware scout, lossless 3-Round Cold `AB/BA` + `TP=8` VMM/rANS verification, and explicitly separated `CALIBRATED_LOSSY` `NVFP4` artifacts:
+- Stage 1 8-GPU Hardware Scout (CUDA 13 VMM Peer Arena + Multi-Plane GPU rANS KV Codec + `b12x` `I=576` `NVFP4` vs `MXFP4` + Single-Socket `TP=4` vs Dual-Socket `TP=8` Collectives): [`docs/round8_stage1_rans_vmm_nvfp4_scout.json`](round8_stage1_rans_vmm_nvfp4_scout.json)
+- Track A1 (`LOSSLESS` Dual-Island `DP=2 × TP=4` vs `TP=8` 3-Round Cold `AB/BA`) + Track A2 (`LOSSLESS` `TP=8` `VmmPeerArena` Zero-Regression Guard + Live GPU rANS `HostDramKvTier`): [`docs/round8_multi_regime_abba_results.json`](round8_multi_regime_abba_results.json)
+- Track B (`PrecisionTrack.CALIBRATED_LOSSY` `LibertAIDAI NVFP4 + MXFP4 Engram` Dual-Island `DP=2 × TP=4` Cold `AB/BA` & `LossyQualityGateSpec` Audit): [`docs/round8_lossy_nvfp4_dp2tp4_results.json`](round8_lossy_nvfp4_dp2tp4_results.json)
+
+### 10.1 Evolith Codec, VMM, Dual-Island `DP=2 × TP=4` & `LossyQualityGateSpec` Primitives (`src/evolith/`)
+- **Lossless KV Codec & Calibrated-Lossy Gate Contracts (`src/evolith/core/topology.py`, `src/evolith/core/regime.py`, `src/evolith/zstep/gates.py`)**:
+  - Added `LosslessKvCodecGateSpec` (`max_ulp_error == 0`, `mismatched_bytes == 0`, `min_compression_ratio`, `require_crc32_integrity=True`) and `LossyQualityGateSpec` (`max_kl_divergence=0.02`, `max_perplexity_delta=0.05`, `min_longctx_retrieval_accuracy=0.995`, `min_task_exact_match_ratio=0.99`) plus `HardwareTopologySnapshot` VMM capability fields (`vmm_peer_arena_supported`, `vmm_granularity_bytes`).
+  - Wired `PiecewisePolicySynthesizer` and `ZStep` `_check_precision_track_gates` so `PrecisionTrack.CALIBRATED_LOSSY` candidates can never overwrite or cross-contaminate `PrecisionTrack.LOSSLESS` incumbents while still enforcing `triton_recompilations == 0` and explicit quality bounds (`211 passed, 1 skipped`, `ruff check` clean).
+- **True Simultaneous Dual-Island `DP=2 × TP=4` Orchestration (`src/evolith/zstep/hardware.py`, `src/evolith/zstep/remote.py`)**:
+  - Added `dp_size` (`world_size == dp_size * tp_size`), `"sm120-8x6000d-dp2tp4"` (`GPU 0..3` on NUMA 0 + `GPU 4..7` on NUMA 1, `--shm-name zstep_dp0` / `zstep_dp1`), and `"nvfp4-dp2tp4"` (`PrecisionTrack.CALIBRATED_LOSSY`), launching both 4-GPU NUMA islands concurrently with wall-clock-synchronized throughput aggregation.
+
+### 10.2 Stage 1 8-GPU Hardware Scout & Capability-Boundary Findings (`round8_stage1_rans_vmm_nvfp4_scout.json`)
+1. **CUDA 13 Virtual Memory Management (`cuMemCreate` + `cuMemAddressReserve` + `cuMemMap` + `cuMemSetAccess`, `P6`)**:
+   - Exact `1-TiB`-strided fixed virtual address reservation (`0x0800_0000_0000 + rank * (1 << 40)`, `2 MiB` granularity) succeeded across all 8 GPUs (`rc = 0` on both same-socket `PXB`/`NODE` and cross-socket `SYS` peers).
+   - Direct 32 MiB peer read over the fixed-VA VMM mapping measured **`56.05 GB/s`** vs **`35.10 GB/s`** on legacy `cudaIpcOpenMemHandle` (**`+59.7%`**). Integrated into `CudaDriverGuard` (`worker/zstep_worker/cuda_driver.py`) and `DeepSeekV41StepRunner` (`ZSTEP_ENABLE_VMM_PEER_ARENA=1`).
+2. **SM120 Multi-Plane GPU rANS Lossless KV-Cache Codec (`P4`)**:
+   - Splitting `DSv41` `584 B/tok` (`74,752 B/page`) and `Latent576` (`73,728 B/page`) KV pages into homogeneous byte planes (`fp8_latent`: `1.2087×`, `fp16_scales`: `1.3651×`, `bf16_rope_exp`: `2.9049×`, `bf16_rope_mant`: `1.0000×`) raises lossless compression from `1.1613×` (unsplit) to **`1.2361×` (`+23.61%` host DRAM KV capacity)** on `DSv41-584` and **`1.2344×`** on `Latent576` with **`0 ULP` (`0` byte mismatches)**, **`47.50 GB/s`** SM120 32-way warp rANS GPU encode, and **`81.57 GB/s`** GPU decode.
+   - **PCIe Gen5 Latency Trade-off (Preserved per `AGENTS.md`)**: Uncongested zero-SM `cuMemcpyBatchAsync_v2` Copy-Engine DMA transfers 256 pages in **`334.22 µs`** vs **`1,228.99 µs`** for `rANS encode + DMA`. Therefore `HostDramKvTier` keeps `codec="none"` as the latency-optimal default and exposes `codec="rans_gpu"` / `codec="lossless"` with IEEE 802.3 CRC32 verification for capacity-bound long-context tiers.
+3. **`b12x` `NVFP4` vs `MXFP4` on `TP=4` (`I=576`) & `LibertAIDAI` Checkpoint Audit (`P7`)**:
+   - `LibertAIDAI_DeepSeek-V4.1-Flash-1017-NVFP4` (`399.52 GiB`) contains bit-identical FP4 expert nibbles to native `MXFP4` (`max_abs_diff = 0.0`), a **larger** expert byte footprint (`284.76 GiB` vs `268.94 GiB` due to block-16 `E4M3` scales vs block-32 `UE8M0`), and a lossy `MXFP4` Engram table (`97.28 GiB` vs `189.12 GiB` BF16, `mean_cosine = 0.993478`, `rel_l2_err = 12.06%`).
+   - On isolated `TP=4` (`I=576`, zero padding), `b12x` `nvfp4_w4a4` beats `mxfp4_w4a8` by **`1.345×` at `M=4096` (`1,989.88 vs 2,675.88 µs`)** and **`1.063×` at `M=64` (`1,566.77 vs 1,665.19 µs`)**, is **`2.64×–6.73×` slower at `M=1..8`** unless paired with `a16_max_tokens=16`, and **`w4a8_nvfp4` is unsupported in FlashInfer `0.7.6` `b12x`** (`CUDA_ERROR_ILLEGAL_ADDRESS (700)` in dynamic `m64` grouped kernel preparation).
+
+### 10.3 Full 8-GPU Verification Across Tracks A1, A2 & Track B (`round8_multi_regime_abba_results.json`, `round8_lossy_nvfp4_dp2tp4_results.json`)
+
+All candidate builds passed `RedTeam` (`spec_pins_verified=true`), `DispatchVerifier` (`8,640` pairs, `0` violations), 9/9 Z3 `FormalVerifier` clauses (`CLOSED`, `Z3 4.15.4`), `cargo fmt --all --check`, vendored Rust unit tests, and `triton_recompilations == 0`:
+
+| Track & Precision Regime | Tier / Gate Metric | `LOSSLESS TP=8` Incumbent (`e9f2b63`) | Round 8 Candidate | Measured Delta | Evolith Gate Verdict |
+|---|---|---:|---:|---:|---|
+| **Track A2 (`LOSSLESS TP=8 + VmmPeerArena`)** | `in512_c16` / `in512_c64`<br>`pf8k_c1` / `pf8k_c4` / `pf16k_c2` | `1,099.48` / `1,887.38 tok/s`<br>`29.43` / `33.37` / `15.78 tok/s` | **`1,109.22`** / **`1,903.09 tok/s`** (`TPOT 11.20 ms`)<br>**`29.44`** / **`33.36`** / **`15.78 tok/s`** | **`+0.34%` geomean** (`+0.89%` `c16`, `+0.83%` `c64`) | **`ACCEPTED` (`100%` Greedy Parity)** |
+| **Track A2 (`LOSSLESS` GPU rANS DRAM KV Tier)** | 32-Block Live Roundtrip (`2.39 MiB → 2.02 MiB`) | Raw DMA (`1.0000×`) | **`1.1834×` live** (**`1.2361×`** 4-plane), **`0 ULP`**, `32/32` CRC32 | **`+18.3%..+23.6%` DRAM KV density**, `0` byte errors | **`PASS` (`LosslessKvCodecGateSpec`)** |
+| **Track A1 (`LOSSLESS DP=2 × TP=4` Prefill Island)** | `pf16k_c2` (`16K` Concurrent Cold Prefill, 3-Round `AB/BA`) | `15.78 out tok/s` (`TTFT 1,938.59 ms`, `p99_ITL 8.84 ms`) | **`16.42 out tok/s`** (**`TTFT 1,851.14 ms`**, **`p99_ITL 7.39 ms`**) | **`+4.06%` throughput**, **`-4.51%` `TTFT`**, **`-16.40%` `p99_ITL`** | **Piecewise Win: Disaggregated `>= 16K, C >= 2` Prefill Island** |
+| **Track A1 (`LOSSLESS DP=2 × TP=4` Decode / Global)** | `in512_c16` / `in512_c64` / `pf8k_c4` (`82,049 MiB` VRAM) | `1,099.48` / `1,887.38` / `33.37 tok/s` (`TPOT 11.33` / `27.61 ms`) | `1,010.94` / `1,701.56` / `32.74 tok/s` (`TPOT 12.47` / `31.19 ms`) | `-8.05%` / `-9.85%` / `-1.89%` (`concurrent geomean -4.09%`) | **`REJECTED` as Global Decode Replacement** (`2×` MoE BW/GPU on `TP=4`) |
+| **Track B (`CALIBRATED_LOSSY NVFP4 DP=2 × TP=4`)** | `in512_c32_v` / `pf8k_c4` `TTFT`<br>Decode `c16` / `c32` (`84,311 MiB` VRAM) | `TTFT 423.60` / `1,820.89 ms`<br>`1,103.88` / `1,448.66 tok/s` | **`TTFT 347.41`** / **`1,768.28 ms`** (`prime_squares 100%`)<br>`555.46` / `908.23 tok/s` (`KL 0.0388`, `EM 22.45%`) | **`-17.99%` / `-2.89%` `TTFT`**<br>`-49.68%` / `-37.31%` decode (`geomean -32.43%`) | **`REJECTED` (`LossyQualityGateSpec` `KL 0.0388 > 0.02` + `W4A16` Decode Fallback + `84.3 GiB` VRAM)** |
+
+### 10.4 Roofline Diagnosis of Dual-Island `DP=2 × TP=4` & `NVFP4` on `8 × RTX 6000D` (`85.6 GiB` GDDR7)
+1. **Why `LOSSLESS DP=2 × TP=4` Wins `>= 16K` Concurrent Prefill (`+4.06%`, `TTFT -4.51%`) Yet Loses Decode (`-8.05%` to `-9.85%`)**:
+   - On `TP=4`, eliminating cross-socket Xeon UPI `AllReduce` saves `~445 µs/layer` at `M=4096`, which dominates compute-bound `16K` prefill (`pf16k_c2`). Conversely, in memory-bandwidth-bound decode, `TP=4` shards `268.94 GiB` of MoE weights across 4 GPUs instead of 8 (**`67.24 GiB/GPU` vs `33.62 GiB/GPU`**), doubling per-GPU GDDR7 expert reads (`+1.14 to +3.58 ms/step`) while `TP=8` cross-socket decode `AllReduce` was already compressed to `~20 µs` by `launch_ar_mhc_decode` (`PXB-BFP7`). Thus `DP=2 × TP=4` is strictly a **disaggregated long-prefill topology**, while `TP=8` remains optimal for decode and `C=1` streams.
+2. **Why `LibertAIDAI NVFP4` Cuts Prefill `TTFT` (`-18.0%`) Yet Fails Deployment Gates on `RTX 6000D`**:
+   - Above `a16_max_tokens=16`, `b12x` `nvfp4_w4a4` drives SM120 FP4 Tensor Cores (`1.345×` faster at `M=4096`), cutting `in512_c32_v` median `TTFT` from `423.60 ms` to **`347.41 ms` (`-17.99%`)**. However, three empirical barriers block production admission on `85.6 GiB` `RTX 6000D`: (i) FlashInfer `0.7.6` `b12x` lacks SM120 `w4a8_nvfp4` (`CUDA_ERROR_ILLEGAL_ADDRESS`), forcing `M <= 16` decode onto `2.65×` slower `W4A16` (`555.5 vs 210.1 µs`); (ii) switching between `W4A16` (`M <= 16`) and `W4A4` (`M > 16`) breaks batch-size invariance while `MXFP4` Engram + `W4A4` yields `KL = 0.03878 > 0.02000`; and (iii) `71.19 GiB/GPU` `NVFP4` experts leave only `768` KV pages (`84,311 MiB` peak VRAM on `85,651 MiB` `RTX 6000D`, vs `97,887 MiB` on workstation `RTX PRO 6000`).
+
+
 
 
 
