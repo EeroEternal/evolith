@@ -124,6 +124,8 @@ class WorkloadRegime(BaseModel):
     draft_depth: int = Field(default=0, ge=0)
     verify_width: int = Field(default=1, ge=1)
     physical_rows: int | None = Field(default=None, ge=1)
+    prefill_chunk_tokens: int | None = Field(default=None, ge=1)
+    comm_green_ctx_sms: int | None = Field(default=None, ge=0)
 
     def effective_physical_rows(self) -> int:
         """Return actual physical rows (`P <= B * W` under confidence pruning, or `batch_tokens`)."""
@@ -229,6 +231,7 @@ class BackendCellMeasurement(BaseModel):
     latency_us: float = Field(gt=0.0)
     vram_used_mib: float | None = Field(default=None, ge=0.0)
     p99_itl_ms: float | None = Field(default=None, ge=0.0)
+    ttft_ms: float | None = Field(default=None, ge=0.0)
     passed_correctness: bool = True
     precision_track: PrecisionTrack = PrecisionTrack.LOSSLESS
 
@@ -281,6 +284,7 @@ class PiecewisePolicySynthesizer:
         min_speedup_guardband: float = 1.015,
         max_vram_used_mib: float | None = None,
         max_p99_itl_ms: float | None = None,
+        max_ttft_ms: float | None = None,
     ) -> None:
         if min_speedup_guardband < 1.0:
             raise ValueError("min_speedup_guardband must be >= 1.0 to forbid regressions")
@@ -288,11 +292,14 @@ class PiecewisePolicySynthesizer:
             raise ValueError("max_vram_used_mib must be > 0.0 when specified")
         if max_p99_itl_ms is not None and max_p99_itl_ms <= 0.0:
             raise ValueError("max_p99_itl_ms must be > 0.0 when specified")
+        if max_ttft_ms is not None and max_ttft_ms <= 0.0:
+            raise ValueError("max_ttft_ms must be > 0.0 when specified")
         self.incumbent_backend = incumbent_backend
         self.allowed_track = allowed_track
         self.min_speedup_guardband = min_speedup_guardband
         self.max_vram_used_mib = max_vram_used_mib
         self.max_p99_itl_ms = max_p99_itl_ms
+        self.max_ttft_ms = max_ttft_ms
 
     def synthesize(
         self,
@@ -351,6 +358,15 @@ class PiecewisePolicySynthesizer:
                 ):
                     rejected.add(
                         f"{cand.backend_id}@({phase},B={batch_tokens},L={seq_len}):p99_itl_exceeded"
+                    )
+                    continue
+                if (
+                    self.max_ttft_ms is not None
+                    and cand.ttft_ms is not None
+                    and cand.ttft_ms > self.max_ttft_ms
+                ):
+                    rejected.add(
+                        f"{cand.backend_id}@({phase},B={batch_tokens},L={seq_len}):ttft_exceeded"
                     )
                     continue
                 sp = inc.latency_us / cand.latency_us
