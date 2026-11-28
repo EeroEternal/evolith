@@ -219,6 +219,71 @@ def register(app: typer.Typer) -> None:
             emit(refusal(str(exc)))
             raise typer.Exit(2) from exc
 
+    @app.command("profiles")
+    def profiles_cmd(
+        profiles_dir: Annotated[Path, typer.Option()] = Path("profiles"),
+    ):
+        """List registered hardware backends, model families, targets, and declarative profiles."""
+        from dataclasses import asdict
+
+        from evolith.hardware import list_hardware
+        from evolith.model_families import list_model_families
+        from evolith.targets import list_targets, load_profile
+
+        loaded_profiles = []
+        if profiles_dir.is_dir():
+            for path in sorted(profiles_dir.glob("*.json")):
+                p = load_profile(path)
+                loaded_profiles.append(
+                    {
+                        "name": p.name,
+                        "path": str(path),
+                        "engine": p.engine,
+                        "hardware": p.hardware.name,
+                        "model_family": p.model_family.name,
+                        "docker_dockerfile": p.docker_dockerfile,
+                        "approved_policy_path": p.approved_policy_path,
+                    }
+                )
+        emit(
+            {
+                "hardware": [asdict(h) for h in list_hardware()],
+                "model_families": [asdict(m) for m in list_model_families()],
+                "targets": [asdict(t) for t in list_targets()],
+                "profiles": loaded_profiles,
+            }
+        )
+
+    @app.command("export-nebula")
+    def export_nebula(
+        profile: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
+        image: Annotated[str, typer.Option(help="Target zstep Docker image tag for Nebula.")],
+        model_uid: Annotated[str, typer.Option(help="Nebula model UID.")],
+        model_dir: Annotated[str, typer.Option(help="Model path inside /model or host mount.")],
+        output: Annotated[Path, typer.Option()] = Path("dist/nebula"),
+        policy: Annotated[Path | None, typer.Option(exists=True, dir_okay=False)] = None,
+        world_size: Annotated[int | None, typer.Option(min=1, max=8)] = None,
+        replicas: Annotated[int, typer.Option(min=1, max=64)] = 1,
+    ):
+        """Export an approved Evolith profile and policy to a Nebula deployment bundle."""
+        try:
+            from evolith.targets.export_nebula import export_profile_for_nebula
+
+            result = export_profile_for_nebula(
+                profile,
+                image=image,
+                model_uid=model_uid,
+                model_dir=model_dir,
+                output_dir=output,
+                policy_override_path=policy,
+                world_size=world_size,
+                replicas=replicas,
+            )
+            emit(result)
+        except (ImportError, KeyError, RuntimeError, ValueError, TypeError, OSError) as exc:
+            emit(refusal(str(exc)))
+            raise typer.Exit(2) from exc
+
     @app.command("archive")
     def archive(
         db: Annotated[Path, typer.Option(exists=True, dir_okay=False)] = Path("results/runs.sqlite3"),

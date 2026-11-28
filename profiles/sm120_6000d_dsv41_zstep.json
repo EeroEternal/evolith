@@ -1,0 +1,16 @@
+{
+  "name": "sm120_6000d_dsv41_zstep",
+  "engine": "zstep",
+  "hardware": "nvidia_sm120",
+  "model_family": "deepseek_v41",
+  "approved_policy_path": null,
+  "docker": {
+    "backend": "sm120",
+    "dockerfile": "deploy/docker/Dockerfile.sm120"
+  },
+  "nebula": {
+    "engine_type": "zstep",
+    "speculative_method": "dspark",
+    "num_speculative_tokens": 5
+  }
+}

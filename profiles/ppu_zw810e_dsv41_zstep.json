@@ -1,0 +1,16 @@
+{
+  "name": "ppu_zw810e_dsv41_zstep",
+  "engine": "zstep",
+  "hardware": "thead_ppu_zw810e",
+  "model_family": "deepseek_v41",
+  "approved_policy_path": "docs/benchmarks/ppu_zw810e_sail_20261128/approved_sail_policy.json",
+  "docker": {
+    "backend": "sail",
+    "dockerfile": "deploy/docker/Dockerfile.sail"
+  },
+  "nebula": {
+    "engine_type": "zstep",
+    "speculative_method": "dspark",
+    "num_speculative_tokens": 5
+  }
+}

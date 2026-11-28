@@ -1,0 +1,16 @@
+{
+  "name": "sm120_6000d_qwen35_zstep",
+  "engine": "zstep",
+  "hardware": "nvidia_sm120",
+  "model_family": "qwen35_moe",
+  "approved_policy_path": null,
+  "docker": {
+    "backend": "sm120",
+    "dockerfile": "deploy/docker/Dockerfile.sm120"
+  },
+  "nebula": {
+    "engine_type": "zstep",
+    "speculative_method": "mtp",
+    "num_speculative_tokens": 3
+  }
+}

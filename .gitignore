@@ -15,7 +15,7 @@ build/
 .env
 .evolith/
 .evolith_archive.db
-targets/
+/targets/
 .worktrees/
 results/
 .ruff_cache/
