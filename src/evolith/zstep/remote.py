@@ -49,29 +49,15 @@ class ZStepRemoteRunner:
     def _ssh_multiplex_opts(self) -> list[str]:
         if self.executor != self._execute:
             return []
-        return [
-            "-o",
-            "ControlMaster=auto",
-            "-o",
-            "ControlPath=/tmp/evolith-ssh-%C",
-            "-o",
-            "ControlPersist=300",
-        ]
+        from evolith.core.remote_exec import build_ssh_multiplex_opts
+
+        return build_ssh_multiplex_opts("/tmp/evolith-ssh-%C", persist_seconds=300)
 
     @staticmethod
     def _is_pre_auth_ssh_drop(res: subprocess.CompletedProcess[str]) -> bool:
-        if res.returncode != 255:
-            return False
-        detail = (res.stderr + res.stdout).lower()
-        return any(
-            token in detail
-            for token in (
-                "banner exchange",
-                "kex_exchange_identification",
-                "connection timed out",
-                "connection reset by peer",
-            )
-        )
+        from evolith.core.remote_exec import is_transient_ssh_drop
+
+        return is_transient_ssh_drop(res.returncode, res.stderr + res.stdout)
 
     def _ssh(self, args: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
         self._require_host()

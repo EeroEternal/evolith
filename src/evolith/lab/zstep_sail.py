@@ -29,6 +29,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from evolith.core.remote_exec import build_ssh_base_cmd
 from evolith.lab.contracts import StrictModel, content_hash
 from evolith.lab.measurement import decide
 from evolith.lab.store import RunStore, new_run_id, write_json
@@ -342,33 +343,17 @@ class ZstepSailEvolution:
 
     def _ssh_base(self) -> list[str]:
         has_askpass = bool(os.environ.get("SSH_ASKPASS"))
-        cmd = [
-            "ssh",
-            "-p",
-            str(self.config.port),
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "ConnectTimeout=20",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-        ]
-        if not has_askpass:
-            cmd += ["-o", "BatchMode=yes"]
-        if self.config.control_path:
-            cmd += [
-                "-o",
-                "ControlMaster=auto",
-                "-o",
-                "ControlPersist=600",
-                "-o",
-                f"ControlPath={self.config.control_path}",
-            ]
-        return cmd
+        return build_ssh_base_cmd(
+            port=self.config.port,
+            strict_host_key="no",
+            known_hosts_devnull=True,
+            connect_timeout=20,
+            server_alive_interval=15,
+            server_alive_count_max=3,
+            batch_mode=not has_askpass,
+            control_path=self.config.control_path,
+            control_persist=600,
+        )
 
     def _run_ssh(
         self,

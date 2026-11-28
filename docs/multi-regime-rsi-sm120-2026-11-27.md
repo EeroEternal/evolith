@@ -94,8 +94,8 @@ To test whether Round 3's two sub-regime winners (`Track 1` `17 LOC` + `Track 3 
 ## 7. Round 5: `FlashInfer v0.7.6` Overlay, SM120 On-Chip SMEM `Split-K=32` mHC Fusion & `#8740` 32K Paged DSA (`zstep@651395c` Incumbent)
 
 Raw Round 5 telemetry & 3-regime 3-Round Cold `AB/BA` artifacts:
-- Stage 1 8-GPU Scout Probe (`FlashInfer v0.7.6` `d0cbb476`): [`docs/round5_stage1_fi076_scout_results.json`](round5_stage1_fi076_scout_results.json)
-- Stage 2 SM120 Dynamic-SMEM `Split-K=32` mHC Pre-Screen: [`docs/round5_stage2_mhc_smem_prescreen.json`](round5_stage2_mhc_smem_prescreen.json)
+- Stage 1 8-GPU Scout Probe (`FlashInfer v0.7.6` `d0cbb476`): [`docs/benchmarks/sm120_6000d_rsi_20261127/round5_stage1_fi076_scout_results.json`](benchmarks/sm120_6000d_rsi_20261127/round5_stage1_fi076_scout_results.json)
+- Stage 2 SM120 Dynamic-SMEM `Split-K=32` mHC Pre-Screen: [`docs/benchmarks/sm120_6000d_rsi_20261127/round5_stage2_mhc_smem_prescreen.json`](benchmarks/sm120_6000d_rsi_20261127/round5_stage2_mhc_smem_prescreen.json)
 - Stage 4 3-Suite 3-Round Interleaved Cold `AB/BA` Verification (`192.0 min` across 36 cold 8-GPU containers): [`docs/benchmarks/sm120_6000d_rsi_20261127/round5_multi_regime_abba_verify.json`](benchmarks/sm120_6000d_rsi_20261127/round5_multi_regime_abba_verify.json)
 
 ### 7.1 Hardware Scout & Rejected Negative Trials (Preserved per `AGENTS.md`)
@@ -120,9 +120,9 @@ Raw Round 5 telemetry & 3-regime 3-Round Cold `AB/BA` artifacts:
 ## 8. Round 6: Asynchronous THP `Engram` Offload (`-12 GiB/GPU`), Zero-Host-Stall Fused `DSpark` Pipeline & Boundary-Safe Ragged Verify (`zstep@cfacb76` Incumbent)
 
 Raw Round 6 telemetry, depth/confidence calibration, and 3-Round Cold `AB/BA` artifacts:
-- Stage 1 8-GPU Hardware Scout (`Engram` VRAM/UVA + `DSpark` SWA Width): [`docs/round6_stage1_engram_dspark_scout.json`](round6_stage1_engram_dspark_scout.json)
-- Stage 2 `DSpark` Draft Depth (`K=5, 6, 7`) & `DSparkConfidenceHead` (`conf=0.0, 0.12`) Calibration: [`docs/round6_stage2_dspark_depth_conf_screen_v3.json`](round6_stage2_dspark_depth_conf_screen_v3.json)
-- Stage 4 Full `ZStepRSILoop` 3-Round Interleaved Cold `AB/BA` Verification (`50.5 min`): [`docs/round6_multi_regime_abba_results.json`](round6_multi_regime_abba_results.json)
+- Stage 1 8-GPU Hardware Scout (`Engram` VRAM/UVA + `DSpark` SWA Width): [`docs/benchmarks/sm120_6000d_rsi_20261127/round6_stage1_engram_dspark_scout.json`](benchmarks/sm120_6000d_rsi_20261127/round6_stage1_engram_dspark_scout.json)
+- Stage 2 `DSpark` Draft Depth (`K=5, 6, 7`) & `DSparkConfidenceHead` (`conf=0.0, 0.12`) Calibration: [`docs/benchmarks/sm120_6000d_rsi_20261127/round6_stage2_dspark_depth_conf_screen_v3.json`](benchmarks/sm120_6000d_rsi_20261127/round6_stage2_dspark_depth_conf_screen_v3.json)
+- Stage 4 Full `ZStepRSILoop` 3-Round Interleaved Cold `AB/BA` Verification (`50.5 min`): [`docs/benchmarks/sm120_6000d_rsi_20261127/round6_multi_regime_abba_results.json`](benchmarks/sm120_6000d_rsi_20261127/round6_multi_regime_abba_results.json)
 
 ### 8.1 Evolith Pareto VRAM / Tail-Latency & Speculative Primitives (`P8`)
 - Extended `RegimeSpec` and `MultiRegimeLedger` (`src/evolith/core/regime.py`) with explicit `max_vram_used_mib` and `max_p99_itl_ms` Pareto admission ceilings plus speculative `(batch_seqs, draft_depth, verify_width, physical_rows)` modeling (`P <= B * W`).
@@ -161,8 +161,8 @@ Raw Round 6 telemetry, depth/confidence calibration, and 3-Round Cold `AB/BA` ar
 ## 9. Round 7: Lockstep-Safe Cold-Prefill Chunk Scaling, TBO `PXB-4K` Ring Reallocation, Piecewise SM120 MLA Prefill & CUDA 13 Green Context Audit (`zstep@3a1e298` Incumbent)
 
 Raw Round 7 hardware scout, closed-loop 5-generation evolution lineage (`g0001..g0005`), and 3-Round Cold `AB/BA` + 3-Guard artifacts:
-- Stage 1 8-GPU Hardware Scout (MLA Prefill Crossover + `shared_experts` Overlap + CUDA 13 Green Context + `PXB-4K` TBO Chunk Scaling): [`docs/round7_stage1_prefill_green_ctx_scout.json`](round7_stage1_prefill_green_ctx_scout.json)
-- Stage 4 Full `ZStepRSILoop` 3-Round Interleaved Cold `AB/BA` Verification (`g0001..g0005`, Accepted `g0005-9271a17c`): [`docs/round7_multi_regime_abba_results.json`](round7_multi_regime_abba_results.json)
+- Stage 1 8-GPU Hardware Scout (MLA Prefill Crossover + `shared_experts` Overlap + CUDA 13 Green Context + `PXB-4K` TBO Chunk Scaling): [`docs/benchmarks/sm120_6000d_rsi_20261127/round7_stage1_prefill_green_ctx_scout.json`](benchmarks/sm120_6000d_rsi_20261127/round7_stage1_prefill_green_ctx_scout.json)
+- Stage 4 Full `ZStepRSILoop` 3-Round Interleaved Cold `AB/BA` Verification (`g0001..g0005`, Accepted `g0005-9271a17c`): [`docs/benchmarks/sm120_6000d_rsi_20261127/round7_multi_regime_abba_results.json`](benchmarks/sm120_6000d_rsi_20261127/round7_multi_regime_abba_results.json)
 
 ### 9.1 Evolith Cold-Prefill `TTFT` & Green Context Introspection Primitives (`P8`)
 - Extended `HardwareTopologySnapshot` (`src/evolith/core/topology.py`) with CUDA 13 Green Context capability attributes (`green_context_supported`, `min_sm_partition_size`, `sm_coscheduled_alignment`).
@@ -210,9 +210,9 @@ Raw Round 7 hardware scout, closed-loop 5-generation evolution lineage (`g0001..
 ## 10. Round 8: SM120 Multi-Plane GPU rANS Lossless KV Codec, CUDA 13 VMM Fixed-VA Peer Arena, Dual-Island `DP=2 × TP=4` Disaggregation Audit & Isolated `CALIBRATED_LOSSY` `NVFP4` Track (`zstep@e9f2b63` Incumbent)
 
 Raw Round 8 8-GPU hardware scout, lossless 3-Round Cold `AB/BA` + `TP=8` VMM/rANS verification, and explicitly separated `CALIBRATED_LOSSY` `NVFP4` artifacts:
-- Stage 1 8-GPU Hardware Scout (CUDA 13 VMM Peer Arena + Multi-Plane GPU rANS KV Codec + `b12x` `I=576` `NVFP4` vs `MXFP4` + Single-Socket `TP=4` vs Dual-Socket `TP=8` Collectives): [`docs/round8_stage1_rans_vmm_nvfp4_scout.json`](round8_stage1_rans_vmm_nvfp4_scout.json)
-- Track A1 (`LOSSLESS` Dual-Island `DP=2 × TP=4` vs `TP=8` 3-Round Cold `AB/BA`) + Track A2 (`LOSSLESS` `TP=8` `VmmPeerArena` Zero-Regression Guard + Live GPU rANS `HostDramKvTier`): [`docs/round8_multi_regime_abba_results.json`](round8_multi_regime_abba_results.json)
-- Track B (`PrecisionTrack.CALIBRATED_LOSSY` `LibertAIDAI NVFP4 + MXFP4 Engram` Dual-Island `DP=2 × TP=4` Cold `AB/BA` & `LossyQualityGateSpec` Audit): [`docs/round8_lossy_nvfp4_dp2tp4_results.json`](round8_lossy_nvfp4_dp2tp4_results.json)
+- Stage 1 8-GPU Hardware Scout (CUDA 13 VMM Peer Arena + Multi-Plane GPU rANS KV Codec + `b12x` `I=576` `NVFP4` vs `MXFP4` + Single-Socket `TP=4` vs Dual-Socket `TP=8` Collectives): [`docs/benchmarks/sm120_6000d_rsi_20261127/round8_stage1_rans_vmm_nvfp4_scout.json`](benchmarks/sm120_6000d_rsi_20261127/round8_stage1_rans_vmm_nvfp4_scout.json)
+- Track A1 (`LOSSLESS` Dual-Island `DP=2 × TP=4` vs `TP=8` 3-Round Cold `AB/BA`) + Track A2 (`LOSSLESS` `TP=8` `VmmPeerArena` Zero-Regression Guard + Live GPU rANS `HostDramKvTier`): [`docs/benchmarks/sm120_6000d_rsi_20261127/round8_multi_regime_abba_results.json`](benchmarks/sm120_6000d_rsi_20261127/round8_multi_regime_abba_results.json)
+- Track B (`PrecisionTrack.CALIBRATED_LOSSY` `LibertAIDAI NVFP4 + MXFP4 Engram` Dual-Island `DP=2 × TP=4` Cold `AB/BA` & `LossyQualityGateSpec` Audit): [`docs/benchmarks/sm120_6000d_rsi_20261127/round8_lossy_nvfp4_dp2tp4_results.json`](benchmarks/sm120_6000d_rsi_20261127/round8_lossy_nvfp4_dp2tp4_results.json)
 
 ### 10.1 Evolith Codec, VMM, Dual-Island `DP=2 × TP=4` & `LossyQualityGateSpec` Primitives (`src/evolith/`)
 - **Lossless KV Codec & Calibrated-Lossy Gate Contracts (`src/evolith/core/topology.py`, `src/evolith/core/regime.py`, `src/evolith/zstep/gates.py`)**:
