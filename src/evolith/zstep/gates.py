@@ -311,6 +311,25 @@ def evaluate_screen(
                     f"screen {label} leaked idle KV cache ({row.idle_kv_cache_usage:.4f} > 0.0)"
                 )
                 break
+            if (
+                task.max_vram_used_mib is not None
+                and row.peak_vram_used_mib is not None
+                and (
+                    not math.isfinite(row.peak_vram_used_mib)
+                    or row.peak_vram_used_mib > task.max_vram_used_mib
+                )
+            ):
+                reasons.append(
+                    f"screen {label} peak VRAM {row.peak_vram_used_mib:.1f} MiB exceeds "
+                    f"max_vram_used_mib {task.max_vram_used_mib:.1f} MiB"
+                )
+                break
+            if task.max_p99_itl_ms is not None and row.p99_itl_ms > task.max_p99_itl_ms:
+                reasons.append(
+                    f"screen {label} p99_itl_ms {row.p99_itl_ms:.2f} ms exceeds "
+                    f"max_p99_itl_ms {task.max_p99_itl_ms:.2f} ms"
+                )
+                break
 
     gains: list[float] = []
     delta_parts: list[str] = []
@@ -574,6 +593,25 @@ def evaluate_candidate(
             ):
                 reasons.append(
                     f"{label} leaked idle KV cache ({row.idle_kv_cache_usage:.4f} > 0.0)"
+                )
+                break
+            if (
+                task.max_vram_used_mib is not None
+                and row.peak_vram_used_mib is not None
+                and (
+                    not math.isfinite(row.peak_vram_used_mib)
+                    or row.peak_vram_used_mib > task.max_vram_used_mib
+                )
+            ):
+                reasons.append(
+                    f"{label} peak VRAM {row.peak_vram_used_mib:.1f} MiB exceeds "
+                    f"max_vram_used_mib {task.max_vram_used_mib:.1f} MiB"
+                )
+                break
+            if task.max_p99_itl_ms is not None and row.p99_itl_ms > task.max_p99_itl_ms:
+                reasons.append(
+                    f"{label} p99_itl_ms {row.p99_itl_ms:.2f} ms exceeds "
+                    f"max_p99_itl_ms {task.max_p99_itl_ms:.2f} ms"
                 )
                 break
 

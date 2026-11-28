@@ -83,6 +83,20 @@ BUILTIN_BENCHMARK_PROFILES: dict[str, BenchmarkProfile] = {
             "ZSTEP_NUM_SPEC_TOKENS": "5",
         },
     ),
+    "cold-prefill": BenchmarkProfile(
+        profile_id="cold-prefill",
+        description="Single-sequence 8K–32K cold-start TTFT & pure-prefill throughput ladder",
+        screen_tiers="prefill8k_c1:1:4:8192:16;prefill16k_c1:1:4:16384:16",
+        verify_tiers=(
+            "prefill8k_v:1:6:8192:32;prefill16k_v:1:6:16384:32;prefill32k_v:1:4:32768:32"
+        ),
+        regime_phase="prefill",
+        num_kv_pages=2560,
+        max_pages_per_seq=264,
+        env_overrides={
+            "ZSTEP_MAX_MODEL_LEN": "33792",
+        },
+    ),
 }
 
 

@@ -115,4 +115,46 @@ Raw Round 5 telemetry & 3-regime 3-Round Cold `AB/BA` artifacts:
 | **`spec-dspark` (`DSpark5` Guard)** | `g0001-882aa453` | **`+0.76%`** (`spec_c1 +0.74%`, `spec_c8 +0.78%`) | **`+0.56%`** (positive guard) | `-0.25%` | `spec_c4` (`n=24`): **`+1.68%`** (`6.66 → 6.54 ms`)<br>`spec_c2` (`n=12`): **`+0.42%`** (`5.69 → 5.67 ms`)<br>`spec_c16` (`n=96`): `-0.42%` | **Guard PASSED (`+0.56% > 0%`, 100% Greedy match)** |
 | **`short-throughput` (`512–1K` Guard)** | `g0001-07bb4dc0` | **`+0.15%`** (`in512_c1 +0.70%`, `in512_c32 -0.40%`) | **`-0.42%`** (with `n <= 64`) | `-0.47%` | `in512_c1` (`n=1`): **`+0.70%`**, `in1024_c32`: **`+0.38%`**<br>`in512_c16` (`n=16`): `-1.02%`, `in512_c128`: `-0.31%`, `in1024_c128`: `-0.72%` | **Crossover Caught**: `Split-K=32` (`32` CTAs on `mhc_stream`) wins for `1 <= n <= 12` (`c1 +0.70%`, `ctx32k_c4 +18.82%`, `ctx16k_c12 +17.37%`) and contends with main-stream GEMMs at `n >= 16` (`c16 -1.02%`). Tightened dispatch in `b12x_dsv41.py` from `1 <= n <= 64` to **`1 <= n <= 12`**. |
 
+---
+
+## 8. Round 6: Asynchronous THP `Engram` Offload (`-12 GiB/GPU`), Zero-Host-Stall Fused `DSpark` Pipeline & Boundary-Safe Ragged Verify (`zstep@cfacb76` Incumbent)
+
+Raw Round 6 telemetry, depth/confidence calibration, and 3-Round Cold `AB/BA` artifacts:
+- Stage 1 8-GPU Hardware Scout (`Engram` VRAM/UVA + `DSpark` SWA Width): [`docs/round6_stage1_engram_dspark_scout.json`](round6_stage1_engram_dspark_scout.json)
+- Stage 2 `DSpark` Draft Depth (`K=5, 6, 7`) & `DSparkConfidenceHead` (`conf=0.0, 0.12`) Calibration: [`docs/round6_stage2_dspark_depth_conf_screen_v3.json`](round6_stage2_dspark_depth_conf_screen_v3.json)
+- Stage 4 Full `ZStepRSILoop` 3-Round Interleaved Cold `AB/BA` Verification (`50.5 min`): [`docs/round6_multi_regime_abba_results.json`](round6_multi_regime_abba_results.json)
+
+### 8.1 Evolith Pareto VRAM / Tail-Latency & Speculative Primitives (`P8`)
+- Extended `RegimeSpec` and `MultiRegimeLedger` (`src/evolith/core/regime.py`) with explicit `max_vram_used_mib` and `max_p99_itl_ms` Pareto admission ceilings plus speculative `(batch_seqs, draft_depth, verify_width, physical_rows)` modeling (`P <= B * W`).
+- Added `max_vram_used_mib` and `max_p99_itl_regression` enforcement to `ZStepRSITask` and `evaluate_screen` / `evaluate_verification` (`src/evolith/zstep/{task,gates}.py`), `pynvml` `peak_vram_used_mib` container stamping + persistent `$HOME/evolith-rsi/container-cache:/root/.cache` mounting in `ZStepRemoteRunner` (`src/evolith/zstep/remote.py`), and `"cold-prefill"` `BenchmarkProfile` (`src/evolith/zstep/hardware.py`).
+
+### 8.2 Hardware Scout & Empirically Rejected Trials (Preserved per `AGENTS.md`)
+1. **`Engram` VRAM & Background UVA CTA Contention**:
+   - `DeepSeek-V4.1-Flash` holds two `16M × 2048` BF16 `Engram` tables (`layers.1.engram.embed` and `layers.14.engram.embed`), each consuming **`11.802 GiB/GPU`** on `TP=8` (`189.13 GiB` total across both tables) while reading only **`792 B/token/GPU`** (`18.2 µs` solo UVA gather).
+   - Stock `ParallelEngramEmbedding.lookup(..., background=True)` launched `self._num_sms // 2 = 78` CTAs on `_prefetch_stream`, competing with Layer 0's `148..156`-CTA `sm12x_mega_gate` (`+202.6 µs` at `M=128`). Capping `emb._num_sms = 16` (**`8` background CTAs** = `5%` of `156` SMs) hides the `~18 µs` PCIe Gen5 x16 UVA gather behind Layers `0..13` (`1.5–4.0 ms`) with **zero** measurable latency overhead on non-speculative `short-throughput` (`+0.09%`) and `longctx-tp8` (`-0.30%`) while freeing **`12.07 GiB/GPU`** (`80,957 → 68,891 MiB/GPU`, **`94.3 GiB` cluster-wide**).
+   - Preserves OS page-cache residency of the `475 GiB` checkpoint by auto-enabling THP host-pinned `layers.14.engram.embed` offload only when `/proc/meminfo` `MemAvailable >= 320 GiB` (`env_config.py`).
+2. **Rejected Speculative Depth & Confidence Threshold Trials (`round6_stage2_dspark_depth_conf_screen_v3.json`)**:
+   - **`K=7` (`cand_v1_k7`)**: Regressed `-17.21%` vs `base_dspark_k5` because verify rows `B × 8` pushed `c4..c16` (`32..128` rows) into compute-bound MoE/MLA regimes with diminishing tail acceptance on Steps `6..7`. Excluded.
+   - **`K=6` (`cand_v3_k6`)**: Achieved `+33.26%` geomean vs `base_dspark_k5`, winning `spec_c8` (`813.65 tok/s`) and tying `spec_c1` (`272.26 tok/s`), but trailing `cand_v3_k5` (`+36.10%`) on `spec_c2` (`474.64 vs 517.05`), `spec_c4` (`727.16 vs 769.78`), and `spec_c16` (`1,228.84 vs 1,256.81`). Excluded.
+   - **`K=5, conf=0.12` (`cand_v3_k5_conf12`, learned `DSparkConfidenceHead`)**: Achieved `+33.35%` geomean, winning `spec_c8` (`798.86 vs 766.99`) and `spec_c16` (`1,293.40 vs 1,256.81`), so `DSparkConfidenceHead` is retained in `deepseek_v41_dspark.py` behind `ZSTEP_DSPARK_CONF_THRESHOLD` (`default 0.0`) for `B >= 8` serving tuning while shipping lossless `K=5, conf=0.0` as the universal default.
+
+### 8.3 Root Cause & Landed Speculative Architecture (`P2`, `g0001-28ab22ed`)
+1. **Zero-Host-Stall Fused Post-Verify `DSpark` CUDAGraph (`csrc/shm_allreduce_kernels.cu`, `deepseek_v41.py`, `deepseek_v41_dspark.py`, `serving.rs`)**:
+   - Replaces the between-stage `runner.finish()` host `synchronize()` + Python `verify_batch` + NumPy `ctx_slot_mapping` + H2D DMA + 2nd graph launch with `dspark_verify_prep_kernel` + captured `post_verify_draft_graphs[v_bucket]`, replaying **`verify_graphs[v_bucket]` + `post_verify_draft_graphs[v_bucket]` back-to-back in one asynchronous GPU submission** and overlapping Rust KV-page retirement (`commit_verified_round`) cleanly.
+2. **Eliminating `85–204 ms` `128`-Token Page-Boundary Eager Fallbacks**:
+   - Whenever `max_req_len % 128 == 0` (`640, 768, 1280`), the final ragged verify step (`p_max = 638`, `q_len < 6`) previously tripped `(p_max_pad // 128) == (p_max // 128)` and fell back to `~95–200 ms` eager Python across the entire batch. Relaxing `_can_use_ragged_verify_graph` to `(p_max_pad // 128) < bt_width` (backed by permanent zeroed `mla_dummy_vb`/`swa_dummy_vb` and `CompressorStateCache.CAPACITY = 8 >= width + 1`) plus per-sequence `eff_max_ctx` clamping in `dspark_verify_prep_kernel` keeps **100% of speculative steps inside CUDA Graphs**, collapsing `spec_c4` `p99_ITL` from **`162.53 ms` down to `14.83 ms` (`-90.9%`)**.
+
+### 8.4 Full 3-Round Interleaved Cold `AB/BA` Verification & Guard Summary (`g0001-28ab22ed`)
+
+| Suite / Regime | Phase & Metric | Incumbent (`cfacb76`, `DSpark K=5`) | Candidate (`g0001-28ab22ed`) | Measured Delta | Gate Verdict |
+|---|---|---:|---:|---:|---|
+| **`spec-dspark` (Peak GPU VRAM)** | `pynvml` Peak VRAM (`<= 74,000 MiB` gate) | `80,957 MiB/GPU` | **`68,891 MiB/GPU`** | **`-12,066 MiB/GPU` (`-11.78 GiB/GPU`)** | **`PASS` (`-94.3 GiB` cluster-wide)** |
+| **`spec-dspark` (Screen)** | `spec_c1` / `spec_c8` (`repeats=1`) | `203.91` / `423.76 tok/s` | **`239.46` / `729.01 tok/s`** | **`+42.14%` geomean** (`+17.43%` / **`+72.03%`**) | **`PASS` (`0` Triton recompiles, 100% Greedy)** |
+| **`spec-dspark` (3-Round Cold `AB/BA`)** | `spec_c2` (`repeats=3` mean) | `404.39 tok/s` (`TPOT 4.41 ms`, `p99 36.65 ms`) | **`528.42 tok/s`** (`TPOT 3.24 ms`, **`p99 11.60 ms`**) | **`+30.67%` mean** (`+26.13%` med, **`-68.4%` `p99_ITL`**) | **`ACCEPTED`** |
+| **`spec-dspark` (3-Round Cold `AB/BA`)** | `spec_c4` (`repeats=3` mean) | `499.59 tok/s` (`TPOT 7.38 ms`, `p99 162.53 ms`) | **`728.99 tok/s`** (`TPOT 4.67 ms`, **`p99 14.83 ms`**) | **`+45.92%` mean** (`+41.29%` med, **`-90.9%` `p99_ITL`**) | **`ACCEPTED`** |
+| **`spec-dspark` (3-Round Cold `AB/BA`)** | `spec_c16` (`repeats=3` mean) | `939.60 tok/s` (`TPOT 13.33 ms`, `p99 173.11 ms`) | **`1,285.54 tok/s`** (`TPOT 10.02 ms`, **`p99 146.76 ms`**) | **`+36.82%` mean** (`+36.74%` med, peak **`1,343.70 tok/s`**) | **`ACCEPTED` (`geomean +34.57%`, `lcb_2se +27.27%`, `net_gate 1.2303`)** |
+| **`short-throughput` (Guard)** | `in512_c1` / `in512_c32` + VRAM | `167.90` / `1,099.24 tok/s` (`78,187 MiB`) | **`168.18` / `1,099.31 tok/s`** (**`66,093 MiB`**) | **`+0.09%` geomean**, **`-12,094 MiB/GPU`** | **`ACCEPTED` (`CONFORMANT`, 9/9 Z3 `CLOSED`)** |
+| **`longctx-tp8` (Guard)** | `ctx8k_c2` / `ctx16k_c8` + VRAM | `99.39` / `61.50 tok/s` (`78,549 MiB`) | **`98.93` / `61.42 tok/s`** (**`66,535 MiB`**) | **`-0.30%` geomean** (noise), **`-12,014 MiB/GPU`** | **`ACCEPTED` (Zero UVA Prefetch Overhead)** |
+
+
 
