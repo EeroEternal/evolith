@@ -342,8 +342,9 @@ fi"""
         overlay_dir = f"/tmp/{container_name}-overlay"
         quoted_model_dir = shlex.quote(self.task.model_dir)
         quoted_model_mount = shlex.quote(f"{self.task.model_dir}:{self.task.model_dir}:ro")
+        replica_world = hw.tp_size * hw.pp_size if hw.dp_size > 1 else hw.world_size
         common = (
-            f"./target/release/zstep --world-size {hw.world_size} "
+            f"./target/release/zstep --world-size {replica_world} "
             "--python /usr/bin/python3 --worker-root ./worker "
             f"--model-dir {quoted_model_dir} --allreduce-blocks 8 "
             f"--num-kv-pages {self.task.num_kv_pages} "
@@ -351,20 +352,101 @@ fi"""
             f"--max-decoder-rows {self.task.max_step_tokens} "
             f"--max-pages-per-seq {self.task.max_pages_per_seq} --ready-timeout-secs 900 --step-timeout-secs 180"
         )
+        from evolith.core.topology import PrecisionTrack
+
+        is_lossy = self.task.precision_track == PrecisionTrack.CALIBRATED_LOSSY
         greedy = ""
         if parity_name:
+            exact_flag = "" if is_lossy else " --require-exact-cases prime_squares_table"
+            greedy_env = "CUDA_VISIBLE_DEVICES=0,1,2,3 " if hw.dp_size == 2 else ""
             greedy = (
-                f"{common} --max-seqs 16 --max-prefill-chunk {self.task.parity_prefill_chunk} "
+                f"{greedy_env}{common} --max-seqs 16 --max-prefill-chunk {self.task.parity_prefill_chunk} "
                 "--verify-greedy-json docs/benchmarks/phase3_vllm_greedy_reference.json "
-                f"--verify-output-json /workspace/results/{parity_name} "
-                "--require-exact-cases prime_squares_table\n"
+                f"--verify-output-json /workspace/results/{parity_name}{exact_flag}\n"
             )
-        benchmark = (
-            f"{common} --max-seqs 128 --max-prefill-chunk 2048 "
-            "--max-mixed-step-tokens 3072 --warmup-prompts 16 "
-            f"--repeats {repeats} --bench-tiers \"{tiers}\" "
-            f"--metrics-output /workspace/results/{metrics_name}\n"
-        )
+            if is_lossy:
+                q_par = shlex.quote(f"/workspace/results/{parity_name}")
+                greedy += (
+                    "/usr/bin/python3 -c 'import json, pathlib, sys; p = pathlib.Path(sys.argv[1]); "
+                    "d = json.loads(p.read_text()); d[\"precision_track\"] = \"calibrated_lossy\"; "
+                    "p.write_text(json.dumps(d, indent=2))' "
+                    f"{q_par}\n"
+                )
+        if hw.dp_size == 2:
+            q_tiers = shlex.quote(tiers)
+            q_out = shlex.quote(f"/workspace/results/{metrics_name}")
+            benchmark = (
+                f"DP0_TIERS=$(/usr/bin/python3 -c 'import sys; out=[]; "
+                "[out.append(f\"{p[0]}:{max(1,int(p[1])//2)}:{max(1,int(p[2])//2)}:{p[3]}:{p[4]}\" if int(p[1])>=2 else s) "
+                "for s in sys.argv[1].replace(\",\", \";\").split(\";\") if s.strip() for p in [s.split(\":\")]]; print(\";\".join(out))' "
+                f"{q_tiers})\n"
+                f"DP1_TIERS=$(/usr/bin/python3 -c 'import sys; out=[]; "
+                "[out.append(f\"{p[0]}:{int(p[1])-int(p[1])//2}:{int(p[2])-int(p[2])//2}:{p[3]}:{p[4]}\") "
+                "for s in sys.argv[1].replace(\",\", \";\").split(\";\") if s.strip() for p in [s.split(\":\")] if int(p[1])>=2]; print(\";\".join(out))' "
+                f"{q_tiers})\n"
+                f"if [ -n \"$DP1_TIERS\" ]; then\n"
+                f"  CUDA_VISIBLE_DEVICES=0,1,2,3 {common} --shm-name zstep_dp0 --max-seqs 128 --max-prefill-chunk 2048 "
+                f"--max-mixed-step-tokens 3072 --warmup-prompts 8 --repeats {repeats} --bench-tiers \"$DP0_TIERS\" "
+                f"--metrics-output /workspace/results/dp0_{metrics_name} &\n"
+                f"  DP0_PID=$!\n"
+                f"  CUDA_VISIBLE_DEVICES=4,5,6,7 {common} --shm-name zstep_dp1 --max-seqs 128 --max-prefill-chunk 2048 "
+                f"--max-mixed-step-tokens 3072 --warmup-prompts 8 --repeats {repeats} --bench-tiers \"$DP1_TIERS\" "
+                f"--metrics-output /workspace/results/dp1_{metrics_name} &\n"
+                f"  DP1_PID=$!\n"
+                f"  wait \"$DP0_PID\"\n"
+                f"  wait \"$DP1_PID\"\n"
+                f"else\n"
+                f"  CUDA_VISIBLE_DEVICES=0,1,2,3 {common} --shm-name zstep_dp0 --max-seqs 128 --max-prefill-chunk 2048 "
+                f"--max-mixed-step-tokens 3072 --warmup-prompts 8 --repeats {repeats} --bench-tiers \"$DP0_TIERS\" "
+                f"--metrics-output /workspace/results/dp0_{metrics_name}\n"
+                f"fi\n"
+                "/usr/bin/python3 -c '\n"
+                "import json, pathlib, statistics, sys\n"
+                "d0 = json.loads(pathlib.Path(sys.argv[1]).read_text())\n"
+                "p1 = pathlib.Path(sys.argv[2])\n"
+                "d1 = json.loads(p1.read_text()) if p1.is_file() else {\"tiers\": []}\n"
+                "by_key1 = {(r[\"label\"], r[\"repeat\"]): r for r in d1.get(\"tiers\", [])}\n"
+                "merged = []\n"
+                "for r0 in d0.get(\"tiers\", []):\n"
+                "    k = (r0[\"label\"], r0[\"repeat\"])\n"
+                "    r = dict(r0)\n"
+                "    if k in by_key1:\n"
+                "        r1 = by_key1[k]\n"
+                "        r[\"concurrency\"] = int(r0[\"concurrency\"]) + int(r1[\"concurrency\"])\n"
+                "        r[\"num_prompts\"] = int(r0[\"num_prompts\"]) + int(r1[\"num_prompts\"])\n"
+                "        r[\"output_throughput_tok_s\"] = float(r0[\"output_throughput_tok_s\"]) + float(r1[\"output_throughput_tok_s\"])\n"
+                "        if \"total_throughput_tok_s\" in r0 and \"total_throughput_tok_s\" in r1:\n"
+                "            r[\"total_throughput_tok_s\"] = float(r0[\"total_throughput_tok_s\"]) + float(r1[\"total_throughput_tok_s\"])\n"
+                "        for lf in (\"median_ttft_ms\", \"mean_tpot_ms\", \"p99_tpot_ms\", \"p99_itl_ms\"):\n"
+                "            if lf in r0 and lf in r1:\n"
+                "                r[lf] = max(float(r0[lf]), float(r1[lf]))\n"
+                "    merged.append(r)\n"
+                "d0[\"world_size\"] = 8\n"
+                "d0[\"dp_size\"] = 2\n"
+                "d0[\"tp_size\"] = 4\n"
+                "d0[\"tiers\"] = merged\n"
+                "by_lbl = {}\n"
+                "for r in merged: by_lbl.setdefault(r[\"label\"], []).append(r)\n"
+                "d0[\"tier_aggregates\"] = [\n"
+                "    {\n"
+                "        \"label\": lbl,\n"
+                "        \"median_output_throughput_tok_s\": statistics.median(x[\"output_throughput_tok_s\"] for x in rs),\n"
+                "        \"median_ttft_ms\": statistics.median(x[\"median_ttft_ms\"] for x in rs),\n"
+                "        \"mean_tpot_ms\": statistics.median(x[\"mean_tpot_ms\"] for x in rs),\n"
+                "        \"p99_itl_ms\": statistics.median(x[\"p99_itl_ms\"] for x in rs),\n"
+                "    }\n"
+                "    for lbl, rs in by_lbl.items()\n"
+                "]\n"
+                "pathlib.Path(sys.argv[3]).write_text(json.dumps(d0, indent=2))\n"
+                f"' /workspace/results/dp0_{metrics_name} /workspace/results/dp1_{metrics_name} {q_out}\n"
+            )
+        else:
+            benchmark = (
+                f"{common} --max-seqs 128 --max-prefill-chunk 2048 "
+                "--max-mixed-step-tokens 3072 --warmup-prompts 16 "
+                f"--repeats {repeats} --bench-tiers \"{tiers}\" "
+                f"--metrics-output /workspace/results/{metrics_name}\n"
+            )
         q_metrics_in_ctr = shlex.quote(f"/workspace/results/{metrics_name}")
         vram_probe_snip = (
             "/usr/bin/python3 -c '\n"
@@ -426,6 +508,7 @@ fi"""
             f"-e {shlex.quote(f'{k}={v}')} "
             for k, v in sorted(self.task.worker_env_overrides.items())
         )
+        shm_sz = "64g" if hw.dp_size > 1 else "32g"
         return f"""set -euo pipefail
 trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
 {rustup_snip}
@@ -442,7 +525,7 @@ if [ ! -x ./target/release/zstep ]; then
   fi
 fi
 {overlay_snip}
-{sudo_pfx}docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
+{sudo_pfx}docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size={shm_sz} --network=none --entrypoint bash \\
   -v "$PWD:/workspace" -v "$HOME/evolith-rsi/container-cache:/root/.cache" -v {quoted_model_mount} -w /workspace \\
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \\
   -e OMP_NUM_THREADS=1 -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\

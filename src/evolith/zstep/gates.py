@@ -13,12 +13,69 @@ import subprocess
 import sys
 
 from evolith.controller.engine import EvolithRSIEngine
+from evolith.core.topology import LossyQualityGateSpec, PrecisionTrack
 from evolith.zstep.task import (
     ScreenDecision,
     TierMetric,
     VerificationDecision,
     ZStepRSITask,
 )
+
+
+def _check_precision_track_gates(
+    task: ZStepRSITask,
+    metrics_or_parity_dir: Path,
+    reasons: list[str],
+    *,
+    parity_path: Path | None = None,
+) -> None:
+    """Enforce strict separation between `LOSSLESS` and `CALIBRATED_LOSSY` tracks (`AGENTS.md`)."""
+    if parity_path is not None and parity_path.is_file():
+        try:
+            par_payload = json.loads(parity_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            par_payload = {}
+        declared_track = str(par_payload.get("precision_track", "")).strip().lower()
+        if (
+            task.precision_track == PrecisionTrack.LOSSLESS
+            and declared_track == PrecisionTrack.CALIBRATED_LOSSY.value
+        ):
+            reasons.append(
+                "lossy candidate forbidden on PrecisionTrack.LOSSLESS (parity declared calibrated_lossy)"
+            )
+    if task.precision_track != PrecisionTrack.CALIBRATED_LOSSY:
+        return
+    gate = task.lossy_quality_gate or LossyQualityGateSpec()
+    qpath = task.lossy_quality_report_path or (metrics_or_parity_dir / "lossy-quality.json")
+    if not qpath.is_file():
+        reasons.append(
+            f"PrecisionTrack.CALIBRATED_LOSSY requires lossy quality report at {qpath.name}"
+        )
+        return
+    try:
+        qdata = json.loads(qpath.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        reasons.append(f"lossy quality report malformed JSON: {exc}")
+        return
+    try:
+        m_kl = float(qdata["measured_kl"])
+        m_ppl = float(qdata["measured_ppl_delta"])
+        m_ret = float(qdata.get("measured_retrieval_acc", 1.0))
+        m_em = float(qdata.get("measured_task_em_ratio", 1.0))
+    except (KeyError, TypeError, ValueError) as exc:
+        reasons.append(f"lossy quality report missing required numeric metrics: {exc}")
+        return
+    if not all(math.isfinite(v) for v in (m_kl, m_ppl, m_ret, m_em)):
+        reasons.append("lossy quality report contains non-finite metric values")
+        return
+    ok, q_reasons = gate.evaluate(
+        measured_kl=m_kl,
+        measured_ppl_delta=m_ppl,
+        measured_retrieval_acc=m_ret,
+        measured_task_em_ratio=m_em,
+    )
+    if not ok:
+        reasons.extend(f"LossyQualityGateSpec failed: {r}" for r in q_reasons)
 
 
 def _has_linux_x86_rust_target() -> bool:
@@ -194,6 +251,7 @@ def _check_parity_guards(
     reasons: list[str],
     *,
     max_cross_mode_logit_drift: float = 8.0,
+    require_lossless_reference: bool = True,
 ) -> None:
     if not parity_path.is_file():
         reasons.append(f"parity report missing at {parity_path.name}")
@@ -201,9 +259,10 @@ def _check_parity_guards(
     recompilations, rates = load_parity(parity_path)
     if recompilations:
         reasons.append(f"unexpected Triton recompilations: {recompilations}")
-    for mode in ("single", "batched", "chunked"):
-        if rates.get(mode) != 1.0:
-            reasons.append(f"prime_squares_table {mode} exact match is not 100%")
+    if require_lossless_reference:
+        for mode in ("single", "batched", "chunked"):
+            if rates.get(mode) != 1.0:
+                reasons.append(f"prime_squares_table {mode} exact match is not 100%")
 
     payload = json.loads(parity_path.read_text(encoding="utf-8"))
     if "chunked_schedule" in payload or "unchunked_schedule" in payload:
@@ -275,11 +334,18 @@ def evaluate_screen(
     BEFORE committing ~60 minutes of 8xGPU interleaved verification time.
     """
     reasons: list[str] = []
+    _check_precision_track_gates(
+        task,
+        candidate_metrics_path.parent,
+        reasons,
+        parity_path=parity_path,
+    )
     if parity_path is not None and parity_path.is_file():
         _check_parity_guards(
             parity_path,
             reasons,
             max_cross_mode_logit_drift=task.max_cross_mode_logit_drift,
+            require_lossless_reference=(task.precision_track == PrecisionTrack.LOSSLESS),
         )
     elif require_parity:
         reasons.append("screen parity report missing")
@@ -510,6 +576,7 @@ def evaluate_secondary_guard(
             parity_path,
             reasons,
             max_cross_mode_logit_drift=guard_task.max_cross_mode_logit_drift,
+            require_lossless_reference=(guard_task.precision_track == PrecisionTrack.LOSSLESS),
         )
     geomean_gain = _safe_geomean_gain(gains, empty_default=0.0)
     return VerificationDecision(
@@ -701,6 +768,13 @@ def evaluate_candidate(
         parity_path,
         reasons,
         max_cross_mode_logit_drift=task.max_cross_mode_logit_drift,
+        require_lossless_reference=(task.precision_track == PrecisionTrack.LOSSLESS),
+    )
+    _check_precision_track_gates(
+        task,
+        parity_path.parent,
+        reasons,
+        parity_path=parity_path,
     )
 
     paired = compute_paired_round_stats(baseline, candidate)

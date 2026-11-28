@@ -827,3 +827,174 @@ def test_green_context_topology_and_cold_prefill_step_tokens_and_ttft_gates(tmp_
     assert "TTFT 950.0 vs 1500.0ms" in dec_ok.metric_delta
 
 
+def test_round8_vmm_lossless_kv_codec_and_calibrated_lossy_dp2tp4_gates(tmp_path: Path) -> None:
+    import json
+    from evolith.core.topology import LosslessKvCodecGateSpec, LossyQualityGateSpec
+    from evolith.zstep.gates import evaluate_candidate, evaluate_screen, load_benchmark
+    from evolith.zstep.hardware import resolve_benchmark_profile, resolve_hardware_profile
+    from evolith.zstep.remote import ZStepRemoteRunner
+    from evolith.zstep.task import ZStepRSITask
+
+    # 1. VMM peer arena topology guidance & LosslessKvCodecGateSpec 0-ULP enforcement
+    topo = HardwareTopologySnapshot(
+        vendor="nvidia",
+        arch_tag="sm120",
+        device_name="NVIDIA RTX 6000D",
+        world_size=8,
+        compute_units_per_device=156,
+        peer_p2p_matrix=_pair_p2p_matrix(8),
+        vmm_peer_arena_supported=True,
+        vmm_granularity_bytes=2 * 1024 * 1024,
+        toolchain_version="cuda-13.0",
+    )
+    notes = " ".join(topo.collective_guidance_notes())
+    assert "VMM POSIX-FD peer arena supported (granularity=2.0 MiB)" in notes
+
+    kv_gate = LosslessKvCodecGateSpec(min_compression_ratio=1.20)
+    ok_kv, reasons_ok = kv_gate.evaluate(
+        mismatched_bytes=0,
+        decode_err_flag=0,
+        crc32_verified=True,
+        measured_compression_ratio=1.42,
+    )
+    assert ok_kv and not reasons_ok
+    bad_ulp, reasons_ulp = kv_gate.evaluate(
+        mismatched_bytes=1,
+        decode_err_flag=0,
+        crc32_verified=True,
+        measured_compression_ratio=1.80,
+    )
+    assert not bad_ulp and any("0-ULP" in r for r in reasons_ulp)
+
+    # 2. PiecewisePolicySynthesizer CALIBRATED_LOSSY quality-gate enforcement
+    synth_lossy = PiecewisePolicySynthesizer(
+        incumbent_backend="lossless_mxfp4_w4a8",
+        allowed_track=PrecisionTrack.CALIBRATED_LOSSY,
+        min_speedup_guardband=1.05,
+        lossy_quality_gate=LossyQualityGateSpec(max_top1_kl_divergence=0.02, max_ppl_delta=0.05),
+    )
+    plan_lossy = synth_lossy.synthesize(
+        [
+            BackendCellMeasurement(
+                backend_id="lossless_mxfp4_w4a8",
+                phase="prefill",
+                batch_tokens=4096,
+                seq_len=8192,
+                latency_us=3000.0,
+                precision_track=PrecisionTrack.LOSSLESS,
+            ),
+            BackendCellMeasurement(
+                backend_id="uncalibrated_nvfp4",
+                phase="prefill",
+                batch_tokens=4096,
+                seq_len=8192,
+                latency_us=1600.0,
+                precision_track=PrecisionTrack.CALIBRATED_LOSSY,
+                lossy_kl_divergence=0.08,
+                lossy_ppl_delta=0.12,
+            ),
+            BackendCellMeasurement(
+                backend_id="calibrated_nvfp4_w4a8",
+                phase="prefill",
+                batch_tokens=4096,
+                seq_len=8192,
+                latency_us=1750.0,
+                precision_track=PrecisionTrack.CALIBRATED_LOSSY,
+                lossy_kl_divergence=0.008,
+                lossy_ppl_delta=0.015,
+            ),
+        ]
+    )
+    assert plan_lossy.resolve(phase="prefill", batch_tokens=4096, seq_len=8192) == "calibrated_nvfp4_w4a8"
+    assert any("lossy_quality_gate_failed" in r for r in plan_lossy.rejected_candidates)
+
+    # 3. sm120-8x6000d-dp2tp4 & nvfp4-dp2tp4 profile + ZStepRSITask / gates track isolation
+    hw_dp2 = resolve_hardware_profile("sm120-8x6000d-dp2tp4")
+    assert (hw_dp2.world_size, hw_dp2.dp_size, hw_dp2.tp_size) == (8, 2, 4)
+    bp_nvfp4 = resolve_benchmark_profile("nvfp4-dp2tp4")
+    assert bp_nvfp4.precision_track == PrecisionTrack.CALIBRATED_LOSSY
+
+    ev_dir = tmp_path / "ev_lossy"
+    ev_dir.mkdir()
+    base_f = ev_dir / "base.json"
+    cand_f = ev_dir / "cand.json"
+    par_f = ev_dir / "parity.json"
+    q_f = ev_dir / "lossy-quality.json"
+    for p, tp in ((base_f, 100.0), (cand_f, 145.0)):
+        p.write_text(
+            json.dumps(
+                {
+                    "tiers": [
+                        {
+                            "label": "prefill8k_v",
+                            "repeat": 0,
+                            "output_throughput_tok_s": tp,
+                            "median_ttft_ms": 280.0,
+                            "mean_tpot_ms": 5.0,
+                            "p99_itl_ms": 7.0,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+    par_f.write_text(
+        json.dumps(
+            {
+                "precision_track": "calibrated_lossy",
+                "triton_recompilations": 0,
+                "cases": [
+                    {
+                        "name": "prime_squares_table",
+                        "single_match": {"exact_token_match_rate": 1.0},
+                        "batched_match": {"exact_token_match_rate": 1.0},
+                        "chunked_match": {"exact_token_match_rate": 1.0},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Lossy candidate on LOSSLESS track must be mechanically rejected!
+    t_lossless = ZStepRSITask(
+        project_root=tmp_path,
+        source_repo=tmp_path / "src",
+        remote_host="gpu-host",
+        hardware_profile="sm120-8x6000d-dp2tp4",
+        precision_track=PrecisionTrack.LOSSLESS,
+    )
+    dec_blocked = evaluate_candidate(load_benchmark(base_f), load_benchmark(cand_f), par_f, t_lossless)
+    assert not dec_blocked.accepted and any("PrecisionTrack.LOSSLESS" in r for r in dec_blocked.reasons)
+
+    # CALIBRATED_LOSSY task fails without lossy-quality.json, then passes once calibrated metrics pass!
+    t_lossy = ZStepRSITask(
+        project_root=tmp_path,
+        source_repo=tmp_path / "src",
+        remote_host="gpu-host",
+        hardware_profile="sm120-8x6000d-dp2tp4",
+        benchmark_profile="nvfp4-dp2tp4",
+    )
+    script_dp2 = ZStepRemoteRunner(t_lossy).benchmark_script(
+        "runs/g0001/screen/src", "runs/g0001/screen/metrics.json", t_lossy.screen_tiers, 1, None
+    )
+    assert "--world-size 4 " in script_dp2
+    assert not evaluate_screen(cand_f, par_f, t_lossy, base_f).passed
+
+    q_f.write_text(
+        json.dumps(
+            {
+                "measured_kl": 0.009,
+                "measured_ppl_delta": 0.018,
+                "measured_retrieval_acc": 0.995,
+                "measured_task_em_ratio": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert evaluate_screen(cand_f, par_f, t_lossy, base_f).passed
+    dec_lossy_ok = evaluate_candidate(load_benchmark(base_f), load_benchmark(cand_f), par_f, t_lossy)
+    assert dec_lossy_ok.accepted
+
+
+

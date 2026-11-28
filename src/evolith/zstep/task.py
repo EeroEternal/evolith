@@ -7,6 +7,7 @@ import re
 
 from pydantic import BaseModel, Field, model_validator
 
+from evolith.core.topology import LossyQualityGateSpec, PrecisionTrack
 from evolith.models import EvolutionPlane
 
 _ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -146,6 +147,9 @@ class ZStepRSITask(BaseModel):
     max_vram_used_mib: float | None = Field(default=None, gt=0.0)
     max_p99_itl_ms: float | None = Field(default=None, gt=0.0)
     max_ttft_ms: float | None = Field(default=None, gt=0.0)
+    precision_track: PrecisionTrack = PrecisionTrack.LOSSLESS
+    lossy_quality_gate: LossyQualityGateSpec | None = None
+    lossy_quality_report_path: Path | None = None
     max_tier_cv: float = Field(default=0.10, ge=0.0)
     min_paired_se_z: float = Field(default=0.0, ge=0.0)
     max_screen_throughput_regression: float = 0.02
@@ -191,6 +195,8 @@ class ZStepRSITask(BaseModel):
     )
     allowed_roots: tuple[str, ...] = (
         "worker/zstep_worker/env_config.py",
+        "worker/zstep_worker/cuda_driver.py",
+        "worker/zstep_worker/kv_dram_tier.py",
         "worker/zstep_worker/models/deepseek_v41.py",
         "worker/zstep_worker/models/deepseek_v41_dspark.py",
         "worker/zstep_worker/runtime_loop.py",
@@ -250,8 +256,12 @@ class ZStepRSITask(BaseModel):
                 self.max_pages_per_seq = preset.max_pages_per_seq
             if "max_step_tokens" not in self.model_fields_set:
                 self.max_step_tokens = preset.max_step_tokens
+            if "precision_track" not in self.model_fields_set:
+                self.precision_track = preset.precision_track
             if "worker_env_overrides" not in self.model_fields_set and preset.env_overrides:
                 self.worker_env_overrides = dict(preset.env_overrides)
+        if self.precision_track == PrecisionTrack.CALIBRATED_LOSSY and self.lossy_quality_gate is None:
+            self.lossy_quality_gate = LossyQualityGateSpec()
         for env_key in self.worker_env_overrides:
             if not _ENV_KEY_RE.match(env_key) or env_key in _FORBIDDEN_ENV_KEYS:
                 raise ValueError(

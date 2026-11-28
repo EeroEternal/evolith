@@ -13,6 +13,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from evolith.core.topology import PrecisionTrack
+
 
 class BenchmarkProfile(BaseModel):
     profile_id: str
@@ -20,6 +22,7 @@ class BenchmarkProfile(BaseModel):
     screen_tiers: str
     verify_tiers: str
     regime_phase: Literal["decode", "prefill", "mixed", "speculative"] = "mixed"
+    precision_track: PrecisionTrack = PrecisionTrack.LOSSLESS
     num_kv_pages: int = Field(default=2560, ge=64)
     max_pages_per_seq: int = Field(default=256, ge=16)
     max_step_tokens: int = Field(default=4096, ge=192)
@@ -99,6 +102,24 @@ BUILTIN_BENCHMARK_PROFILES: dict[str, BenchmarkProfile] = {
             "ZSTEP_MAX_MODEL_LEN": "33792",
         },
     ),
+    "nvfp4-dp2tp4": BenchmarkProfile(
+        profile_id="nvfp4-dp2tp4",
+        description="Isolated CALIBRATED_LOSSY single-island TP=4 / dual-island DP=2xTP=4 NVFP4 ladder",
+        screen_tiers="prefill8k_c1:1:4:8192:16;in512_c16_s:16:32:512:64",
+        verify_tiers=(
+            "prefill8k_v:1:6:8192:32;prefill16k_v:1:6:16384:32;"
+            "in512_c16_v:16:48:512:128;in512_c32_v:32:64:512:128"
+        ),
+        regime_phase="mixed",
+        precision_track=PrecisionTrack.CALIBRATED_LOSSY,
+        num_kv_pages=768,
+        max_pages_per_seq=144,
+        max_step_tokens=8192,
+        env_overrides={
+            "ZSTEP_MAX_MODEL_LEN": "18432",
+            "ZSTEP_ENGRAM_GPU_LAYERS": "0",
+        },
+    ),
 }
 
 
@@ -108,6 +129,7 @@ class HardwareProfile(BaseModel):
     gpu_arch: str = "sm120"
     compute_capability: str = "12.0"
     world_size: int = Field(default=8, ge=1)
+    dp_size: int = Field(default=1, ge=1)
     tp_size: int = Field(default=8, ge=1)
     pp_size: int = Field(default=1, ge=1)
     numa_nodes: int = Field(default=2, ge=1)
@@ -148,6 +170,19 @@ BUILTIN_HARDWARE_PROFILES: dict[str, HardwareProfile] = {
         vram_per_gpu_mib=85651,
         interconnect="pcie_pxb_dual_numa",
         decode_pipeline_1f1b=True,
+    ),
+    "sm120-8x6000d-dp2tp4": HardwareProfile(
+        profile_id="sm120-8x6000d-dp2tp4",
+        gpu_name="NVIDIA RTX 6000D",
+        gpu_arch="sm120",
+        compute_capability="12.0",
+        world_size=8,
+        dp_size=2,
+        tp_size=4,
+        pp_size=1,
+        numa_nodes=2,
+        vram_per_gpu_mib=85651,
+        interconnect="pcie_pxb_single_numa",
     ),
     "sm120-8x5090-tp8": HardwareProfile(
         profile_id="sm120-8x5090-tp8",
