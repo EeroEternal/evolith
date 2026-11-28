@@ -62,9 +62,19 @@ def test_export_profile_for_nebula_sail_gen3(tmp_path: Path) -> None:
     manifest = json.loads((out_dir / "nebula-deployment.json").read_text(encoding="utf-8"))
     assert manifest["engine_type"] == "zstep"
     assert manifest["docker_image"] == "zstep:sail-zw810e-gen3"
+    approved = json.loads(
+        (REPO_ROOT / "docs/benchmarks/ppu_zw810e_sail_20261128/approved_sail_policy.json").read_text(
+            encoding="utf-8"
+        )
+    )
     assert manifest["env"]["ZSTEP_BACKEND"] == "sail"
-    assert manifest["env"]["ZSTEP_SAIL_MOE_PREFILL_BACKEND"] == "dequant_acblas"
-    assert manifest["env"]["ZSTEP_SAIL_ENGRAM_INDEXER_BACKEND"] == "fused_hggc"
+    assert (
+        manifest["env"]["ZSTEP_SAIL_MOE_PREFILL_BACKEND"] == approved["moe_prefill_backend"]
+    )
+    assert (
+        manifest["env"]["ZSTEP_SAIL_ENGRAM_INDEXER_BACKEND"]
+        == approved["engram_indexer_backend"]
+    )
     assert "--speculative-method" in manifest["extra_args"]
     assert "dspark" in manifest["extra_args"]
 
