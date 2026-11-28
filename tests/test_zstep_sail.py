@@ -173,6 +173,9 @@ def test_sail_policy_bounds_and_cli_help(tmp_path: Path) -> None:
     assert v1_pol.qkv_fusion_mode == "separate"
     assert v1_pol.engram_indexer_backend == "eager_py"
     assert v1_pol.lm_head_dtype == "fp32"
+    assert v1_pol.ar_fuse_mhc_post == 0
+    assert v1_pol.moe_router_mode == "fp32"
+    assert v1_pol.mhc_backend == "legacy_2pass"
     assert CliRunner().invoke(app, ["zstep-sail-evolve", "--help"]).exit_code == 0
 
 
@@ -267,3 +270,31 @@ def test_unapplied_sail_policy_fails_closed(tmp_path: Path) -> None:
     evo._remote_bash = lambda *a, **kw: json.dumps(bad_resp)
     with pytest.raises(ValueError, match="Unapplied SAIL policy"):
         evo.model(SailPolicy(sparse_attn_backend="triton_tp8"), evo.directory / "m")
+
+
+def test_run_ssh_retries_transient_exit_255(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess as sp
+
+    evo = ZstepSailEvolution(make_cfg(tmp_path, control_path="/tmp/fake_sail_mux.sock"))
+    monkeypatch.setattr("evolith.lab.zstep_sail.time.sleep", lambda *_a: None)
+    calls = {"n": 0}
+
+    class FakeProc:
+        def __init__(self, rc: int, out: bytes) -> None:
+            self.returncode = rc
+            self._out = out
+            self.pid = 12345
+
+        def communicate(self, input=None, timeout=None):
+            return self._out, b""
+
+    def fake_popen(*_a, **_kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return FakeProc(255, b"")
+        return FakeProc(0, b"ok\n")
+
+    monkeypatch.setattr(sp, "Popen", fake_popen)
+    out = evo._run_ssh("echo ok", tmp_path / "ssh_test")
+    assert out == "ok\n"
+    assert calls["n"] == 2
