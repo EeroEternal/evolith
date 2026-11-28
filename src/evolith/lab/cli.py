@@ -172,11 +172,11 @@ def register(app: typer.Typer) -> None:
         cycles: Annotated[int, typer.Option(min=1, max=8)] = 2,
         evaluations: Annotated[int, typer.Option(min=1, max=64)] = 12,
         model_evaluations: Annotated[int, typer.Option(min=1, max=12)] = 3,
-        families_per_cycle: Annotated[int, typer.Option(min=1, max=6)] = 2,
+        families_per_cycle: Annotated[int, typer.Option(min=1, max=8)] = 2,
         rounds: Annotated[int, typer.Option(min=5, max=101)] = 11,
         iterations: Annotated[int, typer.Option(min=1, max=1000)] = 25,
         model_pairs: Annotated[int, typer.Option(min=5, max=19)] = 5,
-        min_share: Annotated[float, typer.Option(min=0.01, max=0.99)] = 0.03,
+        min_share: Annotated[float, typer.Option(min=0.001, max=0.99)] = 0.03,
         time_budget: Annotated[int, typer.Option(min=60, max=7200)] = 3600,
     ):
         """Observe 8x810E SAIL operator costs, confirm micro-winners, and verify against incumbent."""

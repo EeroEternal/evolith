@@ -153,10 +153,13 @@ def test_sail_policy_bounds_and_cli_help(tmp_path: Path) -> None:
         "mxfp4_moe_decode",
         "mxfp4_moe_prefill",
         "mhc_mixes",
+        "attn_qkv_o_proj",
+        "engram_compressor_indexer",
+        "lm_head",
     ):
         cands = family_candidates(default_p, fam)
         assert cands and default_p not in cands
-    # Legacy v1 approved policy JSON validates cleanly with v2 default mHC knobs
+    # Legacy v1/v2 approved policy JSON validates cleanly with v3 default knobs
     v1_pol = SailPolicy.model_validate(
         {
             "version": 1,
@@ -166,6 +169,10 @@ def test_sail_policy_bounds_and_cli_help(tmp_path: Path) -> None:
         }
     )
     assert v1_pol.mhc_split_k == 1 and v1_pol.mhc_fused_max_rows == 16
+    assert v1_pol.moe_prefill_backend == "triton_grouped"
+    assert v1_pol.qkv_fusion_mode == "separate"
+    assert v1_pol.engram_indexer_backend == "eager_py"
+    assert v1_pol.lm_head_dtype == "fp32"
     assert CliRunner().invoke(app, ["zstep-sail-evolve", "--help"]).exit_code == 0
 
 

@@ -19,12 +19,12 @@ import io
 import json
 import math
 import os
-from pathlib import Path
 import shlex
 import signal
 import subprocess
 import tarfile
 import time
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
@@ -40,6 +40,9 @@ SUPPORTED_SAIL_FAMILIES: frozenset[str] = frozenset(
         "mxfp4_moe_decode",
         "mxfp4_moe_prefill",
         "mhc_mixes",
+        "attn_qkv_o_proj",
+        "engram_compressor_indexer",
+        "lm_head",
     }
 )
 
@@ -52,18 +55,22 @@ DEFAULT_SAIL_CONTAINER_IMAGE: str = (
 class SailPolicy(StrictModel):
     """Bounded, typed PPU/SAIL runtime policy consumed via `ZSTEP_SAIL_POLICY_PATH`."""
 
-    version: Literal[1, 2] = 2
+    version: Literal[1, 2, 3] = 3
     ar_blocks: Literal[4, 8, 16, 24, 32, 64] = 8
     ar_threads: Literal[128, 256, 512] = 256
     ar_oneshot_max_bytes: Literal[65536, 131072, 262144, 524288] = 131072
     ar_pccl_min_bytes: Literal[262144, 524288, 1048576, 4194304, 67108864] = 67108864
-    moe_gemv_max_rows: Literal[8, 16, 32] = 16
+    moe_gemv_max_rows: Literal[8, 16, 32, 64, 128] = 16
     moe_gemv_threads: Literal[128, 256, 512] = 256
     moe_block_m: Literal[16, 32, 64] = 32
     moe_num_warps: Literal[4, 8] = 4
+    moe_prefill_backend: Literal["triton_grouped", "dequant_acblas"] = "triton_grouped"
     sparse_attn_backend: Literal["auto", "triton_tp8", "hggc_tp8", "flash_mla"] = "auto"
     mhc_split_k: Literal[1, 4, 8, 16] = 1
     mhc_fused_max_rows: Literal[16, 64, 256, 4096] = 16
+    qkv_fusion_mode: Literal["separate", "fused_qkv_epilogue"] = "separate"
+    engram_indexer_backend: Literal["eager_py", "fused_hggc"] = "eager_py"
+    lm_head_dtype: Literal["fp32", "bf16"] = "fp32"
 
     @property
     def key(self) -> str:
@@ -71,8 +78,11 @@ class SailPolicy(StrictModel):
             f"ar{self.ar_blocks}x{self.ar_threads}-os{self.ar_oneshot_max_bytes // 1024}k-"
             f"pccl{self.ar_pccl_min_bytes // 1024}k-"
             f"gemv{self.moe_gemv_max_rows}@{self.moe_gemv_threads}-"
-            f"bm{self.moe_block_m}w{self.moe_num_warps}-attn-{self.sparse_attn_backend}-"
-            f"mhc{self.mhc_split_k}r{self.mhc_fused_max_rows}"
+            f"bm{self.moe_block_m}w{self.moe_num_warps}-{self.moe_prefill_backend}-"
+            f"attn-{self.sparse_attn_backend}-"
+            f"mhc{self.mhc_split_k}r{self.mhc_fused_max_rows}-"
+            f"qkv-{self.qkv_fusion_mode}-ei-{self.engram_indexer_backend}-"
+            f"head-{self.lm_head_dtype}"
         )
 
     def to_worker_policy_dict(self) -> dict[str, int | str]:
@@ -85,9 +95,13 @@ class SailPolicy(StrictModel):
             "moe_gemv_threads": self.moe_gemv_threads,
             "moe_block_m": self.moe_block_m,
             "moe_num_warps": self.moe_num_warps,
+            "moe_prefill_backend": self.moe_prefill_backend,
             "sparse_attn_backend": self.sparse_attn_backend,
             "mhc_split_k": self.mhc_split_k,
             "mhc_fused_max_rows": self.mhc_fused_max_rows,
+            "qkv_fusion_mode": self.qkv_fusion_mode,
+            "engram_indexer_backend": self.engram_indexer_backend,
+            "lm_head_dtype": self.lm_head_dtype,
         }
 
 
@@ -116,7 +130,7 @@ class ZstepSailEvolutionConfig(StrictModel):
     cycles: int = Field(default=2, ge=1, le=8)
     evaluations: int = Field(default=12, ge=1, le=64)
     model_evaluations: int = Field(default=3, ge=1, le=12)
-    families_per_cycle: int = Field(default=2, ge=1, le=6)
+    families_per_cycle: int = Field(default=2, ge=1, le=8)
     rounds: int = Field(default=11, ge=5, le=101)
     iterations: int = Field(default=25, ge=1, le=1000)
     model_pairs: int = Field(default=5, ge=5, le=19)
@@ -164,8 +178,11 @@ def family_candidates(incumbent: SailPolicy, family: str) -> list[SailPolicy]:
                 candidates.append(cand)
     elif family == "mxfp4_moe_decode":
         for thrs, gmax in (
-            (128, incumbent.moe_gemv_max_rows),
+            (256, 128),
+            (256, 64),
+            (512, 128),
             (512, incumbent.moe_gemv_max_rows),
+            (128, incumbent.moe_gemv_max_rows),
             (256, 32),
             (256, 8),
         ):
@@ -175,8 +192,20 @@ def family_candidates(incumbent: SailPolicy, family: str) -> list[SailPolicy]:
             if cand != incumbent:
                 candidates.append(cand)
     elif family == "mxfp4_moe_prefill":
-        for bm, nw in ((16, 4), (16, 8), (64, 4), (32, 8), (64, 8)):
-            cand = incumbent.model_copy(update={"moe_block_m": bm, "moe_num_warps": nw})
+        for pb, bm, nw in (
+            ("dequant_acblas", incumbent.moe_block_m, incumbent.moe_num_warps),
+            ("triton_grouped", 16, 4),
+            ("triton_grouped", 16, 8),
+            ("triton_grouped", 64, 4),
+            ("triton_grouped", 32, 8),
+        ):
+            cand = incumbent.model_copy(
+                update={
+                    "moe_prefill_backend": pb,
+                    "moe_block_m": bm,
+                    "moe_num_warps": nw,
+                }
+            )
             if cand != incumbent:
                 candidates.append(cand)
     elif family == "mhc_mixes":
@@ -186,6 +215,20 @@ def family_candidates(incumbent: SailPolicy, family: str) -> list[SailPolicy]:
             )
             if cand != incumbent:
                 candidates.append(cand)
+    elif family == "attn_qkv_o_proj":
+        for qm in ("fused_qkv_epilogue", "separate"):
+            if qm != incumbent.qkv_fusion_mode:
+                candidates.append(incumbent.model_copy(update={"qkv_fusion_mode": qm}))
+    elif family == "engram_compressor_indexer":
+        for eib in ("fused_hggc", "eager_py"):
+            if eib != incumbent.engram_indexer_backend:
+                candidates.append(
+                    incumbent.model_copy(update={"engram_indexer_backend": eib})
+                )
+    elif family == "lm_head":
+        for hd in ("bf16", "fp32"):
+            if hd != incumbent.lm_head_dtype:
+                candidates.append(incumbent.model_copy(update={"lm_head_dtype": hd}))
     else:
         raise ValueError(f"Unsupported SAIL policy family: {family!r}")
 
@@ -224,6 +267,7 @@ def compose_sail_proposals(incumbent: SailPolicy, winners: list[dict]) -> list[S
                 )
             elif fam == "mxfp4_moe_prefill":
                 updates.update(
+                    moe_prefill_backend=pol.moe_prefill_backend,
                     moe_block_m=pol.moe_block_m,
                     moe_num_warps=pol.moe_num_warps,
                 )
@@ -232,6 +276,12 @@ def compose_sail_proposals(incumbent: SailPolicy, winners: list[dict]) -> list[S
                     mhc_split_k=pol.mhc_split_k,
                     mhc_fused_max_rows=pol.mhc_fused_max_rows,
                 )
+            elif fam == "attn_qkv_o_proj":
+                updates["qkv_fusion_mode"] = pol.qkv_fusion_mode
+            elif fam == "engram_compressor_indexer":
+                updates["engram_indexer_backend"] = pol.engram_indexer_backend
+            elif fam == "lm_head":
+                updates["lm_head_dtype"] = pol.lm_head_dtype
         composed = incumbent.model_copy(update=updates)
         if composed.key not in seen:
             seen.add(composed.key)
@@ -424,7 +474,7 @@ class ZstepSailEvolution:
 
     def _verify_applied_policy(self, result: dict, policy: SailPolicy) -> None:
         applied = result.get("applied_policy")
-        if not isinstance(applied, dict):
+        if applied is None or type(applied) is not dict:
             raise ValueError("Missing applied SAIL policy in worker log; failing closed.")
         expected = policy.to_worker_policy_dict()
         for k, v in expected.items():
