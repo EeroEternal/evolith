@@ -8,14 +8,14 @@ immutable, verifies every candidate against an independent FP32/FP64 reference (
 from __future__ import annotations
 
 import argparse
-from datetime import timedelta
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+from datetime import timedelta
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -29,8 +29,9 @@ def _init_sail_device_and_stage(dev: torch.device) -> torch.Tensor:
     stage_u8 = torch.zeros(32 * 1024 * 1024, dtype=torch.uint8, pin_memory=True)
     warm_gpu = torch.zeros(4 * 1024 * 1024, dtype=torch.uint8, device=dev)
     warm_gpu.copy_(stage_u8[: 4 * 1024 * 1024], non_blocking=False)
-    a = torch.ones((16, 16), dtype=torch.bfloat16, device=dev)
-    _ = a @ a
+    a = torch.ones((2048, 2048), dtype=torch.bfloat16, device=dev)
+    for _ in range(20):
+        _ = a @ a
     torch.cuda.synchronize(dev)
     return stage_u8
 
@@ -469,8 +470,8 @@ def _run_micro(args: argparse.Namespace) -> dict:
         }
 
     if family in ("mxfp4_moe_decode", "mxfp4_moe_prefill"):
-        e_cnt, top_k, h_dim, i_tp = 64, 6, 5120, 288
-        row_set = (8, 24) if family == "mxfp4_moe_decode" else (64, 128)
+        e_cnt, top_k, h_dim, i_tp = 384, 6, 5120, 288
+        row_set = (8, 24, 64) if family == "mxfp4_moe_decode" else (256, 512)
         max_m = max(row_set)
         xs = {
             m_r: _to_gpu_pinned(
@@ -549,6 +550,10 @@ def _run_micro(args: argparse.Namespace) -> dict:
         po_buf = torch.zeros((max_m * top_k, h_dim), dtype=torch.bfloat16, device=dev)
         mo_buf = torch.zeros((max_m, h_dim), dtype=torch.bfloat16, device=dev)
         aq_buf = torch.zeros((max_m, h_dim), dtype=torch.bfloat16, device=dev)
+        deq_w_buf = torch.zeros((64, 2 * i_tp, h_dim), dtype=torch.bfloat16, device=dev)
+        ta_buf = torch.zeros((64, 64, h_dim), dtype=torch.bfloat16, device=dev)
+        tgu_buf = torch.zeros((64, 64, 2 * i_tp), dtype=torch.float32, device=dev)
+        ti_tile_buf = torch.zeros((64, 64, i_tp), dtype=torch.bfloat16, device=dev)
 
         def _exec_one(xm: torch.Tensor, cfg: dict) -> torch.Tensor:
             return ops.dsv41_moe_tp8_forward(
@@ -576,10 +581,15 @@ def _run_micro(args: argparse.Namespace) -> dict:
                 pair_out_buf=po_buf,
                 moe_out_buf=mo_buf,
                 act_quant_x_buf=aq_buf,
+                deq_w_buf=deq_w_buf,
+                tile_a_buf=ta_buf,
+                tile_gu_buf=tgu_buf,
+                tile_inter_buf=ti_tile_buf,
                 gemv_max_rows=int(cfg["moe_gemv_max_rows"]),
                 gemv_threads=int(cfg["moe_gemv_threads"]),
                 block_m=int(cfg["moe_block_m"]),
                 num_warps=int(cfg["moe_num_warps"]),
+                prefill_backend=str(cfg.get("moe_prefill_backend", "triton_grouped")),
             )
 
         for cfg in (baseline_cfg, candidate_cfg):
@@ -796,12 +806,624 @@ def _run_micro(args: argparse.Namespace) -> dict:
             "candidate_us": candidate_us,
         }
 
+    if family == "attn_qkv_o_proj":
+        row_set = (1, 8, 32)
+        max_m = max(row_set)
+        h_dim, q_rank, kv_dim = 5120, 1280, 512
+        norm_eps = 1.0e-20
+        hs = {
+            m_r: _to_gpu_pinned(
+                torch.randn((m_r, 4, h_dim), generator=gen, dtype=torch.float32) * 0.4,
+                dev,
+                stage_u8,
+                dtype=torch.bfloat16,
+            )
+            for m_r in row_set
+        }
+        hs_orig = {m_r: t.clone() for m_r, t in hs.items()}
+        pms = {
+            m_r: _to_gpu_pinned(
+                torch.rand((m_r, 4), generator=gen, dtype=torch.float32), dev, stage_u8
+            )
+            for m_r in row_set
+        }
+        attn_os = {
+            m_r: _to_gpu_pinned(
+                torch.randn((m_r, 8, 512), generator=gen, dtype=torch.float32) * 0.3,
+                dev,
+                stage_u8,
+                dtype=torch.bfloat16,
+            )
+            for m_r in row_set
+        }
+        attn_os_orig = {m_r: t.clone() for m_r, t in attn_os.items()}
+        norm_w = _to_gpu_pinned(
+            torch.ones((h_dim,), dtype=torch.float32)
+            + torch.randn((h_dim,), generator=gen, dtype=torch.float32) * 0.05,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
+        q_norm_w = _to_gpu_pinned(
+            torch.ones((q_rank,), dtype=torch.float32)
+            + torch.randn((q_rank,), generator=gen, dtype=torch.float32) * 0.05,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
+        kv_norm_w = _to_gpu_pinned(
+            torch.ones((kv_dim,), dtype=torch.float32)
+            + torch.randn((kv_dim,), generator=gen, dtype=torch.float32) * 0.05,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
+        wqkv_a = _to_gpu_pinned(
+            torch.randn((q_rank + kv_dim, h_dim), generator=gen, dtype=torch.float32) * 0.02,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
+        wq_a = wqkv_a[:q_rank]
+        wkv = wqkv_a[q_rank:]
+        wq_b_cat = _to_gpu_pinned(
+            torch.randn((4608, q_rank), generator=gen, dtype=torch.float32) * 0.02,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
+        wq_b = wq_b_cat[:4096]
+        idx_wq_b = wq_b_cat[4096:]
+        wo_a = _to_gpu_pinned(
+            torch.randn((1024, 4096), generator=gen, dtype=torch.float32) * 0.02,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
+        wo_b = _to_gpu_pinned(
+            torch.randn((h_dim, 1024), generator=gen, dtype=torch.float32) * 0.02,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
+        cos_sin = _to_gpu_pinned(
+            torch.randn((1024, 64), generator=gen, dtype=torch.float32), dev, stage_u8
+        )
+        pos_all = _to_gpu_pinned(
+            torch.arange(max_m, dtype=torch.int32) + 17, dev, stage_u8
+        )
+        swa_slots = _to_gpu_pinned(
+            torch.arange(max_m, dtype=torch.int64) + 128, dev, stage_u8
+        )
+
+        x_norm_buf = torch.zeros((max_m, h_dim), dtype=torch.bfloat16, device=dev)
+        q_in_buf = torch.zeros((max_m, h_dim), dtype=torch.bfloat16, device=dev)
+        qkv_a_buf = torch.zeros((max_m, q_rank + kv_dim), dtype=torch.bfloat16, device=dev)
+        qr_buf = torch.zeros((max_m, q_rank), dtype=torch.bfloat16, device=dev)
+        qr_q_buf = torch.zeros((max_m, q_rank), dtype=torch.bfloat16, device=dev)
+        kv_buf = torch.zeros((max_m, kv_dim), dtype=torch.bfloat16, device=dev)
+        q_cat_buf = torch.zeros((max_m, 4608), dtype=torch.bfloat16, device=dev)
+        q_buf = torch.zeros((max_m, 8, 512), dtype=torch.bfloat16, device=dev)
+        qi_buf = torch.zeros((max_m, 4, 128), dtype=torch.bfloat16, device=dev)
+        ao_work = torch.zeros((max_m, 8, 512), dtype=torch.bfloat16, device=dev)
+        ol_buf = torch.zeros((max_m, 1024), dtype=torch.bfloat16, device=dev)
+        out_buf = torch.zeros((max_m, h_dim), dtype=torch.bfloat16, device=dev)
+        kv_arena = torch.zeros((512, 1, 512), dtype=torch.bfloat16, device=dev)
+
+        def _exec_qkv(m_r: int, mode: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            hm = hs[m_r]
+            pm = pms[m_r]
+            pos_m = pos_all[:m_r]
+            slots_m = swa_slots[:m_r]
+            ao = ao_work[:m_r]
+            ao.copy_(attn_os[m_r])
+            xn = x_norm_buf[:m_r]
+            qi_in = q_in_buf[:m_r]
+            if mode == "fused_qkv_epilogue":
+                ops.mhc_pre_rmsnorm_quant(
+                    hm, pm, norm_w, normed_out=xn, quant_out=qi_in, write_normed=True, norm_eps=norm_eps
+                )
+                qkva = qkv_a_buf[:m_r]
+                torch.matmul(qi_in, wqkv_a.t(), out=qkva)
+                ops.fused_qkv_a_epilogue(
+                    qkva,
+                    q_norm_w,
+                    kv_norm_w,
+                    cos_sin,
+                    pos_m,
+                    slots_m,
+                    qr_unquant_out=qr_buf[:m_r],
+                    qr_quant_out=qr_q_buf[:m_r],
+                    kv_arena=kv_arena,
+                    layer_swa_base=0,
+                    rope_dim=64,
+                    write_qr_unquant=False,
+                    eps=norm_eps,
+                )
+                qc = q_cat_buf[:m_r]
+                torch.matmul(qr_q_buf[:m_r], wq_b_cat.t(), out=qc)
+                ops.fused_q_idx_epilogue(
+                    qc, cos_sin, pos_m, q_out=q_buf[:m_r], q_idx_out=qi_buf[:m_r]
+                )
+                ops.fused_inv_rope_act_quant(ao, cos_sin, pos_m, rope_dim=64)
+                o_flat = ao.view(m_r, 4096)
+            else:
+                ops.mhc_pre_rmsnorm(hm, pm, norm_w, normed_out=xn, norm_eps=norm_eps)
+                ops.act_quant_ue8m0(xn, out=qi_in)
+                qr = qr_buf[:m_r]
+                torch.matmul(qi_in, wq_a.t(), out=qr)
+                ops.rmsnorm_bf16(qr, q_norm_w, eps=norm_eps, out=qr)
+                wkv_o = kv_buf[:m_r]
+                torch.matmul(qi_in, wkv.t(), out=wkv_o)
+                ops.rmsnorm_bf16(wkv_o, kv_norm_w, eps=norm_eps, out=wkv_o)
+                ops.apply_rope_inplace(wkv_o.unsqueeze(1), cos_sin, pos_m, rope_dim=64, inverse=False)
+                ops.inplace_act_quant_ue8m0(wkv_o)
+                kv_arena.view(-1, 512).index_copy_(0, slots_m, wkv_o)
+                ops.act_quant_ue8m0(qr, out=qr_q_buf[:m_r])
+                torch.matmul(qr_q_buf[:m_r], wq_b.t(), out=q_buf[:m_r].view(m_r, -1))
+                ops.apply_rope_inplace(q_buf[:m_r], cos_sin, pos_m, rope_dim=64, inverse=False)
+                torch.matmul(qr_q_buf[:m_r], idx_wq_b.t(), out=qi_buf[:m_r].view(m_r, -1))
+                ops.apply_rope_inplace(qi_buf[:m_r], cos_sin, pos_m, rope_dim=64, inverse=False)
+                ops.inplace_fp4_quant(qi_buf[:m_r], block_size=32, is_e4m3_scale=False)
+                ops.apply_rope_inplace(ao, cos_sin, pos_m, rope_dim=64, inverse=True)
+                o_flat = ao.view(m_r, 4096)
+                ops.inplace_act_quant_ue8m0(o_flat)
+            ol = ol_buf[:m_r]
+            torch.matmul(o_flat, wo_a.t(), out=ol)
+            ops.inplace_act_quant_ue8m0(ol)
+            out = out_buf[:m_r]
+            torch.matmul(ol, wo_b.t(), out=out)
+            return q_buf[:m_r].clone(), qi_buf[:m_r].clone(), kv_arena.view(-1, 512)[slots_m].clone(), out.clone()
+
+        b_mode = str(baseline_cfg.get("qkv_fusion_mode", "separate"))
+        c_mode = str(candidate_cfg.get("qkv_fusion_mode", "separate"))
+        for md in (b_mode, c_mode):
+            for _ in range(3):
+                for m_r in row_set:
+                    _exec_qkv(m_r, md)
+        torch.cuda.synchronize(dev)
+
+        # Gate 1: Exact bit-level equivalence (`0.0` error) of all 4 HGGC fused epilogue kernels
+        # when fed identical GEMM outputs (isolates C++/CUDA epilogues from acBLAS N-tile rounding).
+        xn_e_ref = torch.zeros((max_m, h_dim), dtype=torch.bfloat16, device=dev)
+        qi_e_ref = torch.zeros((max_m, h_dim), dtype=torch.bfloat16, device=dev)
+        ops.mhc_pre_rmsnorm(hs[max_m], pms[max_m], norm_w, normed_out=xn_e_ref, norm_eps=norm_eps)
+        ops.act_quant_ue8m0(xn_e_ref, out=qi_e_ref)
+        xn_e_f = torch.zeros_like(xn_e_ref)
+        qi_e_f = torch.zeros_like(qi_e_ref)
+        ops.mhc_pre_rmsnorm_quant(
+            hs[max_m],
+            pms[max_m],
+            norm_w,
+            normed_out=xn_e_f,
+            quant_out=qi_e_f,
+            write_normed=True,
+            norm_eps=norm_eps,
+        )
+        qkva_same = qi_e_ref @ wqkv_a.t()
+        qr_e_ref = qkva_same[:, :q_rank].contiguous()
+        ops.rmsnorm_bf16(qr_e_ref, q_norm_w, eps=norm_eps, out=qr_e_ref)
+        qr_q_e_ref = torch.zeros_like(qr_e_ref)
+        ops.act_quant_ue8m0(qr_e_ref, out=qr_q_e_ref)
+        wkv_e_ref = qkva_same[:, q_rank:].contiguous()
+        ops.rmsnorm_bf16(wkv_e_ref, kv_norm_w, eps=norm_eps, out=wkv_e_ref)
+        ops.apply_rope_inplace(wkv_e_ref.unsqueeze(1), cos_sin, pos_all, rope_dim=64, inverse=False)
+        ops.inplace_act_quant_ue8m0(wkv_e_ref)
+        qr_u_e_f = torch.zeros_like(qr_e_ref)
+        qr_q_e_f = torch.zeros_like(qr_e_ref)
+        kv_arena.zero_()
+        ops.fused_qkv_a_epilogue(
+            qkva_same,
+            q_norm_w,
+            kv_norm_w,
+            cos_sin,
+            pos_all,
+            swa_slots,
+            qr_unquant_out=qr_u_e_f,
+            qr_quant_out=qr_q_e_f,
+            kv_arena=kv_arena,
+            layer_swa_base=0,
+            rope_dim=64,
+            write_qr_unquant=True,
+            eps=norm_eps,
+        )
+        wkv_e_f = kv_arena.view(-1, 512)[swa_slots].clone()
+        qc_same = qr_q_e_ref @ wq_b_cat.t()
+        q_e_ref = qc_same[:, :4096].contiguous().view(max_m, 8, 512)
+        ops.apply_rope_inplace(q_e_ref, cos_sin, pos_all, rope_dim=64, inverse=False)
+        qi_sub_ref = qc_same[:, 4096:].contiguous().view(max_m, 4, 128)
+        ops.apply_rope_inplace(qi_sub_ref, cos_sin, pos_all, rope_dim=64, inverse=False)
+        ops.inplace_fp4_quant(qi_sub_ref, block_size=32, is_e4m3_scale=False)
+        q_e_f = torch.zeros_like(q_e_ref)
+        qi_sub_f = torch.zeros_like(qi_sub_ref)
+        ops.fused_q_idx_epilogue(qc_same, cos_sin, pos_all, q_out=q_e_f, q_idx_out=qi_sub_f)
+        ao_e_ref = attn_os[max_m].clone()
+        ops.apply_rope_inplace(ao_e_ref, cos_sin, pos_all, rope_dim=64, inverse=True)
+        ops.inplace_act_quant_ue8m0(ao_e_ref.view(max_m, 4096))
+        ao_e_f = attn_os[max_m].clone()
+        ops.fused_inv_rope_act_quant(ao_e_f, cos_sin, pos_all, rope_dim=64)
+        epilogues_exact = bool(
+            torch.equal(xn_e_ref, xn_e_f)
+            and torch.equal(qi_e_ref, qi_e_f)
+            and torch.equal(qr_e_ref, qr_u_e_f)
+            and torch.equal(qr_q_e_ref, qr_q_e_f)
+            and torch.equal(wkv_e_ref, wkv_e_f)
+            and torch.equal(q_e_ref, q_e_f)
+            and torch.equal(qi_sub_ref, qi_sub_f)
+            and torch.equal(ao_e_ref, ao_e_f)
+        )
+
+        # Gate 2: End-to-end pipeline verification (accounting for 1-ULP acBLAS cat-vs-split rounding
+        # across discrete E4M3fn / FP4 E2M1 block quantization boundaries).
+        e2e_ok = True
+        for m_r in row_set:
+            rq, rqi, rkv, rout = _exec_qkv(m_r, "separate")
+            cq, cqi, ckv, cout = _exec_qkv(m_r, c_mode)
+            dq = (rq.float() - cq.float()).abs()
+            dqi = (rqi.float() - cqi.float()).abs()
+            dkv = (rkv.float() - ckv.float()).abs()
+            dout = (rout.float() - cout.float()).abs()
+            if (
+                float(dq.max().item()) >= 0.02
+                or float(dout.max().item()) >= 0.02
+                or float(dqi.max().item()) > 0.25
+                or float(dkv.max().item()) > 0.125
+                or float(dqi.mean().item()) >= 1.0e-3
+                or float(dkv.mean().item()) >= 1.0e-3
+                or float((dqi > 0.02).float().mean().item()) > 0.005
+                or float((dkv > 0.02).float().mean().item()) > 0.005
+            ):
+                e2e_ok = False
+        inputs_unchanged = all(torch.equal(hs[m_r], hs_orig[m_r]) for m_r in row_set) and all(
+            torch.equal(attn_os[m_r], attn_os_orig[m_r]) for m_r in row_set
+        )
+        reference_ok = epilogues_exact and e2e_ok
+
+        def _time_qkv(md: str) -> float:
+            ev0 = torch.cuda.Event(enable_timing=True)
+            ev1 = torch.cuda.Event(enable_timing=True)
+            ev0.record()
+            for _ in range(iterations):
+                for m_r in row_set:
+                    _exec_qkv(m_r, md)
+            ev1.record()
+            ev1.synchronize()
+            return float(ev0.elapsed_time(ev1)) * 1000.0 / float(len(row_set) * iterations)
+
+        baseline_us, candidate_us = [], []
+        for r_idx in range(rounds):
+            if r_idx % 2 == 0:
+                bt, ct = _time_qkv(b_mode), _time_qkv(c_mode)
+            else:
+                ct, bt = _time_qkv(c_mode), _time_qkv(b_mode)
+            baseline_us.append(bt)
+            candidate_us.append(ct)
+
+        return {
+            "family": family,
+            "seed": seed,
+            "rounds": rounds,
+            "iterations": iterations,
+            "world_size": 1,
+            "baseline_config": baseline_cfg,
+            "config": candidate_cfg,
+            "inputs_unchanged": inputs_unchanged,
+            "reference_ok": reference_ok,
+            "ranks_agree": True,
+            "baseline_us": baseline_us,
+            "candidate_us": candidate_us,
+        }
+
+    if family == "engram_compressor_indexer":
+        row_set = (8, 32)
+        max_m = max(row_set)
+        h_dim, eff_c, lat_pp, bt_w = 5120, 2048, 128, 16
+        hs = {
+            m_r: _to_gpu_pinned(
+                torch.randn((m_r, 4, h_dim), generator=gen, dtype=torch.float32) * 0.4,
+                dev,
+                stage_u8,
+                dtype=torch.bfloat16,
+            )
+            for m_r in row_set
+        }
+        hs_orig = {m_r: t.clone() for m_r, t in hs.items()}
+        kvps = {
+            m_r: _to_gpu_pinned(
+                torch.randn((m_r, 5 * h_dim), generator=gen, dtype=torch.float32) * 0.3,
+                dev,
+                stage_u8,
+                dtype=torch.bfloat16,
+            )
+            for m_r in row_set
+        }
+        qk_prod = _to_gpu_pinned(
+            torch.randn((4, h_dim), generator=gen, dtype=torch.float32) * 0.1, dev, stage_u8
+        )
+        k_cache = _to_gpu_pinned(
+            torch.randn((512, lat_pp, 128), generator=gen, dtype=torch.float32) * 0.2,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
+        mla_bt = _to_gpu_pinned(
+            torch.randint(1, 500, (max_m, bt_w), generator=gen, dtype=torch.int32), dev, stage_u8
+        )
+        q_idxs = {
+            m_r: _to_gpu_pinned(
+                torch.randn((m_r, 4, 128), generator=gen, dtype=torch.float32) * 0.2,
+                dev,
+                stage_u8,
+                dtype=torch.bfloat16,
+            )
+            for m_r in row_set
+        }
+        w_idxs = {
+            m_r: _to_gpu_pinned(
+                torch.randn((m_r, 4), generator=gen, dtype=torch.float32) * 0.2,
+                dev,
+                stage_u8,
+                dtype=torch.bfloat16,
+            )
+            for m_r in row_set
+        }
+        # Mix both `comp_len <= 512` and `comp_len > 512` (`900`) to verify both fast & bitonic paths!
+        pos_cpu = torch.tensor(
+            [380 if i % 2 == 0 else 900 for i in range(max_m)], dtype=torch.int32
+        )
+        pos_gpu = _to_gpu_pinned(pos_cpu, dev, stage_u8)
+        row_seq_ids = torch.arange(max_m, dtype=torch.int64, device=dev)
+        comp_arange = torch.arange(eff_c, dtype=torch.int32, device=dev)
+        w_scale = float((128**-0.5) * (32**-0.5))
+
+        h_work = torch.zeros((max_m, 4, h_dim), dtype=torch.bfloat16, device=dev)
+        sc_buf = torch.zeros((max_m, eff_c), dtype=torch.float32, device=dev)
+        tk_buf = torch.full((max_m, 640), -1, dtype=torch.int32, device=dev)
+
+        def _exec_ei(m_r: int, bk: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            hw = h_work[:m_r]
+            hw.copy_(hs[m_r])
+            kvp = kvps[m_r]
+            qi = q_idxs[m_r]
+            wi = w_idxs[m_r]
+            pm = pos_gpu[:m_r]
+            rs = row_seq_ids[:m_r]
+            bt_m = mla_bt[:m_r]
+            sc = sc_buf[:m_r]
+            tk = tk_buf[:m_r]
+            tk.fill_(-1)
+            if bk == "fused_hggc":
+                ops.engram_gated_residual(hw, kvp, qk_prod, norm_eps=1.0e-20)
+                ops.indexer_paged_score(
+                    qi,
+                    wi,
+                    k_cache,
+                    bt_m,
+                    rs,
+                    pm,
+                    scores_out=sc,
+                    weight_scale=w_scale,
+                    compress_ratio=1,
+                    lat_pp=lat_pp,
+                    bt_width=bt_w,
+                    eff_max_c=eff_c,
+                )
+                ops.indexer_topk512_slots(
+                    sc,
+                    bt_m,
+                    rs,
+                    pm,
+                    shared_full_topk=tk,
+                    compress_ratio=1,
+                    lat_pp=lat_pp,
+                    bt_width=bt_w,
+                    eff_max_c=eff_c,
+                    mla_arena_base=1000,
+                )
+            else:
+                kf = kvp[:, : 4 * h_dim].float().view(m_r, 4, h_dim)
+                vf = kvp[:, 4 * h_dim :].float().unsqueeze(1)
+                hf = hw.float()
+                rstd = torch.rsqrt(hf.square().mean(-1) + 1.0e-20) * torch.rsqrt(
+                    kf.square().mean(-1) + 1.0e-20
+                )
+                dot = (hf * qk_prod.unsqueeze(0) * kf).sum(-1) * rstd * (h_dim**-0.5)
+                gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1.0e-6).sqrt(), dot))
+                hw.copy_((hf + gate.unsqueeze(-1) * vf).to(torch.bfloat16))
+
+                kp = k_cache.index_select(0, bt_m.reshape(-1).to(torch.int64)).view(
+                    m_r, eff_c, 128
+                )
+                raw = torch.bmm(qi, kp.transpose(1, 2))
+                torch.sum(
+                    raw.float().relu_() * (wi.float() * w_scale).unsqueeze(-1),
+                    dim=1,
+                    out=sc,
+                )
+                comp_lens = pm + 1
+                reachable = comp_arange[None, :] < comp_lens[:, None]
+                sc_m = torch.where(reachable, sc, -1.0e30)
+                tv, tc = sc_m.topk(512, dim=-1, sorted=False)
+                tcs, perm = tc.sort(dim=-1)
+                tvs = tv.gather(1, perm)
+                valid = (tcs < comp_lens[:, None].to(torch.int64)) & (tvs > -1.0e19)
+                phys_p = bt_m[rs[:, None], tcs // lat_pp]
+                slots = 1000 + phys_p * lat_pp + (tcs % lat_pp).to(torch.int32)
+                tk[:, 128:640] = torch.where(valid & (phys_p > 0), slots, -1)
+            return hw.clone(), sc.clone(), tk[:, 128:640].clone()
+
+        b_bk = str(baseline_cfg.get("engram_indexer_backend", "eager_py"))
+        c_bk = str(candidate_cfg.get("engram_indexer_backend", "eager_py"))
+        for bk in (b_bk, c_bk):
+            for _ in range(3):
+                for m_r in row_set:
+                    _exec_ei(m_r, bk)
+        torch.cuda.synchronize(dev)
+
+        reference_ok = True
+        for m_r in row_set:
+            rh, rsc, rtk = _exec_ei(m_r, "eager_py")
+            ch, csc, ctk = _exec_ei(m_r, c_bk)
+            comp_l = pos_gpu[:m_r] + 1
+            reach = comp_arange[None, :] < comp_l[:, None]
+            h_err = float((rh.float() - ch.float()).abs().max().item())
+            sc_err = float(((rsc - csc) * reach.float()).abs().max().item())
+            if h_err > 0.02 or sc_err > 1.0e-3 or not bool(torch.equal(rtk, ctk)):
+                reference_ok = False
+
+        inputs_unchanged = all(torch.equal(hs[m_r], hs_orig[m_r]) for m_r in row_set)
+
+        def _time_ei(bk: str) -> float:
+            ev0 = torch.cuda.Event(enable_timing=True)
+            ev1 = torch.cuda.Event(enable_timing=True)
+            ev0.record()
+            for _ in range(iterations):
+                for m_r in row_set:
+                    _exec_ei(m_r, bk)
+            ev1.record()
+            ev1.synchronize()
+            return float(ev0.elapsed_time(ev1)) * 1000.0 / float(len(row_set) * iterations)
+
+        baseline_us, candidate_us = [], []
+        for r_idx in range(rounds):
+            if r_idx % 2 == 0:
+                bt, ct = _time_ei(b_bk), _time_ei(c_bk)
+            else:
+                ct, bt = _time_ei(c_bk), _time_ei(b_bk)
+            baseline_us.append(bt)
+            candidate_us.append(ct)
+
+        return {
+            "family": family,
+            "seed": seed,
+            "rounds": rounds,
+            "iterations": iterations,
+            "world_size": 1,
+            "baseline_config": baseline_cfg,
+            "config": candidate_cfg,
+            "inputs_unchanged": inputs_unchanged,
+            "reference_ok": reference_ok,
+            "ranks_agree": True,
+            "baseline_us": baseline_us,
+            "candidate_us": candidate_us,
+        }
+
+    if family == "lm_head":
+        row_set = (1, 8, 48)
+        max_m = max(row_set)
+        vpr, h_dim, m_rank = 16160, 5120, 256
+        xs = {
+            m_r: _to_gpu_pinned(
+                torch.randn((m_r, h_dim), generator=gen, dtype=torch.float32) * 0.4,
+                dev,
+                stage_u8,
+                dtype=torch.bfloat16,
+            )
+            for m_r in row_set
+        }
+        xs_orig = {m_r: t.clone() for m_r, t in xs.items()}
+        w_bf16 = _to_gpu_pinned(
+            torch.randn((vpr, h_dim), generator=gen, dtype=torch.float32) * 0.02,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
+        w_f32 = w_bf16.float().contiguous()
+        mk_bf16_t = _to_gpu_pinned(
+            torch.randn((m_rank, vpr), generator=gen, dtype=torch.float32) * 0.02,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
+        mk_f32_t = mk_bf16_t.float().contiguous()
+        mv_bf16 = _to_gpu_pinned(
+            torch.randn((max_m, m_rank), generator=gen, dtype=torch.float32) * 0.3,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
+        mv_f32 = mv_bf16.float().contiguous()
+
+        out_f32_buf = torch.zeros((max_m, vpr), dtype=torch.float32, device=dev)
+        out_bf16_buf = torch.zeros((max_m, vpr), dtype=torch.bfloat16, device=dev)
+
+        def _exec_head(m_r: int, dt: str) -> torch.Tensor:
+            xm = xs[m_r]
+            ob = out_bf16_buf[:m_r]
+            if dt == "bf16":
+                torch.matmul(xm, w_bf16.t(), out=ob)
+                torch.addmm(ob, mv_bf16[:m_r], mk_bf16_t, out=ob)
+            else:
+                of = out_f32_buf[:m_r]
+                torch.matmul(xm.float(), w_f32.t(), out=of)
+                torch.addmm(of, mv_f32[:m_r], mk_f32_t, out=of)
+                ob.copy_(of.to(torch.bfloat16))
+            return ob
+
+        b_dt = str(baseline_cfg.get("lm_head_dtype", "fp32"))
+        c_dt = str(candidate_cfg.get("lm_head_dtype", "fp32"))
+        for dt in (b_dt, c_dt):
+            for _ in range(3):
+                for m_r in row_set:
+                    _exec_head(m_r, dt)
+        torch.cuda.synchronize(dev)
+
+        max_diff = 0.0
+        for m_r in row_set:
+            ref_d = (xs[m_r].float().double() @ w_bf16.double().t()) + (
+                mv_bf16[:m_r].float().double() @ mk_bf16_t.double()
+            )
+            cand_o = _exec_head(m_r, c_dt).clone()
+            max_diff = max(
+                max_diff,
+                float((cand_o.double() - ref_d.to(torch.bfloat16).double()).abs().max().item()),
+            )
+        inputs_unchanged = all(torch.equal(xs[m_r], xs_orig[m_r]) for m_r in row_set)
+        reference_ok = max_diff < 0.05
+
+        def _time_head(dt: str) -> float:
+            ev0 = torch.cuda.Event(enable_timing=True)
+            ev1 = torch.cuda.Event(enable_timing=True)
+            ev0.record()
+            for _ in range(iterations):
+                for m_r in row_set:
+                    _exec_head(m_r, dt)
+            ev1.record()
+            ev1.synchronize()
+            return float(ev0.elapsed_time(ev1)) * 1000.0 / float(len(row_set) * iterations)
+
+        baseline_us, candidate_us = [], []
+        for r_idx in range(rounds):
+            if r_idx % 2 == 0:
+                bt, ct = _time_head(b_dt), _time_head(c_dt)
+            else:
+                ct, bt = _time_head(c_dt), _time_head(b_dt)
+            baseline_us.append(bt)
+            candidate_us.append(ct)
+
+        return {
+            "family": family,
+            "seed": seed,
+            "rounds": rounds,
+            "iterations": iterations,
+            "world_size": 1,
+            "baseline_config": baseline_cfg,
+            "config": candidate_cfg,
+            "inputs_unchanged": inputs_unchanged,
+            "reference_ok": reference_ok,
+            "ranks_agree": True,
+            "baseline_us": baseline_us,
+            "candidate_us": candidate_us,
+        }
+
     raise ValueError(f"Unsupported SAIL microbenchmark family: {family!r}")
 
 
 def _parse_applied_sail_from_log(log_text: str) -> dict | None:
     m = re.search(
-        r"sail=(\w+)\(ar=(\d+)x(\d+),os=(\d+),pccl=(\d+),moe_gemv<=(\d+)@(\d+),bm=(\d+)w(\d+),attn=(\w+),mhc=(\d+)r(\d+)\)",
+        r"sail=(\w+)\(ar=(\d+)x(\d+),os=(\d+),pccl=(\d+),moe_gemv<=(\d+)@(\d+),"
+        r"bm=(\d+)w(\d+):(\w+),attn=(\w+),mhc=(\d+)r(\d+),"
+        r"qkv=(\w+),ei=(\w+),head=(\w+)\)",
         log_text,
     )
     if not m:
@@ -816,9 +1438,13 @@ def _parse_applied_sail_from_log(log_text: str) -> dict | None:
         "moe_gemv_threads": int(m.group(7)),
         "moe_block_m": int(m.group(8)),
         "moe_num_warps": int(m.group(9)),
-        "sparse_attn_backend": m.group(10),
-        "mhc_split_k": int(m.group(11)),
-        "mhc_fused_max_rows": int(m.group(12)),
+        "moe_prefill_backend": m.group(10),
+        "sparse_attn_backend": m.group(11),
+        "mhc_split_k": int(m.group(12)),
+        "mhc_fused_max_rows": int(m.group(13)),
+        "qkv_fusion_mode": m.group(14),
+        "engram_indexer_backend": m.group(15),
+        "lm_head_dtype": m.group(16),
     }
 
 
@@ -936,6 +1562,9 @@ def _run_zstep_model(args: argparse.Namespace) -> dict:
             "mxfp4_moe_decode",
             "mxfp4_moe_prefill",
             "mhc_mixes",
+            "attn_qkv_o_proj",
+            "engram_compressor_indexer",
+            "lm_head",
         }
         gap_reasons = {
             "attn_qkv_o_proj": (
