@@ -694,3 +694,136 @@ def test_pareto_vram_tail_latency_guards_and_speculative_regime_rows(tmp_path: P
     v_ok = evaluate_candidate(load_benchmark(base_json), load_benchmark(cand_ok), parity_json, t_cold)
     assert v_ok.accepted
 
+
+def test_green_context_topology_and_cold_prefill_step_tokens_and_ttft_gates(tmp_path: Path) -> None:
+    import json
+    from evolith.zstep.gates import evaluate_candidate, evaluate_screen, load_benchmark
+    from evolith.zstep.remote import ZStepRemoteRunner
+    from evolith.zstep.task import ZStepRSITask
+
+    topo = HardwareTopologySnapshot(
+        vendor="nvidia",
+        arch_tag="sm120",
+        device_name="NVIDIA RTX 6000D",
+        world_size=8,
+        compute_units_per_device=156,
+        peer_p2p_matrix=_pair_p2p_matrix(8),
+        green_context_supported=True,
+        min_sm_partition_size=8,
+        sm_coscheduled_alignment=8,
+        toolchain_version="cuda-13.0",
+    )
+    notes = " ".join(topo.collective_guidance_notes())
+    assert "min_partition=8" in notes
+    assert "coscheduled_align=8" in notes
+
+    reg = WorkloadRegime(
+        regime_id="cold_prefill_16k",
+        phase="prefill",
+        batch_tokens=8192,
+        seq_len=16384,
+        prefill_chunk_tokens=8192,
+        comm_green_ctx_sms=8,
+    )
+    assert reg.prefill_chunk_tokens == 8192
+    assert reg.comm_green_ctx_sms == 8
+
+    synth = PiecewisePolicySynthesizer(
+        incumbent_backend="decode_reuse_mla",
+        min_speedup_guardband=1.02,
+        max_ttft_ms=900.0,
+    )
+    plan = synth.synthesize(
+        [
+            BackendCellMeasurement(
+                backend_id="decode_reuse_mla",
+                phase="prefill",
+                batch_tokens=4096,
+                seq_len=16384,
+                latency_us=18000.0,
+                ttft_ms=1450.0,
+            ),
+            BackendCellMeasurement(
+                backend_id="slow_ttft_cand",
+                phase="prefill",
+                batch_tokens=4096,
+                seq_len=16384,
+                latency_us=12000.0,
+                ttft_ms=1100.0,
+            ),
+            BackendCellMeasurement(
+                backend_id="b12x_mg_prefill",
+                phase="prefill",
+                batch_tokens=4096,
+                seq_len=16384,
+                latency_us=11500.0,
+                ttft_ms=720.0,
+            ),
+        ]
+    )
+    assert plan.resolve(phase="prefill", batch_tokens=4096, seq_len=16384) == "b12x_mg_prefill"
+    assert any("ttft_exceeded" in r for r in plan.rejected_candidates)
+
+    t_cold = ZStepRSITask(
+        project_root=tmp_path,
+        source_repo=tmp_path / "src",
+        remote_host="gpu-host",
+        benchmark_profile="cold-prefill",
+        max_ttft_ms=1200.0,
+    )
+    assert t_cold.max_step_tokens == 8192
+    script = ZStepRemoteRunner(t_cold).benchmark_script(
+        "runs/g0001/screen/src",
+        "runs/g0001/screen/metrics.json",
+        t_cold.screen_tiers,
+        1,
+        None,
+    )
+    assert "--max-step-tokens 8192 --max-decoder-rows 8192" in script
+
+    base_f = tmp_path / "base_cp.json"
+    cand_bad_ttft = tmp_path / "cand_bad_ttft.json"
+    cand_good_ttft = tmp_path / "cand_good_ttft.json"
+    parity_f = tmp_path / "parity_cp.json"
+    parity_f.write_text(
+        json.dumps(
+            {
+                "triton_recompilations": 0,
+                "cases": [
+                    {
+                        "name": "prime_squares_table",
+                        "single_match": {"exact_token_match_rate": 1.0},
+                        "batched_match": {"exact_token_match_rate": 1.0},
+                        "chunked_match": {"exact_token_match_rate": 1.0},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    for p, tp, ttft in ((base_f, 40.0, 1500.0), (cand_bad_ttft, 55.0, 1300.0), (cand_good_ttft, 60.0, 950.0)):
+        p.write_text(
+            json.dumps(
+                {
+                    "tiers": [
+                        {
+                            "label": "prefill16k_v",
+                            "repeat": 0,
+                            "output_throughput_tok_s": tp,
+                            "median_ttft_ms": ttft,
+                            "mean_tpot_ms": 9.0,
+                            "p99_itl_ms": 11.0,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+    assert not evaluate_screen(cand_bad_ttft, None, t_cold, base_f).passed
+    dec_bad = evaluate_candidate(load_benchmark(base_f), load_benchmark(cand_bad_ttft), parity_f, t_cold)
+    assert not dec_bad.accepted and any("max_ttft_ms" in r for r in dec_bad.reasons)
+    dec_ok = evaluate_candidate(load_benchmark(base_f), load_benchmark(cand_good_ttft), parity_f, t_cold)
+    assert dec_ok.accepted
+    assert "TTFT 950.0 vs 1500.0ms" in dec_ok.metric_delta
+
+

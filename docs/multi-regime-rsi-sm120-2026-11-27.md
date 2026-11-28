@@ -156,5 +156,55 @@ Raw Round 6 telemetry, depth/confidence calibration, and 3-Round Cold `AB/BA` ar
 | **`short-throughput` (Guard)** | `in512_c1` / `in512_c32` + VRAM | `167.90` / `1,099.24 tok/s` (`78,187 MiB`) | **`168.18` / `1,099.31 tok/s`** (**`66,093 MiB`**) | **`+0.09%` geomean**, **`-12,094 MiB/GPU`** | **`ACCEPTED` (`CONFORMANT`, 9/9 Z3 `CLOSED`)** |
 | **`longctx-tp8` (Guard)** | `ctx8k_c2` / `ctx16k_c8` + VRAM | `99.39` / `61.50 tok/s` (`78,549 MiB`) | **`98.93` / `61.42 tok/s`** (**`66,535 MiB`**) | **`-0.30%` geomean** (noise), **`-12,014 MiB/GPU`** | **`ACCEPTED` (Zero UVA Prefetch Overhead)** |
 
+---
+
+## 9. Round 7: Lockstep-Safe Cold-Prefill Chunk Scaling, TBO `PXB-4K` Ring Reallocation, Piecewise SM120 MLA Prefill & CUDA 13 Green Context Audit (`zstep@3a1e298` Incumbent)
+
+Raw Round 7 hardware scout, closed-loop 5-generation evolution lineage (`g0001..g0005`), and 3-Round Cold `AB/BA` + 3-Guard artifacts:
+- Stage 1 8-GPU Hardware Scout (MLA Prefill Crossover + `shared_experts` Overlap + CUDA 13 Green Context + `PXB-4K` TBO Chunk Scaling): [`docs/round7_stage1_prefill_green_ctx_scout.json`](round7_stage1_prefill_green_ctx_scout.json)
+- Stage 4 Full `ZStepRSILoop` 3-Round Interleaved Cold `AB/BA` Verification (`g0001..g0005`, Accepted `g0005-9271a17c`): [`docs/round7_multi_regime_abba_results.json`](round7_multi_regime_abba_results.json)
+
+### 9.1 Evolith Cold-Prefill `TTFT` & Green Context Introspection Primitives (`P8`)
+- Extended `HardwareTopologySnapshot` (`src/evolith/core/topology.py`) with CUDA 13 Green Context capability attributes (`green_context_supported`, `min_sm_partition_size`, `sm_coscheduled_alignment`).
+- Extended `RegimeSpec`, `RegimeObservation`, and `MultiRegimeLedger` (`src/evolith/core/regime.py`) with explicit `ttft_ms` / `max_ttft_ms` admission bounds plus `prefill_chunk_tokens` and `comm_green_ctx_sms` descriptors.
+- Upgraded `BenchmarkProfile`, `ZStepRSITask`, `evaluate_screen` / `evaluate_verification`, `ZStepRemoteRunner`, and `ZStepRSILoop` (`src/evolith/zstep/{hardware,task,gates,remote,loop}.py`) with per-profile `max_step_tokens` (`"cold-prefill"` = `8192`) and `max_ttft_ms` enforcement (`201 passed` CPU tests).
+
+### 9.2 Stage 1 8-GPU Hardware Scout & Empirically Falsified Hypotheses (Preserved per `AGENTS.md`)
+1. **CUDA 13 Green Context SM Partitioning (`P5` — Falsified & Excluded)**:
+   - Disjoint SM splits (`pxb4k_green_split_8_148` and `pxb4k_green_split_16_140`) fail at runtime with **`CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)`** because `b12x.moe.fused_moe` (`tp_moe_dynamic_launch`) launches a `156-SM` persistent cooperative kernel that cannot launch on `148` or `140` SMs.
+   - Asymmetric Green Contexts restricting only `comm_s` while keeping `main_s` at `156` SMs (`pxb4k_green_comm8_main156`: `298.94 ms` @ `8K`, `269.22 ms` @ `4K`; `pxb4k_green_comm16_main156`: `309.08 ms` @ `8K`, `241.32 ms` @ `4K`) are **`3.8%–16.7%` slower** than unpartitioned `pxb4k_shared_156sm` (`287.87 ms` @ `8K`, `230.70 ms` @ `4K`) because `shm_ar_tbo` (`24` blocks, `priority=-1`) bursts across `24` SMs during inter-kernel tail gaps when unthrottled. Excluded.
+2. **Intra-Layer `shared_experts` Aux-Stream Overlap (`P5` — Falsified & Excluded)**:
+   - Across `M = 8..4096`, launching `shared_experts` on an auxiliary stream concurrently with `b12x` `routed_experts` regressed **`22.6–41.2 µs/layer` (`0.981×–0.990×`)** because persistent `156-SM` `b12x.moe.fused_moe` saturates `100%` of SMs, leaving zero free wave slots and paying pure `cudaEventRecord` / `cudaStreamWaitEvent` overhead. Excluded.
+3. **Piecewise SM120 MG MLA Prefill Crossover (`P1` — Tightened Dispatch)**:
+   - Stock `cake_sparse_mla` (`flashinfer_trtllm_batch_decode_sparse_mla_dsv4`) beats `b12x` MG prefill (`_run_sm120_compressed_prefill`) on all `32` `swa_only` layers (`0.35×–0.96×`), on all `4` `compressed_cr64` layers (`iw_n = 512`, `0.31×–0.97×` — exposing a `1.54×–2.17×` regression in Round 6's `iw_n > 0 and rows >= 1024` rule), and at `T = 1024` on `full_cr1` (`0.835×`).
+   - `b12x` MG prefill wins cleanly on `full_cr1` (`4` layers, `iw_n = 2048`) for **`rows >= 2048`** (`1.028×` @ `2K`, **`1.097×` @ `4K`**, **`1.125×` @ `8K`**, `cos_sim = 1.0`). Tightened `b12x_dsv41.py` dispatch to `iw_n >= 2048 and rows >= 2048`.
+4. **TBO Chunk Scaling (`2048 → 8192`) + `shm_ar_tbo` `PXB-4K` Ring Reallocation (`P1` — Primary Win)**:
+   - Scaling pure prefill from `chunk = 2048` (`u = 1024`: `2.6242 µs/tok`, `214.98 ms` / 40L) to `chunk = 8192` (`u = 4096`) initially regressed to `540.11 ms` (`r6_pxb2k_shared_156sm`) because `shm_ar_tbo.pxb_max_elements = 2048 * 5120` dropped `u = 4096` (`20,971,520` elements) off the P2P PXB ring onto host `/dev/shm`. Reallocating `shm_ar_tbo` to `pxb_max_elements = 4096 * 5120` (`pxb4k_shared_156sm`, Z3-verified `245.38 MiB <= 256.0 MiB` on `PP=1`) cut 40-layer `8K` execution to **`287.87 ms` (`0.8785 µs/tok`)** — **`1.88×` faster** at `8K` and **`2.99×` higher per-token efficiency** than `2K` chunks.
+
+### 9.3 Closed-Loop 5-Generation Evolution Lineage (`g0001..g0005` in `round7_multi_regime_abba_results.json`)
+
+| Candidate ID | LOC | Primary `cold-prefill` 3-Round `AB/BA` | Outcome | Multi-Regime Gate Diagnosis & Architectural Fix |
+|---|---:|---:|---|---|
+| `g0001-a85884d7` | `68` | — | `formal_inconclusive` | Container `PATH` lacked `.venv/bin/z3` (`Z3 solver unavailable`). Restored `PATH` so all 9 Z3 clauses run strictly (`CLOSED`). |
+| `g0002-57830f5a` | `68` | `+40.72%` (`lcb_2se +39.58%`) | `verify_rejected` | Caught two cross-regime regressions: (1) `longctx-tp8` `ctx8k_c2` `p99_ITL` spiked `6.56 → 165.20 ms` (`+2418%`, `-18.31%` tok/s) because bursting `max_step_tokens` whenever `decode_active_count == 0` let Req 0 finish `8K` prefill ahead of Req 1 and suffer 4 mixed steps; fixed in `serving.rs` by gating burst on `decode_active_count == 0 && pending_prefill_seqs <= 1`. (2) `spec-dspark` `spec_c8` regressed `-4.25%` from unconditional `4K` MoE warmup & ring sizing; fixed by conditioning `4K` linear cap and `shm_ar_tbo` `PXB-4K` strictly on `self.max_step_tokens > 4096`. |
+| `g0003-b2b5f177` | `89` | `+40.57%` (`lcb_2se +39.04%`) | `verify_rejected` | Passed `longctx-tp8` (`ACCEPTED`, `-1.31%`) and `spec-dspark` (`ACCEPTED`, `+4.98%`), but `short-throughput` tripped `TRACE_BATCH_COMPOSITION_INVARIANCE` (`france_capital` `batched_vs_chunked` logit drift `9.38 > 8.00`) because `chunked` (`n=101 <= 128`) used lossless `shm_ar_decode` whereas `batched` (`n=223`, `129..256` rows) used `pxb_bfp = 1`. |
+| `g0004-5cffc5ce` | `93` | `+40.14%` (`lcb_2se +38.76%`) | `verify_rejected` | Setting `pxb_bfp = 0` across `0..256` rows passed `TRACE_BATCH_COMPOSITION_INVARIANCE` across all 5 containers (`drift <= 3.00`), `short-throughput` (`ACCEPTED`, `-0.21%`), and `longctx-tp8` (`ACCEPTED`, `-1.45%`), and boosted `spec-dspark` `+12.78%`, but altered `<= 128`-row `DSpark` draft acceptance enough to synchronize two `spec_c8` request retirements (`med_ttft` `114.0 → 144.3 ms`, `+26.58% > 5%`). |
+| **`g0005-9271a17c`** | **`97`** | **`+40.26%` (`lcb_2se +39.27%`)** | **`ACCEPTED`** | Narrowed lossless `pxb_bfp = 0` in `shm_allreduce.py` strictly to **`128 * 5120 < numel <= 256 * 5120`**, closing the `129..256` `batched`-prefill parity gap (`max_logit_drift = 2.125 <= 8.00`) while keeping `1..128`-row `DSpark` drafts bit-identical (`spec-dspark` **`+3.38%`**, `spec_c8 med_ttft -0.39%`). **Passed 100% of primary & secondary gates.** |
+
+### 9.4 Full 3-Round Interleaved Cold `AB/BA` Verification & 3-Guard Summary (`g0005-9271a17c`)
+
+| Suite / Regime | Phase & Tier | Incumbent (`3a1e298`) | Candidate (`g0005-9271a17c`, `97` LOC) | Measured Delta | Gate Verdict |
+|---|---|---:|---:|---:|---|
+| **`cold-prefill` (Screen)** | `prefill8k_c1` / `prefill16k_c1` (`repeats=1`) | `10,402.0` / `11,020.9 total tok/s` (`TTFT 703.7` / `1,404.1 ms`) | **`15,099.5` / `16,243.6 total tok/s`** (**`TTFT 462.9` / `928.3 ms`**) | **`+46.28%` geomean** (`TTFT -34.2%` / `-33.9%`) | **`PASS` (`66,981 MiB/GPU`)** |
+| **`cold-prefill` (3-Round Cold `AB/BA`)** | `prefill8k_v` (`1:6:8192:32`, median) | `37.05 out tok/s` (`9,520.9 tot tok/s`, `TTFT 697.25 ms`, `TPOT 5.32 ms`) | **`50.98 out tok/s`** (**`13,100.7 tot tok/s`**, **`TTFT 462.66 ms`**, `TPOT 5.32 ms`) | **`+37.60%` med** (`+37.93%` mean, **`-33.65%` `TTFT`**) | **`ACCEPTED`** |
+| **`cold-prefill` (3-Round Cold `AB/BA`)** | `prefill16k_v` (`1:6:16384:32`, median) | `20.65 out tok/s` (`10,595.7 tot tok/s`, `TTFT 1,383.32 ms`, `TPOT 5.36 ms`) | **`29.23 out tok/s`** (**`14,996.4 tot tok/s`**, **`TTFT 928.43 ms`**, `TPOT 5.36 ms`) | **`+41.55%` med** (`+41.84%` mean, **`-32.88%` `TTFT`**) | **`ACCEPTED`** |
+| **`cold-prefill` (3-Round Cold `AB/BA`)** | `prefill32k_v` (`1:4:32768:32`, median) | `10.92 out tok/s` (`11,194.3 tot tok/s`, `TTFT 2,762.32 ms`, `TPOT 5.36 ms`) | **`15.47 out tok/s`** (**`15,860.9 tot tok/s`**, **`TTFT 1,901.24 ms`**, `TPOT 5.36 ms`) | **`+41.67%` med** (`+41.48%` mean, **`-31.17%` `TTFT` / `-861 ms`**) | **`ACCEPTED` (`geomean +40.26%`, `lcb_2se +39.27%`, `67,145 MiB`)** |
+| **`longctx-tp8` (Guard)** | `ctx8k_c2` / `ctx16k_c8` + VRAM | `99.13` / `61.43 tok/s` (`p99_ITL 6.56 ms` @ `ctx8k_c2`) | **`97.76` / `60.58 tok/s`** (`p99_ITL 6.55 ms`, `15,568.9 tot tok/s`, `66,515 MiB`) | **`-1.38%` geomean** (within `±3%` noise, **`0%` `p99_ITL` drift**) | **`ACCEPTED` (`CONFORMANT`)** |
+| **`short-throughput` (Guard)** | `in512_c1` / `in512_c32` + VRAM | `168.06` / `1,105.03 tok/s` (`65,809 MiB`) | **`168.08` / `1,097.96 tok/s`** (`66,133 MiB`, `max_drift 2.125 <= 8.00`) | **`-0.32%` geomean** (`+0.01%` / `-0.64%`) | **`ACCEPTED` (`CONFORMANT`)** |
+| **`spec-dspark` (Guard)** | `spec_c1` / `spec_c8` (`DSpark K=5`) | `270.06` / `743.16 tok/s` (`spec_c8 med_ttft 114.02 ms`) | **`289.92` / `739.79 tok/s`** (`spec_c1 TPOT 2.89 ms`, `spec_c8 med_ttft 113.57 ms`, `68,845 MiB`) | **`+3.38%` geomean** (**`+7.35%` `spec_c1`**, `-0.39%` `med_ttft`) | **`ACCEPTED` (`CONFORMANT`, 9/9 Z3 `CLOSED`)** |
+
+> **Capability-Boundary Note (`LOSSLESS TP=8` vs `CALIBRATED_LOSSY NVFP4 TP=4`)**: On lossless `475.25 GiB` `DeepSeek-V4.1-Flash` across `8 × RTX 6000D` (`TP=8` spanning dual-socket Xeon UPI), pure GPU 40-layer `8K` chunk execution now runs in `287.87 ms` (`28,457 tok/s` kernel rate) and end-to-end HTTP serving reaches `15,864.5 total tok/s` (`TTFT 462.7 ms` @ `8K`, `1,901.2 ms` @ `32K`). Reaching the `43.8K–58.0K tok/s` single-island workstation curve (`4 × RTX PRO 6000` running `NVFP4 + CSF` `TP=4` with zero cross-socket UPI, `--row-shard-attention`, and `16K` prepared prefill graphs) crosses into `PrecisionTrack.CALIBRATED_LOSSY` + `DP=2 × TP=4` single-socket topology, scheduled as an explicitly separated track in **Round 8 (`P7`)** alongside lossless `Latent576` GPU rANS KV compression (`P4`).
+
+
 
 

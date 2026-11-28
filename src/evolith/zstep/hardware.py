@@ -22,6 +22,7 @@ class BenchmarkProfile(BaseModel):
     regime_phase: Literal["decode", "prefill", "mixed", "speculative"] = "mixed"
     num_kv_pages: int = Field(default=2560, ge=64)
     max_pages_per_seq: int = Field(default=256, ge=16)
+    max_step_tokens: int = Field(default=4096, ge=192)
     env_overrides: dict[str, str] = Field(default_factory=dict)
 
 
@@ -93,6 +94,7 @@ BUILTIN_BENCHMARK_PROFILES: dict[str, BenchmarkProfile] = {
         regime_phase="prefill",
         num_kv_pages=2560,
         max_pages_per_seq=264,
+        max_step_tokens=8192,
         env_overrides={
             "ZSTEP_MAX_MODEL_LEN": "33792",
         },

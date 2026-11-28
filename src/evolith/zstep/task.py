@@ -145,6 +145,7 @@ class ZStepRSITask(BaseModel):
     max_p99_itl_regression: float = 0.05
     max_vram_used_mib: float | None = Field(default=None, gt=0.0)
     max_p99_itl_ms: float | None = Field(default=None, gt=0.0)
+    max_ttft_ms: float | None = Field(default=None, gt=0.0)
     max_tier_cv: float = Field(default=0.10, ge=0.0)
     min_paired_se_z: float = Field(default=0.0, ge=0.0)
     max_screen_throughput_regression: float = 0.02
@@ -158,6 +159,7 @@ class ZStepRSITask(BaseModel):
     )
     num_kv_pages: int = Field(default=2560, ge=64)
     max_pages_per_seq: int = Field(default=256, ge=16)
+    max_step_tokens: int = Field(default=4096, ge=192)
     worker_env_overrides: dict[str, str] = Field(default_factory=dict)
     keep_remote_stage: bool = False
     sandbox_root: Path | None = None
@@ -246,6 +248,8 @@ class ZStepRSITask(BaseModel):
                 self.num_kv_pages = preset.num_kv_pages
             if "max_pages_per_seq" not in self.model_fields_set:
                 self.max_pages_per_seq = preset.max_pages_per_seq
+            if "max_step_tokens" not in self.model_fields_set:
+                self.max_step_tokens = preset.max_step_tokens
             if "worker_env_overrides" not in self.model_fields_set and preset.env_overrides:
                 self.worker_env_overrides = dict(preset.env_overrides)
         for env_key in self.worker_env_overrides:

@@ -319,6 +319,7 @@ EVOLITH_PROPOSAL_JSON: {{"hypothesis": "<why this bottleneck & mechanism yields 
                     "verify_tiers": preset.verify_tiers,
                     "num_kv_pages": preset.num_kv_pages,
                     "max_pages_per_seq": preset.max_pages_per_seq,
+                    "max_step_tokens": preset.max_step_tokens,
                     "worker_env_overrides": dict(preset.env_overrides),
                 }
             )

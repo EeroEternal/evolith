@@ -81,6 +81,9 @@ class HardwareTopologySnapshot(BaseModel):
     has_dma_copy_engine: bool = True
     unified_memory: bool = False
     high_speed_fabric: bool = False  # True when NVLink / NVSwitch / xGMI is present
+    green_context_supported: bool = False  # Hardware CU/SM partitioning (CUDA 13 GreenCtx / ROCm CU mask)
+    min_sm_partition_size: int = Field(default=0, ge=0)
+    sm_coscheduled_alignment: int = Field(default=0, ge=0)
     toolchain_version: str = ""  # e.g. "cuda-13.0", "cuda-12.9", "rocm-6.3"
 
     @model_validator(mode="after")
@@ -200,5 +203,12 @@ class HardwareTopologySnapshot(BaseModel):
             notes.append(
                 f"Persisting L2 cache window cap = {l2_p_mib:.1f} MiB: pin small high-reuse decode "
                 "projections or collective ring buffers in L2 while keeping streaming loads bypass-cached."
+            )
+        if self.green_context_supported and self.min_sm_partition_size > 0:
+            align = max(1, self.sm_coscheduled_alignment or self.min_sm_partition_size)
+            notes.append(
+                f"Hardware compute-unit partitioning supported (min_partition={self.min_sm_partition_size}, "
+                f"coscheduled_align={align} out of {self.compute_units_per_device}): isolate TBO/async "
+                "collective streams in a small partition only where empirically faster than shared scheduling."
             )
         return tuple(notes)

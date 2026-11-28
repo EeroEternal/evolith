@@ -330,6 +330,12 @@ def evaluate_screen(
                     f"max_p99_itl_ms {task.max_p99_itl_ms:.2f} ms"
                 )
                 break
+            if task.max_ttft_ms is not None and row.median_ttft_ms > task.max_ttft_ms:
+                reasons.append(
+                    f"screen {label} median_ttft_ms {row.median_ttft_ms:.2f} ms exceeds "
+                    f"max_ttft_ms {task.max_ttft_ms:.2f} ms"
+                )
+                break
 
     gains: list[float] = []
     delta_parts: list[str] = []
@@ -614,6 +620,12 @@ def evaluate_candidate(
                     f"max_p99_itl_ms {task.max_p99_itl_ms:.2f} ms"
                 )
                 break
+            if task.max_ttft_ms is not None and row.median_ttft_ms > task.max_ttft_ms:
+                reasons.append(
+                    f"{label} median_ttft_ms {row.median_ttft_ms:.2f} ms exceeds "
+                    f"max_ttft_ms {task.max_ttft_ms:.2f} ms"
+                )
+                break
 
     gains: list[float] = []
     tier_deltas: list[str] = []
@@ -643,10 +655,13 @@ def evaluate_candidate(
                     )
         gain = candidate_throughput / base_throughput - 1.0
         gains.append(gain)
+        base_ttft = _median_metric(baseline[label], "median_ttft_ms")
+        cand_ttft = _median_metric(candidate[label], "median_ttft_ms")
         base_tpot = _median_metric(baseline[label], "mean_tpot_ms")
         cand_tpot = _median_metric(candidate[label], "mean_tpot_ms")
         tier_deltas.append(
-            f"{label}:{gain:+.2%}(TPOT {cand_tpot:.2f} vs {base_tpot:.2f}ms)"
+            f"{label}:{gain:+.2%}(TTFT {cand_ttft:.1f} vs {base_ttft:.1f}ms, "
+            f"TPOT {cand_tpot:.2f} vs {base_tpot:.2f}ms)"
         )
         if gain < -task.max_tier_throughput_regression:
             reasons.append(f"{label} throughput regressed {gain:.2%}")
