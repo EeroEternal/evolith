@@ -260,6 +260,8 @@ def test_regime_benchmark_profiles_env_overrides_and_security(tmp_path: Path) ->
     )
     assert "ZSTEP_SPEC_METHOD=dspark" in script
     assert "ZSTEP_NUM_SPEC_TOKENS=5" in script
+    assert "$HOME/evolith-rsi/container-cache:/root/.cache" in script
+    assert "peak_vram_used_mib" in script
 
     with pytest.raises(ValueError, match="Forbidden"):
         ZStepRSITask(
@@ -524,3 +526,171 @@ def test_min_screen_gain_and_hot_prescreen_fast_reject_before_cold_verify(
         remote=rem_reg,
     )
     assert loop_reg.run() == [CandidateStatus.VERIFY_REJECTED]
+
+
+def test_pareto_vram_tail_latency_guards_and_speculative_regime_rows(tmp_path: Path) -> None:
+    import json
+    from evolith.zstep.gates import evaluate_candidate, evaluate_screen, load_benchmark
+    from evolith.zstep.task import ZStepRSITask
+
+    # 1. Speculative WorkloadRegime physical row modeling (P < B * W under adaptive confidence pruning)
+    reg_full = WorkloadRegime(
+        regime_id="spec_b8_full",
+        phase="speculative",
+        batch_tokens=48,
+        batch_seqs=8,
+        draft_depth=5,
+        verify_width=6,
+    )
+    assert reg_full.effective_physical_rows() == 48
+    reg_pruned = WorkloadRegime(
+        regime_id="spec_b8_pruned",
+        phase="speculative",
+        batch_tokens=34,
+        batch_seqs=8,
+        draft_depth=7,
+        verify_width=8,
+        physical_rows=34,
+    )
+    assert reg_pruned.effective_physical_rows() == 34
+
+    # 2. PiecewisePolicySynthesizer Pareto VRAM & p99_itl_ms rejection
+    synth = PiecewisePolicySynthesizer(
+        incumbent_backend="base_dspark",
+        min_speedup_guardband=1.02,
+        max_vram_used_mib=80000.0,
+        max_p99_itl_ms=25.0,
+    )
+    plan = synth.synthesize(
+        [
+            BackendCellMeasurement(
+                backend_id="base_dspark",
+                phase="speculative",
+                batch_tokens=6,
+                seq_len=1024,
+                latency_us=5000.0,
+                vram_used_mib=84950.0,
+                p99_itl_ms=12.0,
+            ),
+            BackendCellMeasurement(
+                backend_id="oom_risk_cand",
+                phase="speculative",
+                batch_tokens=6,
+                seq_len=1024,
+                latency_us=3800.0,
+                vram_used_mib=84900.0,
+                p99_itl_ms=10.0,
+            ),
+            BackendCellMeasurement(
+                backend_id="spiky_itl_cand",
+                phase="speculative",
+                batch_tokens=6,
+                seq_len=1024,
+                latency_us=3900.0,
+                vram_used_mib=73100.0,
+                p99_itl_ms=42.0,
+            ),
+            BackendCellMeasurement(
+                backend_id="async_engram_dspark",
+                phase="speculative",
+                batch_tokens=6,
+                seq_len=1024,
+                latency_us=4100.0,
+                vram_used_mib=73100.0,
+                p99_itl_ms=11.0,
+            ),
+        ]
+    )
+    assert plan.resolve(phase="speculative", batch_tokens=6, seq_len=1024) == "async_engram_dspark"
+    assert any("vram_budget_exceeded" in r for r in plan.rejected_candidates)
+    assert any("p99_itl_exceeded" in r for r in plan.rejected_candidates)
+
+    # 3. cold-prefill preset & ZStepRSITask / gates Pareto VRAM + p99_itl_ms enforcement
+    t_cold = ZStepRSITask(
+        project_root=tmp_path,
+        source_repo=tmp_path / "src",
+        benchmark_profile="cold-prefill",
+        max_vram_used_mib=80000.0,
+        max_p99_itl_ms=30.0,
+    )
+    assert "prefill32k_v" in t_cold.verify_tiers
+    base_json = tmp_path / "b.json"
+    cand_vram_bad = tmp_path / "c_vram.json"
+    cand_ok = tmp_path / "c_ok.json"
+    parity_json = tmp_path / "p.json"
+    parity_json.write_text(
+        json.dumps(
+            {
+                "triton_recompilations": 0,
+                "cases": [
+                    {
+                        "name": "prime_squares_table",
+                        "single_match": {"exact_token_match_rate": 1.0},
+                        "batched_match": {"exact_token_match_rate": 1.0},
+                        "chunked_match": {"exact_token_match_rate": 1.0},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    base_json.write_text(
+        json.dumps(
+            {
+                "tiers": [
+                    {
+                        "label": "spec_c2",
+                        "repeat": 0,
+                        "output_throughput_tok_s": 300.0,
+                        "median_ttft_ms": 40.0,
+                        "mean_tpot_ms": 5.0,
+                        "p99_itl_ms": 12.0,
+                        "peak_vram_used_mib": 84950.0,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cand_vram_bad.write_text(
+        json.dumps(
+            {
+                "tiers": [
+                    {
+                        "label": "spec_c2",
+                        "repeat": 0,
+                        "output_throughput_tok_s": 420.0,
+                        "median_ttft_ms": 38.0,
+                        "mean_tpot_ms": 3.5,
+                        "p99_itl_ms": 11.0,
+                        "peak_vram_used_mib": 84500.0,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cand_ok.write_text(
+        json.dumps(
+            {
+                "tiers": [
+                    {
+                        "label": "spec_c2",
+                        "repeat": 0,
+                        "output_throughput_tok_s": 420.0,
+                        "median_ttft_ms": 38.0,
+                        "mean_tpot_ms": 3.5,
+                        "p99_itl_ms": 11.0,
+                        "peak_vram_used_mib": 73150.0,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert not evaluate_screen(cand_vram_bad, None, t_cold, base_json).passed
+    v_bad = evaluate_candidate(load_benchmark(base_json), load_benchmark(cand_vram_bad), parity_json, t_cold)
+    assert not v_bad.accepted and any("max_vram_used_mib" in r for r in v_bad.reasons)
+    v_ok = evaluate_candidate(load_benchmark(base_json), load_benchmark(cand_ok), parity_json, t_cold)
+    assert v_ok.accepted
+

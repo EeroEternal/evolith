@@ -116,10 +116,22 @@ class WorkloadRegime(BaseModel):
     """A single operational regime in a multi-regime serving profile."""
 
     regime_id: str
-    phase: str  # "decode" | "prefill" | "mixed"
+    phase: str  # "decode" | "prefill" | "mixed" | "speculative"
     batch_tokens: int = Field(ge=1)
     seq_len: int = Field(default=1024, ge=1)
     weight: float = Field(default=1.0, gt=0.0)
+    batch_seqs: int = Field(default=1, ge=1)
+    draft_depth: int = Field(default=0, ge=0)
+    verify_width: int = Field(default=1, ge=1)
+    physical_rows: int | None = Field(default=None, ge=1)
+
+    def effective_physical_rows(self) -> int:
+        """Return actual physical rows (`P <= B * W` under confidence pruning, or `batch_tokens`)."""
+        if self.physical_rows is not None:
+            return self.physical_rows
+        if self.draft_depth > 0:
+            return self.batch_seqs * max(self.verify_width, self.draft_depth + 1)
+        return self.batch_tokens
 
 
 class RegimeOperatorShare(BaseModel):
@@ -208,13 +220,15 @@ class MultiRegimeLedger:
 
 
 class BackendCellMeasurement(BaseModel):
-    """Measured latency and correctness of one backend/tactic at one `(phase, batch_tokens, seq_len)` cell."""
+    """Measured latency, resource usage, and correctness of one backend at one `(phase, batch_tokens, seq_len)` cell."""
 
     backend_id: str
-    phase: str  # "decode" | "prefill" | "mixed"
+    phase: str  # "decode" | "prefill" | "mixed" | "speculative"
     batch_tokens: int = Field(ge=1)
     seq_len: int = Field(default=1024, ge=1)
     latency_us: float = Field(gt=0.0)
+    vram_used_mib: float | None = Field(default=None, ge=0.0)
+    p99_itl_ms: float | None = Field(default=None, ge=0.0)
     passed_correctness: bool = True
     precision_track: PrecisionTrack = PrecisionTrack.LOSSLESS
 
@@ -257,7 +271,7 @@ class PiecewiseDispatchPlan(BaseModel):
 
 
 class PiecewisePolicySynthesizer:
-    """Synthesizes zero-regression piecewise dispatch tables from multi-backend cell timings."""
+    """Synthesizes zero-regression piecewise dispatch tables with Pareto VRAM and tail-latency guards."""
 
     def __init__(
         self,
@@ -265,12 +279,20 @@ class PiecewisePolicySynthesizer:
         incumbent_backend: str,
         allowed_track: PrecisionTrack = PrecisionTrack.LOSSLESS,
         min_speedup_guardband: float = 1.015,
+        max_vram_used_mib: float | None = None,
+        max_p99_itl_ms: float | None = None,
     ) -> None:
         if min_speedup_guardband < 1.0:
             raise ValueError("min_speedup_guardband must be >= 1.0 to forbid regressions")
+        if max_vram_used_mib is not None and max_vram_used_mib <= 0.0:
+            raise ValueError("max_vram_used_mib must be > 0.0 when specified")
+        if max_p99_itl_ms is not None and max_p99_itl_ms <= 0.0:
+            raise ValueError("max_p99_itl_ms must be > 0.0 when specified")
         self.incumbent_backend = incumbent_backend
         self.allowed_track = allowed_track
         self.min_speedup_guardband = min_speedup_guardband
+        self.max_vram_used_mib = max_vram_used_mib
+        self.max_p99_itl_ms = max_p99_itl_ms
 
     def synthesize(
         self,
@@ -311,6 +333,24 @@ class PiecewisePolicySynthesizer:
                 ):
                     rejected.add(
                         f"{cand.backend_id}@({phase},B={batch_tokens},L={seq_len}):lossy_track_blocked"
+                    )
+                    continue
+                if (
+                    self.max_vram_used_mib is not None
+                    and cand.vram_used_mib is not None
+                    and cand.vram_used_mib > self.max_vram_used_mib
+                ):
+                    rejected.add(
+                        f"{cand.backend_id}@({phase},B={batch_tokens},L={seq_len}):vram_budget_exceeded"
+                    )
+                    continue
+                if (
+                    self.max_p99_itl_ms is not None
+                    and cand.p99_itl_ms is not None
+                    and cand.p99_itl_ms > self.max_p99_itl_ms
+                ):
+                    rejected.add(
+                        f"{cand.backend_id}@({phase},B={batch_tokens},L={seq_len}):p99_itl_exceeded"
                     )
                     continue
                 sp = inc.latency_us / cand.latency_us

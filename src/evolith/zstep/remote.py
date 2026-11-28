@@ -363,11 +363,51 @@ fi"""
             f"--repeats {repeats} --bench-tiers \"{tiers}\" "
             f"--metrics-output /workspace/results/{metrics_name}\n"
         )
+        q_metrics_in_ctr = shlex.quote(f"/workspace/results/{metrics_name}")
+        vram_probe_snip = (
+            "/usr/bin/python3 -c '\n"
+            "import json, pathlib, sys, time\n"
+            "mpath = pathlib.Path(sys.argv[1])\n"
+            "stop = pathlib.Path(\"/tmp/evolith_vram_stop\")\n"
+            "peak = 0\n"
+            "try:\n"
+            "    import pynvml\n"
+            "    pynvml.nvmlInit()\n"
+            "    hs = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())]\n"
+            "    while not stop.exists():\n"
+            "        cur = max((pynvml.nvmlDeviceGetMemoryInfo(h).used // (1024 * 1024) for h in hs), default=0)\n"
+            "        if cur > peak: peak = cur\n"
+            "        time.sleep(1.0)\n"
+            "except Exception:\n"
+            "    pass\n"
+            "pathlib.Path(\"/tmp/evolith_peak_vram\").write_text(str(peak))\n"
+            f"' {q_metrics_in_ctr} &\n"
+            "EVOLITH_VRAM_PID=$!\n"
+        )
+        vram_stamp_snip = (
+            "touch /tmp/evolith_vram_stop\n"
+            'wait "$EVOLITH_VRAM_PID" 2>/dev/null || true\n'
+            "/usr/bin/python3 -c '\n"
+            "import json, pathlib, sys\n"
+            "mpath, ppath = pathlib.Path(sys.argv[1]), pathlib.Path(\"/tmp/evolith_peak_vram\")\n"
+            "peak = int(ppath.read_text().strip() or \"0\") if ppath.is_file() else 0\n"
+            "if peak > 0 and mpath.is_file():\n"
+            "    d = json.loads(mpath.read_text())\n"
+            "    d[\"peak_vram_used_mib\"] = peak\n"
+            "    for r in d.get(\"tiers\", []):\n"
+            "        if isinstance(r, dict): r[\"peak_vram_used_mib\"] = peak\n"
+            "    mpath.write_text(json.dumps(d, indent=2))\n"
+            f"' {q_metrics_in_ctr}\n"
+        )
         inner_cmd = (
             'set -euo pipefail\n'
-            'trap \'rm -rf /dev/shm/zstep* >/dev/null 2>&1 || true; chown -R "${HOST_UID}:${HOST_GID}" /workspace /fi-cache >/dev/null 2>&1 || true\' EXIT\n'
+            'rm -f /tmp/evolith_vram_stop /tmp/evolith_peak_vram\n'
+            'EVOLITH_VRAM_PID=""\n'
+            'trap \'touch /tmp/evolith_vram_stop >/dev/null 2>&1 || true; [ -n "$EVOLITH_VRAM_PID" ] && kill "$EVOLITH_VRAM_PID" >/dev/null 2>&1 || true; rm -rf /dev/shm/zstep* >/dev/null 2>&1 || true; chown -R "${HOST_UID}:${HOST_GID}" /workspace /root/.cache >/dev/null 2>&1 || true\' EXIT\n'
+            + vram_probe_snip
             + greedy
             + benchmark
+            + vram_stamp_snip
         )
         gpus_spec = self._docker_gpus_spec()
         rustup_snip = self._rustup_env_snippet()
@@ -388,7 +428,7 @@ fi"""
 trap 'rm -rf {shlex.quote(overlay_dir)} >/dev/null 2>&1 || true' EXIT
 {rustup_snip}
 cd {shlex.quote(source_dir)}
-mkdir -p results
+mkdir -p results "$HOME/evolith-rsi/container-cache"
 if [ ! -x ./target/release/zstep ]; then
   if [ -d "$HOME/evolith-rsi/cargo-vendor" ]; then
     CARGO_VENDOR_ARGS=(--offline --config "source.crates-io.replace-with='vendored-sources'" --config "source.vendored-sources.directory='$HOME/evolith-rsi/cargo-vendor'")
@@ -401,7 +441,7 @@ if [ ! -x ./target/release/zstep ]; then
 fi
 {overlay_snip}
 {sudo_pfx}docker run --rm --name {container_name} --gpus {gpus_spec} --shm-size=32g --network=none --entrypoint bash \\
-  -v "$PWD:/workspace" -v {quoted_model_mount} -w /workspace \\
+  -v "$PWD:/workspace" -v "$HOME/evolith-rsi/container-cache:/root/.cache" -v {quoted_model_mount} -w /workspace \\
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \\
   -e OMP_NUM_THREADS=1 -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
   -e VLLM_HOST_IP=127.0.0.1 -e NCCL_SOCKET_IFNAME=lo -e GLOO_SOCKET_IFNAME=lo \\

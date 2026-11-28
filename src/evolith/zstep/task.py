@@ -46,6 +46,7 @@ class TierMetric(BaseModel):
     prefix_cache_hit_rate: float | None = None
     idle_kv_cache_usage: float | None = None
     non_spec_throughput_tok_s: float | None = None
+    peak_vram_used_mib: float | None = None
 
 
 class RedTeamFinding(BaseModel):
@@ -142,6 +143,8 @@ class ZStepRSITask(BaseModel):
     max_ttft_regression: float = 0.05
     max_tpot_regression: float = 0.05
     max_p99_itl_regression: float = 0.05
+    max_vram_used_mib: float | None = Field(default=None, gt=0.0)
+    max_p99_itl_ms: float | None = Field(default=None, gt=0.0)
     max_tier_cv: float = Field(default=0.10, ge=0.0)
     min_paired_se_z: float = Field(default=0.0, ge=0.0)
     max_screen_throughput_regression: float = 0.02
@@ -192,6 +195,7 @@ class ZStepRSITask(BaseModel):
         "worker/zstep_worker/p2p_probe.py",
         "worker/zstep_worker/spec_decode.py",
         "worker/zstep_worker/kernels_sm120",
+        "worker/tests/test_spec_decode.py",
         "crates/zs-kv/src",
         "crates/zs-scheduler/src",
         "crates/zs-server/src/serve.rs",
