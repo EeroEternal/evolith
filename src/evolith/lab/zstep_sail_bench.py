@@ -104,6 +104,7 @@ def _icn_worker(
     seed: int,
     out_file: str,
 ) -> None:
+    from zstep_worker.kernels_sail import dsv41_sail_ops as ops
     from zstep_worker.kernels_sail.ppu_collectives import PpuIcnCollectives
 
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0")
@@ -123,6 +124,8 @@ def _icn_worker(
     pg = dist.group.WORLD
     b_pccl_min = int(baseline_cfg.get("ar_pccl_min_bytes", 67108864))
     c_pccl_min = int(candidate_cfg.get("ar_pccl_min_bytes", 67108864))
+    b_fmp = int(baseline_cfg.get("ar_fuse_mhc_post", 0))
+    c_fmp = int(candidate_cfg.get("ar_fuse_mhc_post", 0))
     pccl_pg = None
     if min(b_pccl_min, c_pccl_min) < 67108864:
         pccl_pg = dist.new_group(backend="nccl", timeout=timedelta(seconds=120))
@@ -157,69 +160,97 @@ def _icn_worker(
         max_bf16_ar_elements=1024 * 5120,
     )
     try:
-        # Test across representative decode (`M=1`), batch decode (`M=16`), and prefill (`M=512`, `5.12 MB`)
+        # Test representative decode (`M=1`, `10 KB`), batch decode (`M=16`, `160 KB`), and prefill (`M=512`, `5.24 MB`)
         gen = torch.Generator(device="cpu")
         gen.manual_seed(seed * 97 + rank + 1)
-        x1_cpu = (torch.randn((1, 5120), generator=gen, dtype=torch.float32) * 0.5).to(
-            torch.bfloat16
-        )
-        x8_cpu = (torch.randn((16, 5120), generator=gen, dtype=torch.float32) * 0.5).to(
-            torch.bfloat16
-        )
-        x16_cpu = (torch.randn((512, 5120), generator=gen, dtype=torch.float32) * 0.5).to(
-            torch.bfloat16
-        )
-        x1 = _to_gpu_pinned(x1_cpu, dev, stage_u8)
-        x8 = _to_gpu_pinned(x8_cpu, dev, stage_u8)
-        x16 = _to_gpu_pinned(x16_cpu, dev, stage_u8)
-        x1_orig = x1.clone()
-        x8_orig = x8.clone()
-        x16_orig = x16.clone()
+        gen_sh = torch.Generator(device="cpu")
+        gen_sh.manual_seed(seed * 313 + 7)
 
-        # FP64 reference across all 8 ranks
-        ref1_cpu = x1_cpu.float().double()
-        ref8_cpu = x8_cpu.float().double()
-        ref16_cpu = x16_cpu.float().double()
-        dist.all_reduce(ref1_cpu, group=pg)
-        dist.all_reduce(ref8_cpu, group=pg)
-        dist.all_reduce(ref16_cpu, group=pg)
-        ref1 = _to_gpu_pinned(ref1_cpu.to(torch.bfloat16), dev, stage_u8)
-        ref8 = _to_gpu_pinned(ref8_cpu.to(torch.bfloat16), dev, stage_u8)
-        ref16 = _to_gpu_pinned(ref16_cpu.to(torch.bfloat16), dev, stage_u8)
+        row_shapes = (1, 16, 512)
+        xs_cpu = {
+            m: (torch.randn((m, 5120), generator=gen, dtype=torch.float32) * 0.5).to(torch.bfloat16)
+            for m in row_shapes
+        }
+        res_cpu = {
+            m: (torch.randn((m, 4, 5120), generator=gen_sh, dtype=torch.float32) * 0.4).to(
+                torch.bfloat16
+            )
+            for m in row_shapes
+        }
+        pm_cpu = {
+            m: torch.rand((m, 4), generator=gen_sh, dtype=torch.float32) * 0.5 + 0.1
+            for m in row_shapes
+        }
+        cm_cpu = {
+            m: torch.softmax(
+                torch.randn((m, 4, 4), generator=gen_sh, dtype=torch.float32), dim=-1
+            )
+            for m in row_shapes
+        }
 
-        y1_b = torch.zeros_like(x1)
-        y8_b = torch.zeros_like(x8)
-        y16_b = torch.zeros_like(x16)
-        y1_c = torch.zeros_like(x1)
-        y8_c = torch.zeros_like(x8)
-        y16_c = torch.zeros_like(x16)
+        xs = {m: _to_gpu_pinned(xs_cpu[m], dev, stage_u8) for m in row_shapes}
+        res_g = {m: _to_gpu_pinned(res_cpu[m], dev, stage_u8) for m in row_shapes}
+        pm_g = {m: _to_gpu_pinned(pm_cpu[m], dev, stage_u8) for m in row_shapes}
+        cm_g = {m: _to_gpu_pinned(cm_cpu[m], dev, stage_u8) for m in row_shapes}
+        xs_orig = {m: xs[m].clone() for m in row_shapes}
+        res_orig = {m: res_g[m].clone() for m in row_shapes}
+
+        # Independent FP64 reference across all 8 ranks (`AllReduce` + 4-stream `mhc_post`)
+        refs = {}
+        for m in row_shapes:
+            ar_d = xs_cpu[m].float().double()
+            dist.all_reduce(ar_d, group=pg)
+            ar_bf16_d = ar_d.to(torch.bfloat16).double()
+            comb_d = cm_cpu[m].double()
+            res_d = res_cpu[m].float().double()
+            post_d = pm_cpu[m].double()
+            mixed_d = torch.einsum("mjs,mjd->msd", comb_d, res_d) + post_d.unsqueeze(
+                -1
+            ) * ar_bf16_d.unsqueeze(1)
+            refs[m] = _to_gpu_pinned(mixed_d.to(torch.bfloat16), dev, stage_u8)
+
+        scratch_red = torch.zeros((512, 5120), dtype=torch.bfloat16, device=dev)
+        yb = {m: torch.zeros_like(res_g[m]) for m in row_shapes}
+        yc = {m: torch.zeros_like(res_g[m]) for m in row_shapes}
+
+        def _exec_step(comm: PpuIcnCollectives, fmp: int, outs: dict[int, torch.Tensor]) -> None:
+            for m in row_shapes:
+                if fmp == 1:
+                    comm.all_reduce_mhc_post_bf16(
+                        xs[m],
+                        res_g[m],
+                        pm_g[m],
+                        cm_g[m],
+                        out=outs[m],
+                        scratch_red=scratch_red[:m],
+                    )
+                else:
+                    red_m = scratch_red[:m]
+                    comm.all_reduce_bf16(xs[m], output=red_m)
+                    ops.mhc_post(red_m, res_g[m], pm_g[m], cm_g[m], out=outs[m])
 
         for _ in range(4):
-            base_comm.all_reduce_bf16(x1, output=y1_b)
-            base_comm.all_reduce_bf16(x8, output=y8_b)
-            base_comm.all_reduce_bf16(x16, output=y16_b)
-            cand_comm.all_reduce_bf16(x1, output=y1_c)
-            cand_comm.all_reduce_bf16(x8, output=y8_c)
-            cand_comm.all_reduce_bf16(x16, output=y16_c)
+            _exec_step(base_comm, b_fmp, yb)
+            _exec_step(cand_comm, c_fmp, yc)
         torch.cuda.synchronize(dev)
 
-        inputs_unchanged = bool(
-            torch.equal(x1, x1_orig) and torch.equal(x8, x8_orig) and torch.equal(x16, x16_orig)
+        inputs_unchanged = all(torch.equal(xs[m], xs_orig[m]) for m in row_shapes) and all(
+            torch.equal(res_g[m], res_orig[m]) for m in row_shapes
         )
-        err1 = float((y1_c.float() - ref1.float()).abs().max().item())
-        err8 = float((y8_c.float() - ref8.float()).abs().max().item())
-        err16 = float((y16_c.float() - ref16.float()).abs().max().item())
-        ref_ok = err1 <= 0.0625 and err8 <= 0.0625 and err16 <= 0.0625
+        ref_ok = all(
+            float((yc[m].float() - refs[m].float()).abs().max().item()) <= 0.0625
+            for m in row_shapes
+        )
 
         # Verify all 8 ranks produced identical BF16 bit-patterns on BOTH ICNLink (M=16) and PCCL (M=512)
-        y8_cpu = y8_c.view(torch.int16).to(torch.int32).cpu()
-        g8 = [torch.empty_like(y8_cpu) for _ in range(world_size)]
-        dist.all_gather(g8, y8_cpu, group=pg)
-        y16_cpu = y16_c.view(torch.int16).to(torch.int32).cpu()
-        gathered = [torch.empty_like(y16_cpu) for _ in range(world_size)]
-        dist.all_gather(gathered, y16_cpu, group=pg)
-        ranks_agree = all(torch.equal(g8[0], g) for g in g8[1:]) and all(
-            torch.equal(gathered[0], g) for g in gathered[1:]
+        y16_cpu = yc[16].view(torch.int16).to(torch.int32).cpu()
+        g16 = [torch.empty_like(y16_cpu) for _ in range(world_size)]
+        dist.all_gather(g16, y16_cpu, group=pg)
+        y512_cpu = yc[512].view(torch.int16).to(torch.int32).cpu()
+        g512 = [torch.empty_like(y512_cpu) for _ in range(world_size)]
+        dist.all_gather(g512, y512_cpu, group=pg)
+        ranks_agree = all(torch.equal(g16[0], g) for g in g16[1:]) and all(
+            torch.equal(g512[0], g) for g in g512[1:]
         )
 
         ok_tensor = torch.tensor(
@@ -232,29 +263,26 @@ def _icn_worker(
 
         def _time_comm(
             comm: PpuIcnCollectives,
-            out1: torch.Tensor,
-            out8: torch.Tensor,
-            out16: torch.Tensor,
+            fmp: int,
+            outs: dict[int, torch.Tensor],
         ) -> float:
             dist.barrier(group=pg)
             ev0 = torch.cuda.Event(enable_timing=True)
             ev1 = torch.cuda.Event(enable_timing=True)
             ev0.record()
             for _ in range(iterations):
-                comm.all_reduce_bf16(x1, output=out1)
-                comm.all_reduce_bf16(x8, output=out8)
-                comm.all_reduce_bf16(x16, output=out16)
+                _exec_step(comm, fmp, outs)
             ev1.record()
             ev1.synchronize()
-            return float(ev0.elapsed_time(ev1)) * 1000.0 / float(3 * iterations)
+            return float(ev0.elapsed_time(ev1)) * 1000.0 / float(len(row_shapes) * iterations)
 
         for r_idx in range(rounds):
             if r_idx % 2 == 0:
-                b_t = _time_comm(base_comm, y1_b, y8_b, y16_b)
-                c_t = _time_comm(cand_comm, y1_c, y8_c, y16_c)
+                b_t = _time_comm(base_comm, b_fmp, yb)
+                c_t = _time_comm(cand_comm, c_fmp, yc)
             else:
-                c_t = _time_comm(cand_comm, y1_c, y8_c, y16_c)
-                b_t = _time_comm(base_comm, y1_b, y8_b, y16_b)
+                c_t = _time_comm(cand_comm, c_fmp, yc)
+                b_t = _time_comm(base_comm, b_fmp, yb)
             baseline_us.append(b_t)
             candidate_us.append(c_t)
 
@@ -322,27 +350,30 @@ def _run_micro(args: argparse.Namespace) -> dict:
         sink = _to_gpu_pinned(
             torch.randn((8,), generator=gen, dtype=torch.float32), dev, stage_u8
         )
-        # Benchmark representative decode (`M=8`) + prefill (`M=64`) sparse MQA (`topk=640`)
-        q8 = _to_gpu_pinned(
-            torch.randn((8, 8, 512), generator=gen, dtype=torch.float32) * 0.2,
-            dev,
-            stage_u8,
-            dtype=torch.bfloat16,
-        )
-        q64 = _to_gpu_pinned(
-            torch.randn((64, 8, 512), generator=gen, dtype=torch.float32) * 0.2,
-            dev,
-            stage_u8,
-            dtype=torch.bfloat16,
-        )
-        idx8_cpu = torch.randint(0, 65536, (8, 640), generator=gen, dtype=torch.int32)
-        idx8_cpu[:, 512:] = -1
-        idx8 = _to_gpu_pinned(idx8_cpu, dev, stage_u8)
-        idx64_cpu = torch.randint(0, 65536, (64, 640), generator=gen, dtype=torch.int32)
-        idx64_cpu[:, 512:] = -1
-        idx64 = _to_gpu_pinned(idx64_cpu, dev, stage_u8)
+        # Benchmark decode (`M=8`), batch decode (`M=24`), and causal prefill (`M=256`) sparse MQA (`topk=640`)
+        row_set = (8, 24, 256)
+        max_m = max(row_set)
+        qs = {
+            m: _to_gpu_pinned(
+                torch.randn((m, 8, 512), generator=gen, dtype=torch.float32) * 0.2,
+                dev,
+                stage_u8,
+                dtype=torch.bfloat16,
+            )
+            for m in row_set
+        }
+        idxs = {}
+        for m in row_set:
+            ic = torch.randint(0, 65536, (m, 640), generator=gen, dtype=torch.int32)
+            if m <= 24:
+                ic[:, 384:] = -1
+            else:
+                for r in range(m):
+                    valid_len = min(512, r * 2 + 32)
+                    ic[r, valid_len:] = -1
+            idxs[m] = _to_gpu_pinned(ic, dev, stage_u8)
 
-        q8_orig, q64_orig = q8.clone(), q64.clone()
+        qs_orig = {m: qs[m].clone() for m in row_set}
         arena_orig = arena.clone()
         sm_scale = 512**-0.5
 
@@ -359,91 +390,63 @@ def _run_micro(args: argparse.Namespace) -> dict:
                     out_r[m] = p @ kv_m
             return out_r
 
-        ref8 = _ref_attn(q8, idx8)
-        ref64 = _ref_attn(q64, idx64)
+        refs = {m: _ref_attn(qs[m], idxs[m]) for m in row_set}
 
-        p_acc = torch.zeros((64 * 64, 512), dtype=torch.float32, device=dev)
-        p_m = torch.zeros((64 * 64,), dtype=torch.float32, device=dev)
-        p_l = torch.zeros((64 * 64,), dtype=torch.float32, device=dev)
-        q_pad = torch.zeros((64, 64, 512), dtype=torch.bfloat16, device=dev)
-        o8 = torch.zeros_like(q8)
-        o64 = torch.zeros_like(q64)
+        p_acc = torch.zeros((max_m * 64, 512), dtype=torch.float32, device=dev)
+        p_m = torch.zeros((max_m * 64,), dtype=torch.float32, device=dev)
+        p_l = torch.zeros((max_m * 64,), dtype=torch.float32, device=dev)
+        q_pad = torch.zeros((max_m, 64, 512), dtype=torch.bfloat16, device=dev)
+        outs = {m: torch.zeros_like(qs[m]) for m in row_set}
 
         b_bk = str(baseline_cfg["sparse_attn_backend"])
         c_bk = str(candidate_cfg["sparse_attn_backend"])
         for bk in (b_bk, c_bk):
             for _ in range(3):
-                ops.sparse_attn_tp8_forward(
-                    q8,
-                    arena,
-                    sink,
-                    idx8,
-                    out=o8,
-                    partial_acc=p_acc[: 8 * 64],
-                    partial_m=p_m[: 8 * 64],
-                    partial_l=p_l[: 8 * 64],
-                    q_pad64_buf=q_pad[:8],
-                    sm_scale=sm_scale,
-                    backend=bk,
-                )
-                ops.sparse_attn_tp8_forward(
-                    q64,
-                    arena,
-                    sink,
-                    idx64,
-                    out=o64,
-                    partial_acc=p_acc,
-                    partial_m=p_m,
-                    partial_l=p_l,
-                    q_pad64_buf=q_pad,
-                    sm_scale=sm_scale,
-                    backend=bk,
-                )
+                for m in row_set:
+                    ops.sparse_attn_tp8_forward(
+                        qs[m],
+                        arena,
+                        sink,
+                        idxs[m],
+                        out=outs[m],
+                        partial_acc=p_acc[: m * 64],
+                        partial_m=p_m[: m * 64],
+                        partial_l=p_l[: m * 64],
+                        q_pad64_buf=q_pad[:m],
+                        sm_scale=sm_scale,
+                        backend=bk,
+                    )
         torch.cuda.synchronize(dev)
 
-        inputs_unchanged = bool(
-            torch.equal(q8, q8_orig)
-            and torch.equal(q64, q64_orig)
-            and torch.equal(arena, arena_orig)
+        inputs_unchanged = all(torch.equal(qs[m], qs_orig[m]) for m in row_set) and bool(
+            torch.equal(arena, arena_orig)
         )
-        max_err8 = float((o8.float() - ref8).abs().max().item())
-        max_err64 = float((o64.float() - ref64).abs().max().item())
-        reference_ok = max_err8 < 2.0e-3 and max_err64 < 2.0e-3
+        reference_ok = all(
+            float((outs[m].float() - refs[m]).abs().max().item()) < 2.0e-3 for m in row_set
+        )
 
         def _time_bk(bk: str) -> float:
             ev0 = torch.cuda.Event(enable_timing=True)
             ev1 = torch.cuda.Event(enable_timing=True)
             ev0.record()
             for _ in range(iterations):
-                ops.sparse_attn_tp8_forward(
-                    q8,
-                    arena,
-                    sink,
-                    idx8,
-                    out=o8,
-                    partial_acc=p_acc[: 8 * 64],
-                    partial_m=p_m[: 8 * 64],
-                    partial_l=p_l[: 8 * 64],
-                    q_pad64_buf=q_pad[:8],
-                    sm_scale=sm_scale,
-                    backend=bk,
-                )
-                ops.sparse_attn_tp8_forward(
-                    q64,
-                    arena,
-                    sink,
-                    idx64,
-                    out=o64,
-                    partial_acc=p_acc,
-                    partial_m=p_m,
-                    partial_l=p_l,
-                    q_pad64_buf=q_pad,
-                    sm_scale=sm_scale,
-                    backend=bk,
-                )
+                for m in row_set:
+                    ops.sparse_attn_tp8_forward(
+                        qs[m],
+                        arena,
+                        sink,
+                        idxs[m],
+                        out=outs[m],
+                        partial_acc=p_acc[: m * 64],
+                        partial_m=p_m[: m * 64],
+                        partial_l=p_l[: m * 64],
+                        q_pad64_buf=q_pad[:m],
+                        sm_scale=sm_scale,
+                        backend=bk,
+                    )
             ev1.record()
             ev1.synchronize()
-            return float(ev0.elapsed_time(ev1)) * 1000.0 / float(2 * iterations)
+            return float(ev0.elapsed_time(ev1)) * 1000.0 / float(len(row_set) * iterations)
 
         baseline_us, candidate_us = [], []
         for r_idx in range(rounds):
@@ -536,8 +539,10 @@ def _run_micro(args: argparse.Namespace) -> dict:
 
         w13_ref = _dequant_mxfp4_ref(exp_w13_p, exp_w13_s).to(torch.bfloat16)
         w2_ref = _dequant_mxfp4_ref(exp_w2_p, exp_w2_s).to(torch.bfloat16)
+        gate_w_ozaki = ops.make_ozaki2_bf16(gate_w)
 
         r_buf = torch.zeros((max_m, e_cnt), dtype=torch.float32, device=dev)
+        r_oz_buf = torch.zeros((max_m, 2 * e_cnt), dtype=torch.float32, device=dev)
         tw_buf = torch.zeros((max_m, top_k), dtype=torch.float32, device=dev)
         ti_buf = torch.zeros((max_m, top_k), dtype=torch.int32, device=dev)
         sgu_buf = torch.zeros((max_m, 2 * i_tp), dtype=torch.bfloat16, device=dev)
@@ -585,6 +590,9 @@ def _run_micro(args: argparse.Namespace) -> dict:
                 tile_a_buf=ta_buf,
                 tile_gu_buf=tgu_buf,
                 tile_inter_buf=ti_tile_buf,
+                gate_weight_ozaki_bf16=gate_w_ozaki,
+                router_ozaki_buf=r_oz_buf,
+                router_mode=str(cfg.get("moe_router_mode", "fp32")),
                 gemv_max_rows=int(cfg["moe_gemv_max_rows"]),
                 gemv_threads=int(cfg["moe_gemv_threads"]),
                 block_m=int(cfg["moe_block_m"]),
@@ -676,7 +684,7 @@ def _run_micro(args: argparse.Namespace) -> dict:
         }
 
     if family == "mhc_mixes":
-        row_set = (8, 24, 256)
+        row_set = (8, 24, 512)
         max_m = max(row_set)
         norm_eps = 1.0e-20
         hc_eps = 1.0e-6
@@ -697,6 +705,7 @@ def _run_micro(args: argparse.Namespace) -> dict:
             stage_u8,
         )
         hc_fn_bf16 = hc_fn_f32.to(torch.bfloat16).contiguous()
+        hc_fn_ozaki = ops.make_ozaki2_bf16(hc_fn_f32)
         hc_scale = _to_gpu_pinned(
             torch.randn((3,), generator=gen, dtype=torch.float32).abs() * 0.2 + 0.05,
             dev,
@@ -712,7 +721,9 @@ def _run_micro(args: argparse.Namespace) -> dict:
         post_buf = torch.zeros((max_m, 4), dtype=torch.float32, device=dev)
         comb_buf = torch.zeros((max_m, 4, 4), dtype=torch.float32, device=dev)
         proj_buf = torch.zeros((max_m, 24), dtype=torch.float32, device=dev)
+        oz_proj_buf = torch.zeros((max_m, 48), dtype=torch.float32, device=dev)
         part_buf = torch.zeros((max_m * 16 * 25,), dtype=torch.float32, device=dev)
+        cnt_buf = torch.zeros((max_m,), dtype=torch.int32, device=dev)
 
         def _exec_mhc(xm: torch.Tensor, cfg: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             m_r = xm.shape[0]
@@ -727,8 +738,12 @@ def _run_micro(args: argparse.Namespace) -> dict:
                 comb_out=comb_buf[:m_r],
                 raw_proj_buf=proj_buf[:m_r],
                 split_k_part_buf=part_buf,
+                split_k_counters_buf=cnt_buf,
+                hc_fn_ozaki_bf16=hc_fn_ozaki,
+                ozaki_proj_buf=oz_proj_buf,
                 split_k=int(cfg["mhc_split_k"]),
                 fused_max_rows=int(cfg["mhc_fused_max_rows"]),
+                backend=str(cfg.get("mhc_backend", "legacy_2pass")),
                 norm_eps=norm_eps,
                 hc_eps=hc_eps,
                 sinkhorn_iters=sinkhorn_iters,
@@ -1115,7 +1130,7 @@ def _run_micro(args: argparse.Namespace) -> dict:
         }
 
     if family == "engram_compressor_indexer":
-        row_set = (8, 32)
+        row_set = (8, 32, 256)
         max_m = max(row_set)
         h_dim, eff_c, lat_pp, bt_w = 5120, 2048, 128, 16
         hs = {
@@ -1128,6 +1143,29 @@ def _run_micro(args: argparse.Namespace) -> dict:
             for m_r in row_set
         }
         hs_orig = {m_r: t.clone() for m_r, t in hs.items()}
+        x_norms = {
+            m_r: _to_gpu_pinned(
+                torch.randn((m_r, h_dim), generator=gen, dtype=torch.float32) * 0.4,
+                dev,
+                stage_u8,
+                dtype=torch.bfloat16,
+            )
+            for m_r in row_set
+        }
+        x_norms_orig = {m_r: t.clone() for m_r, t in x_norms.items()}
+        comp_wkv_gate_f32 = _to_gpu_pinned(
+            torch.randn((1024, h_dim), generator=gen, dtype=torch.float32) * 0.02,
+            dev,
+            stage_u8,
+        )
+        comp_wkv_gate_oz = ops.make_ozaki2_bf16(comp_wkv_gate_f32)
+        comp_norm_w = _to_gpu_pinned(
+            torch.ones((512,), dtype=torch.float32)
+            + torch.randn((512,), generator=gen, dtype=torch.float32) * 0.05,
+            dev,
+            stage_u8,
+            dtype=torch.bfloat16,
+        )
         kvps = {
             m_r: _to_gpu_pinned(
                 torch.randn((m_r, 5 * h_dim), generator=gen, dtype=torch.float32) * 0.3,
@@ -1167,32 +1205,121 @@ def _run_micro(args: argparse.Namespace) -> dict:
             )
             for m_r in row_set
         }
-        # Mix both `comp_len <= 512` and `comp_len > 512` (`900`) to verify both fast & bitonic paths!
-        pos_cpu = torch.tensor(
-            [380 if i % 2 == 0 else 900 for i in range(max_m)], dtype=torch.int32
+        # Mix both `comp_len <= 512` and `comp_len > 512` (`900`), and consecutive positions for `M=256` prefill
+        pos_dec_gpu = _to_gpu_pinned(
+            torch.tensor([380 if i % 2 == 0 else 901 for i in range(32)], dtype=torch.int32),
+            dev,
+            stage_u8,
         )
-        pos_gpu = _to_gpu_pinned(pos_cpu, dev, stage_u8)
-        row_seq_ids = torch.arange(max_m, dtype=torch.int64, device=dev)
+        pos_prefill_gpu = _to_gpu_pinned(
+            torch.arange(256, dtype=torch.int32), dev, stage_u8
+        )
+        qsl_prefill_gpu = _to_gpu_pinned(
+            torch.tensor([0, 256], dtype=torch.int32), dev, stage_u8
+        )
+        row_seq_dec = torch.arange(32, dtype=torch.int64, device=dev)
+        row_seq_pre = torch.zeros(256, dtype=torch.int64, device=dev)
+        row_comp_dec = torch.arange(1, 33, dtype=torch.int64, device=dev)
+        row_comp_pre = torch.ones(256, dtype=torch.int64, device=dev)
+        mla_pages_gpu = torch.ones(max_m, dtype=torch.int64, device=dev) * 3
         comp_arange = torch.arange(eff_c, dtype=torch.int32, device=dev)
         w_scale = float((128**-0.5) * (32**-0.5))
 
+        comp_state_init = _to_gpu_pinned(
+            torch.randn((36, 8, 2, 512), generator=gen, dtype=torch.float32) * 0.2,
+            dev,
+            stage_u8,
+        )
+        comp_state_work = torch.zeros_like(comp_state_init)
+        comp_kv_gate_buf = torch.zeros((max_m, 1024), dtype=torch.float32, device=dev)
+        comp_oz_buf = torch.zeros((max_m, 2048), dtype=torch.float32, device=dev)
+        lat_buf = torch.zeros((max_m, 512), dtype=torch.bfloat16, device=dev)
+        gpos_buf = torch.zeros((max_m,), dtype=torch.int32, device=dev)
+        mslot_buf = torch.zeros((max_m,), dtype=torch.int64, device=dev)
         h_work = torch.zeros((max_m, 4, h_dim), dtype=torch.bfloat16, device=dev)
         sc_buf = torch.zeros((max_m, eff_c), dtype=torch.float32, device=dev)
         tk_buf = torch.full((max_m, 640), -1, dtype=torch.int32, device=dev)
+        arange_i64 = torch.arange(max_m, dtype=torch.int64, device=dev)
 
-        def _exec_ei(m_r: int, bk: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        def _exec_ei(
+            m_r: int, bk: str, *, reset_state: bool = False
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            if reset_state:
+                comp_state_work.copy_(comp_state_init)
             hw = h_work[:m_r]
             hw.copy_(hs[m_r])
+            xn = x_norms[m_r]
             kvp = kvps[m_r]
             qi = q_idxs[m_r]
             wi = w_idxs[m_r]
-            pm = pos_gpu[:m_r]
-            rs = row_seq_ids[:m_r]
-            bt_m = mla_bt[:m_r]
+            is_pre = m_r == 256
+            pm = pos_prefill_gpu if is_pre else pos_dec_gpu[:m_r]
+            rs = row_seq_pre if is_pre else row_seq_dec[:m_r]
+            cs = row_comp_pre if is_pre else row_comp_dec[:m_r]
+            bt_m = mla_bt[: (1 if is_pre else m_r)]
             sc = sc_buf[:m_r]
             tk = tk_buf[:m_r]
             tk.fill_(-1)
-            if bk == "fused_hggc":
+            lat_o = lat_buf[:m_r]
+
+            if bk == "fused_hggc_ozaki":
+                ops.compressor_cr2_fused(
+                    xn,
+                    wkv_gate_f32=comp_wkv_gate_f32,
+                    wkv_gate_ozaki_bf16=comp_wkv_gate_oz,
+                    use_ozaki=True,
+                    kv_gate_f32_buf=comp_kv_gate_buf,
+                    ozaki_buf=comp_oz_buf,
+                    comp_state=comp_state_work,
+                    positions_i32=pm,
+                    mla_write_pages=mla_pages_gpu[:m_r],
+                    row_comp_slots=cs,
+                    row_seq_ids=rs,
+                    qsl_gpu=qsl_prefill_gpu if is_pre else qsl_prefill_gpu[:0],
+                    norm_weight=comp_norm_w,
+                    latent_out=lat_o,
+                    group_pos_out=gpos_buf[:m_r],
+                    mla_in_page_slots_out=mslot_buf[:m_r],
+                    uniform_width=0 if is_pre else 1,
+                    lat_pp=64,
+                    norm_eps=1.0e-20,
+                )
+            else:
+                xf = xn.float()
+                if bk == "fused_hggc":
+                    kv_g = comp_kv_gate_buf[:m_r]
+                    torch.matmul(xf, comp_wkv_gate_f32.t(), out=kv_g)
+                    c_kv, c_sc = kv_g[:, :512], kv_g[:, 512:]
+                else:
+                    c_kv = torch.matmul(xf, comp_wkv_gate_f32[:512].t())
+                    c_sc = torch.matmul(xf, comp_wkv_gate_f32[512:].t())
+                r_idx = ((pm // 2) & 7).to(torch.int64)
+                is_ev = (pm & 1) == 0
+                is_od = (pm & 1) == 1
+                if not is_pre:
+                    ev_cs = torch.where(is_ev, cs, 0)
+                    comp_state_work[ev_cs, r_idx, 0] = c_kv
+                    comp_state_work[ev_cs, r_idx, 1] = c_sc
+                    od_cs = torch.where(is_od, cs, 0)
+                    p_kv = comp_state_work[od_cs, r_idx, 0]
+                    p_sc = comp_state_work[od_cs, r_idx, 1]
+                else:
+                    prv_r = (arange_i64[:m_r] - 1).clamp(min=0)
+                    p_kv = c_kv.index_select(0, prv_r)
+                    p_sc = c_sc.index_select(0, prv_r)
+                    p_kv[0] = comp_state_work[cs[0], r_idx[0], 0]
+                    p_sc[0] = comp_state_work[cs[0], r_idx[0], 1]
+                    for tr in range(m_r - 16, m_r):
+                        d_cs = torch.where(is_ev[tr], cs[tr], 0)
+                        comp_state_work[d_cs, r_idx[tr], 0] = c_kv[tr]
+                        comp_state_work[d_cs, r_idx[tr], 1] = c_sc[tr]
+                m_mx = torch.maximum(p_sc, c_sc)
+                e0 = torch.exp(p_sc - m_mx)
+                e1 = torch.exp(c_sc - m_mx)
+                pooled = ((p_kv * e0 + c_kv * e1) / (e0 + e1).clamp_min(1.0e-30)).to(torch.bfloat16)
+                ops.rmsnorm_bf16(pooled, comp_norm_w, eps=1.0e-20, out=lat_o)
+
+            if bk in ("fused_hggc", "fused_hggc_ozaki"):
                 ops.engram_gated_residual(hw, kvp, qk_prod, norm_eps=1.0e-20)
                 ops.indexer_paged_score(
                     qi,
@@ -1231,10 +1358,14 @@ def _run_micro(args: argparse.Namespace) -> dict:
                 gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1.0e-6).sqrt(), dot))
                 hw.copy_((hf + gate.unsqueeze(-1) * vf).to(torch.bfloat16))
 
+                n_seq = 1 if is_pre else m_r
                 kp = k_cache.index_select(0, bt_m.reshape(-1).to(torch.int64)).view(
-                    m_r, eff_c, 128
+                    n_seq, eff_c, 128
                 )
-                raw = torch.bmm(qi, kp.transpose(1, 2))
+                if is_pre:
+                    raw = torch.matmul(qi.view(-1, 128), kp[0].t()).view(m_r, 4, eff_c)
+                else:
+                    raw = torch.bmm(qi, kp.transpose(1, 2))
                 torch.sum(
                     raw.float().relu_() * (wi.float() * w_scale).unsqueeze(-1),
                     dim=1,
@@ -1250,28 +1381,38 @@ def _run_micro(args: argparse.Namespace) -> dict:
                 phys_p = bt_m[rs[:, None], tcs // lat_pp]
                 slots = 1000 + phys_p * lat_pp + (tcs % lat_pp).to(torch.int32)
                 tk[:, 128:640] = torch.where(valid & (phys_p > 0), slots, -1)
-            return hw.clone(), sc.clone(), tk[:, 128:640].clone()
+            return lat_o.clone(), hw.clone(), sc.clone(), tk[:, 128:640].clone()
 
         b_bk = str(baseline_cfg.get("engram_indexer_backend", "eager_py"))
         c_bk = str(candidate_cfg.get("engram_indexer_backend", "eager_py"))
         for bk in (b_bk, c_bk):
             for _ in range(3):
                 for m_r in row_set:
-                    _exec_ei(m_r, bk)
+                    _exec_ei(m_r, bk, reset_state=True)
         torch.cuda.synchronize(dev)
 
         reference_ok = True
         for m_r in row_set:
-            rh, rsc, rtk = _exec_ei(m_r, "eager_py")
-            ch, csc, ctk = _exec_ei(m_r, c_bk)
-            comp_l = pos_gpu[:m_r] + 1
+            rlat, rh, rsc, rtk = _exec_ei(m_r, "eager_py", reset_state=True)
+            clat, ch, csc, ctk = _exec_ei(m_r, c_bk, reset_state=True)
+            pm_cur = pos_prefill_gpu if m_r == 256 else pos_dec_gpu[:m_r]
+            comp_l = pm_cur + 1
             reach = comp_arange[None, :] < comp_l[:, None]
+            odd_mask = ((pm_cur & 1) == 1).float().unsqueeze(-1)
+            lat_err = float(((rlat.float() - clat.float()) * odd_mask).abs().max().item())
             h_err = float((rh.float() - ch.float()).abs().max().item())
             sc_err = float(((rsc - csc) * reach.float()).abs().max().item())
-            if h_err > 0.02 or sc_err > 1.0e-3 or not bool(torch.equal(rtk, ctk)):
+            if (
+                lat_err > 0.03
+                or h_err > 0.02
+                or sc_err > 1.0e-3
+                or not bool(torch.equal(rtk, ctk))
+            ):
                 reference_ok = False
 
-        inputs_unchanged = all(torch.equal(hs[m_r], hs_orig[m_r]) for m_r in row_set)
+        inputs_unchanged = all(torch.equal(hs[m_r], hs_orig[m_r]) for m_r in row_set) and all(
+            torch.equal(x_norms[m_r], x_norms_orig[m_r]) for m_r in row_set
+        )
 
         def _time_ei(bk: str) -> float:
             ev0 = torch.cuda.Event(enable_timing=True)
@@ -1428,24 +1569,33 @@ def _parse_applied_sail_from_log(log_text: str) -> dict | None:
     )
     if not m:
         return None
-    return {
+    out = {
         "backend": m.group(1),
         "ar_blocks": int(m.group(2)),
         "ar_threads": int(m.group(3)),
         "ar_oneshot_max_bytes": int(m.group(4)),
         "ar_pccl_min_bytes": int(m.group(5)),
+        "ar_fuse_mhc_post": 0,
         "moe_gemv_max_rows": int(m.group(6)),
         "moe_gemv_threads": int(m.group(7)),
         "moe_block_m": int(m.group(8)),
         "moe_num_warps": int(m.group(9)),
         "moe_prefill_backend": m.group(10),
+        "moe_router_mode": "fp32",
         "sparse_attn_backend": m.group(11),
         "mhc_split_k": int(m.group(12)),
         "mhc_fused_max_rows": int(m.group(13)),
+        "mhc_backend": "legacy_2pass",
         "qkv_fusion_mode": m.group(14),
         "engram_indexer_backend": m.group(15),
         "lm_head_dtype": m.group(16),
     }
+    m4 = re.search(r"sail_v4=\(fmp=(\d+),rtr=(\w+),mhc_bk=(\w+)\)", log_text)
+    if m4:
+        out["ar_fuse_mhc_post"] = int(m4.group(1))
+        out["moe_router_mode"] = m4.group(2)
+        out["mhc_backend"] = m4.group(3)
+    return out
 
 
 def _run_zstep_model(args: argparse.Namespace) -> dict:
