@@ -55,32 +55,40 @@ DEFAULT_SAIL_CONTAINER_IMAGE: str = (
 class SailPolicy(StrictModel):
     """Bounded, typed PPU/SAIL runtime policy consumed via `ZSTEP_SAIL_POLICY_PATH`."""
 
-    version: Literal[1, 2, 3] = 3
+    version: Literal[1, 2, 3, 4] = 4
     ar_blocks: Literal[4, 8, 16, 24, 32, 64] = 8
     ar_threads: Literal[128, 256, 512] = 256
     ar_oneshot_max_bytes: Literal[65536, 131072, 262144, 524288] = 131072
-    ar_pccl_min_bytes: Literal[262144, 524288, 1048576, 4194304, 67108864] = 67108864
-    moe_gemv_max_rows: Literal[8, 16, 32, 64, 128] = 16
+    ar_pccl_min_bytes: Literal[262144, 524288, 1048576, 2097152, 4194304, 67108864] = 67108864
+    ar_fuse_mhc_post: Literal[0, 1] = 0
+    moe_gemv_max_rows: Literal[8, 16, 32, 64, 128, 256] = 16
     moe_gemv_threads: Literal[128, 256, 512] = 256
     moe_block_m: Literal[16, 32, 64] = 32
     moe_num_warps: Literal[4, 8] = 4
     moe_prefill_backend: Literal["triton_grouped", "dequant_acblas"] = "triton_grouped"
-    sparse_attn_backend: Literal["auto", "triton_tp8", "hggc_tp8", "flash_mla"] = "auto"
+    moe_router_mode: Literal["fp32", "ozaki_bf16", "ozaki_fast_fp4"] = "fp32"
+    sparse_attn_backend: Literal[
+        "auto", "triton_tp8", "triton_splitk", "hggc_tp8", "flash_mla"
+    ] = "auto"
     mhc_split_k: Literal[1, 4, 8, 16] = 1
     mhc_fused_max_rows: Literal[16, 64, 256, 4096] = 16
+    mhc_backend: Literal["legacy_2pass", "vec_1pass_ozaki"] = "legacy_2pass"
     qkv_fusion_mode: Literal["separate", "fused_qkv_epilogue"] = "separate"
-    engram_indexer_backend: Literal["eager_py", "fused_hggc"] = "eager_py"
+    engram_indexer_backend: Literal[
+        "eager_py", "fused_hggc", "fused_hggc_ozaki"
+    ] = "eager_py"
     lm_head_dtype: Literal["fp32", "bf16"] = "fp32"
 
     @property
     def key(self) -> str:
         return (
             f"ar{self.ar_blocks}x{self.ar_threads}-os{self.ar_oneshot_max_bytes // 1024}k-"
-            f"pccl{self.ar_pccl_min_bytes // 1024}k-"
+            f"pccl{self.ar_pccl_min_bytes // 1024}k-fmp{self.ar_fuse_mhc_post}-"
             f"gemv{self.moe_gemv_max_rows}@{self.moe_gemv_threads}-"
             f"bm{self.moe_block_m}w{self.moe_num_warps}-{self.moe_prefill_backend}-"
+            f"rtr-{self.moe_router_mode}-"
             f"attn-{self.sparse_attn_backend}-"
-            f"mhc{self.mhc_split_k}r{self.mhc_fused_max_rows}-"
+            f"mhc{self.mhc_split_k}r{self.mhc_fused_max_rows}-{self.mhc_backend}-"
             f"qkv-{self.qkv_fusion_mode}-ei-{self.engram_indexer_backend}-"
             f"head-{self.lm_head_dtype}"
         )
@@ -91,14 +99,17 @@ class SailPolicy(StrictModel):
             "ar_threads": self.ar_threads,
             "ar_oneshot_max_bytes": self.ar_oneshot_max_bytes,
             "ar_pccl_min_bytes": self.ar_pccl_min_bytes,
+            "ar_fuse_mhc_post": self.ar_fuse_mhc_post,
             "moe_gemv_max_rows": self.moe_gemv_max_rows,
             "moe_gemv_threads": self.moe_gemv_threads,
             "moe_block_m": self.moe_block_m,
             "moe_num_warps": self.moe_num_warps,
             "moe_prefill_backend": self.moe_prefill_backend,
+            "moe_router_mode": self.moe_router_mode,
             "sparse_attn_backend": self.sparse_attn_backend,
             "mhc_split_k": self.mhc_split_k,
             "mhc_fused_max_rows": self.mhc_fused_max_rows,
+            "mhc_backend": self.mhc_backend,
             "qkv_fusion_mode": self.qkv_fusion_mode,
             "engram_indexer_backend": self.engram_indexer_backend,
             "lm_head_dtype": self.lm_head_dtype,
@@ -155,16 +166,21 @@ def family_candidates(incumbent: SailPolicy, family: str) -> list[SailPolicy]:
     """Bounded single-family mutations around `incumbent`; never proposes `incumbent` itself."""
     candidates: list[SailPolicy] = []
     if family == "sparse_attn_tp8":
-        for bk in ("triton_tp8", "hggc_tp8", "flash_mla"):
+        for bk in ("triton_splitk", "triton_tp8", "hggc_tp8", "flash_mla"):
             if bk != incumbent.sparse_attn_backend:
                 candidates.append(incumbent.model_copy(update={"sparse_attn_backend": bk}))
     elif family == "icn_allreduce":
-        for blks, thrs, os_b, pccl_b in (
-            (64, 512, 131072, 67108864),
-            (32, 256, 131072, 67108864),
-            (16, 256, 131072, 67108864),
-            (16, 256, 262144, 67108864),
-            (4, 256, 131072, 67108864),
+        for blks, thrs, os_b, pccl_b, fmp in (
+            (
+                incumbent.ar_blocks,
+                incumbent.ar_threads,
+                incumbent.ar_oneshot_max_bytes,
+                67108864,
+                1,
+            ),
+            (16, 256, 262144, 67108864, 0),
+            (32, 256, incumbent.ar_oneshot_max_bytes, 67108864, 1),
+            (64, 512, 262144, 67108864, 1),
         ):
             cand = incumbent.model_copy(
                 update={
@@ -172,46 +188,56 @@ def family_candidates(incumbent: SailPolicy, family: str) -> list[SailPolicy]:
                     "ar_threads": thrs,
                     "ar_oneshot_max_bytes": os_b,
                     "ar_pccl_min_bytes": pccl_b,
+                    "ar_fuse_mhc_post": fmp,
                 }
             )
             if cand != incumbent:
                 candidates.append(cand)
     elif family == "mxfp4_moe_decode":
-        for thrs, gmax in (
-            (256, 128),
-            (256, 64),
-            (512, 128),
-            (512, incumbent.moe_gemv_max_rows),
-            (128, incumbent.moe_gemv_max_rows),
-            (256, 32),
-            (256, 8),
+        for thrs, gmax, rtr in (
+            (512, 256, "ozaki_fast_fp4"),
+            (incumbent.moe_gemv_threads, incumbent.moe_gemv_max_rows, "ozaki_fast_fp4"),
+            (256, 128, "ozaki_fast_fp4"),
+            (512, 128, "ozaki_bf16"),
+            (512, incumbent.moe_gemv_max_rows, incumbent.moe_router_mode),
         ):
             cand = incumbent.model_copy(
-                update={"moe_gemv_threads": thrs, "moe_gemv_max_rows": gmax}
+                update={
+                    "moe_gemv_threads": thrs,
+                    "moe_gemv_max_rows": gmax,
+                    "moe_router_mode": rtr,
+                }
             )
             if cand != incumbent:
                 candidates.append(cand)
     elif family == "mxfp4_moe_prefill":
-        for pb, bm, nw in (
-            ("dequant_acblas", incumbent.moe_block_m, incumbent.moe_num_warps),
-            ("triton_grouped", 16, 4),
-            ("triton_grouped", 16, 8),
-            ("triton_grouped", 64, 4),
-            ("triton_grouped", 32, 8),
+        for pb, bm, nw, gmax, rtr in (
+            ("dequant_acblas", incumbent.moe_block_m, incumbent.moe_num_warps, 256, "ozaki_fast_fp4"),
+            ("dequant_acblas", incumbent.moe_block_m, incumbent.moe_num_warps, incumbent.moe_gemv_max_rows, "ozaki_fast_fp4"),
+            ("dequant_acblas", 32, 4, incumbent.moe_gemv_max_rows, "ozaki_fast_fp4"),
+            ("dequant_acblas", incumbent.moe_block_m, incumbent.moe_num_warps, incumbent.moe_gemv_max_rows, incumbent.moe_router_mode),
         ):
             cand = incumbent.model_copy(
                 update={
                     "moe_prefill_backend": pb,
                     "moe_block_m": bm,
                     "moe_num_warps": nw,
+                    "moe_gemv_max_rows": gmax,
+                    "moe_router_mode": rtr,
                 }
             )
             if cand != incumbent:
                 candidates.append(cand)
     elif family == "mhc_mixes":
-        for sk, mr in ((8, 4096), (16, 4096), (4, 4096), (8, 256), (4, 64)):
+        for sk, mr, mbk in (
+            (8, 256, "vec_1pass_ozaki"),
+            (16, 256, "vec_1pass_ozaki"),
+            (4, 256, "vec_1pass_ozaki"),
+            (8, 4096, "legacy_2pass"),
+            (16, 4096, "legacy_2pass"),
+        ):
             cand = incumbent.model_copy(
-                update={"mhc_split_k": sk, "mhc_fused_max_rows": mr}
+                update={"mhc_split_k": sk, "mhc_fused_max_rows": mr, "mhc_backend": mbk}
             )
             if cand != incumbent:
                 candidates.append(cand)
@@ -220,7 +246,7 @@ def family_candidates(incumbent: SailPolicy, family: str) -> list[SailPolicy]:
             if qm != incumbent.qkv_fusion_mode:
                 candidates.append(incumbent.model_copy(update={"qkv_fusion_mode": qm}))
     elif family == "engram_compressor_indexer":
-        for eib in ("fused_hggc", "eager_py"):
+        for eib in ("fused_hggc_ozaki", "fused_hggc", "eager_py"):
             if eib != incumbent.engram_indexer_backend:
                 candidates.append(
                     incumbent.model_copy(update={"engram_indexer_backend": eib})
@@ -259,22 +285,29 @@ def compose_sail_proposals(incumbent: SailPolicy, winners: list[dict]) -> list[S
                     ar_threads=pol.ar_threads,
                     ar_oneshot_max_bytes=pol.ar_oneshot_max_bytes,
                     ar_pccl_min_bytes=pol.ar_pccl_min_bytes,
+                    ar_fuse_mhc_post=pol.ar_fuse_mhc_post,
                 )
             elif fam == "mxfp4_moe_decode":
-                updates.update(
-                    moe_gemv_threads=pol.moe_gemv_threads,
-                    moe_gemv_max_rows=pol.moe_gemv_max_rows,
-                )
+                updates["moe_gemv_threads"] = pol.moe_gemv_threads
+                if pol.moe_gemv_max_rows != incumbent.moe_gemv_max_rows:
+                    updates["moe_gemv_max_rows"] = pol.moe_gemv_max_rows
+                if pol.moe_router_mode != incumbent.moe_router_mode:
+                    updates["moe_router_mode"] = pol.moe_router_mode
             elif fam == "mxfp4_moe_prefill":
                 updates.update(
                     moe_prefill_backend=pol.moe_prefill_backend,
                     moe_block_m=pol.moe_block_m,
                     moe_num_warps=pol.moe_num_warps,
                 )
+                if pol.moe_gemv_max_rows != incumbent.moe_gemv_max_rows:
+                    updates["moe_gemv_max_rows"] = pol.moe_gemv_max_rows
+                if pol.moe_router_mode != incumbent.moe_router_mode:
+                    updates["moe_router_mode"] = pol.moe_router_mode
             elif fam == "mhc_mixes":
                 updates.update(
                     mhc_split_k=pol.mhc_split_k,
                     mhc_fused_max_rows=pol.mhc_fused_max_rows,
+                    mhc_backend=pol.mhc_backend,
                 )
             elif fam == "attn_qkv_o_proj":
                 updates["qkv_fusion_mode"] = pol.qkv_fusion_mode
@@ -317,11 +350,24 @@ class ZstepSailEvolution:
             "StrictHostKeyChecking=no",
             "-o",
             "UserKnownHostsFile=/dev/null",
+            "-o",
+            "ConnectTimeout=20",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
         ]
         if not has_askpass:
             cmd += ["-o", "BatchMode=yes"]
         if self.config.control_path:
-            cmd += ["-o", f"ControlPath={self.config.control_path}"]
+            cmd += [
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPersist=600",
+                "-o",
+                f"ControlPath={self.config.control_path}",
+            ]
         return cmd
 
     def _run_ssh(
@@ -333,36 +379,46 @@ class ZstepSailEvolution:
         stdin_bytes: bytes | None = None,
     ) -> str:
         directory.mkdir(parents=True, exist_ok=True)
-        bounded = min(timeout, max(1, int(self._remaining())))
         env = os.environ.copy()
         if env.get("SSH_ASKPASS"):
             env.setdefault("SSH_ASKPASS_REQUIRE", "force")
             env.setdefault("DISPLAY", ":0")
-        proc = subprocess.Popen(
-            [*self._ssh_base(), self.config.remote, remote_cmd],
-            stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            env=env,
-        )
-        try:
-            out_b, err_b = proc.communicate(input=stdin_bytes, timeout=bounded)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                out_b, err_b = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                out_b, err_b = proc.communicate()
-            (directory / "worker.log").write_bytes(out_b + err_b)
-            raise TimeoutError(f"SSH command exceeded {bounded}s; terminated.") from None
-        (directory / "worker.log").write_bytes(out_b + err_b)
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Remote command exited {proc.returncode}; see {directory / 'worker.log'}"
+        last_rc = 0
+        out_b = b""
+        err_b = b""
+        for attempt in range(4):
+            bounded = min(timeout, max(1, int(self._remaining())))
+            proc = subprocess.Popen(
+                [*self._ssh_base(), self.config.remote, remote_cmd],
+                stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                env=env,
             )
-        return out_b.decode("utf-8", errors="replace")
+            try:
+                out_b, err_b = proc.communicate(input=stdin_bytes, timeout=bounded)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    out_b, err_b = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    out_b, err_b = proc.communicate()
+                (directory / "worker.log").write_bytes(out_b + err_b)
+                raise TimeoutError(f"SSH command exceeded {bounded}s; terminated.") from None
+            last_rc = proc.returncode
+            (directory / "worker.log").write_bytes(out_b + err_b)
+            if last_rc == 0:
+                return out_b.decode("utf-8", errors="replace")
+            if last_rc != 255 or attempt == 3:
+                break
+            if self.config.control_path:
+                Path(self.config.control_path).unlink(missing_ok=True)
+            time.sleep(min(3.0 * (attempt + 1), max(0.1, self._remaining() - 1.0)))
+        raise RuntimeError(
+            f"Remote command exited {last_rc}; see {directory / 'worker.log'}"
+        )
 
     def _remote_bash(self, script: str, directory: Path, timeout: int = 600) -> str:
         bounded = min(timeout, max(1, int(self._remaining())))
@@ -675,15 +731,15 @@ class ZstepSailEvolution:
             )
             report["context"] = context
 
-            tried = {
-                entry["key"]
-                for entry in self.store.recent("zstep_sail_micro", limit=256)
-                if entry.get("context") == context
-            }
+            prior_micro_by_key: dict[str, dict] = {}
+            for entry in reversed(self.store.recent("zstep_sail_micro", limit=256)):
+                if entry.get("context") == context and "error" not in entry:
+                    prior_micro_by_key[entry["key"]] = entry
+            tried = set(prior_micro_by_key)
             model_tried = {
                 entry["key"]
                 for entry in self.store.recent("zstep_sail_policy", limit=256)
-                if entry.get("context") == context
+                if entry.get("context") == context and "error" not in entry
             }
             if self.config.initial_policy_path is None:
                 for session in self.store.recent("zstep_sail_session", limit=256):
@@ -733,6 +789,7 @@ class ZstepSailEvolution:
                 for target_fam in targets:
                     fam_name = str(target_fam["name"])
                     options: list[tuple[SailPolicy, str]] = []
+                    archived_fam_winner: dict | None = None
                     for cand in family_candidates(incumbent, fam_name):
                         m_key = content_hash(
                             {
@@ -744,10 +801,39 @@ class ZstepSailEvolution:
                         )
                         if m_key not in tried:
                             options.append((cand, m_key))
+                        else:
+                            prev = prior_micro_by_key.get(m_key)
+                            if prev and prev.get("accepted") is True:
+                                conf_m = prev.get("confirmation_measurement") or {}
+                                spd = float(conf_m.get("speedup", 0.0))
+                                if spd > 1.0 and (
+                                    archived_fam_winner is None
+                                    or spd > archived_fam_winner["speedup"]
+                                ):
+                                    archived_fam_winner = {
+                                        "family": fam_name,
+                                        "policy": cand.model_dump(),
+                                        "speedup": spd,
+                                        "predicted_saving_us": float(
+                                            target_fam["estimated_total_us"]
+                                        )
+                                        * (1.0 - 1.0 / spd),
+                                    }
                     if not options:
+                        if archived_fam_winner is not None:
+                            p_cand = SailPolicy.model_validate(archived_fam_winner["policy"])
+                            p_check = content_hash(
+                                {
+                                    "context": context,
+                                    "incumbent": incumbent.model_dump(),
+                                    "candidate": p_cand.model_dump(),
+                                }
+                            )
+                            if p_check not in model_tried:
+                                winners.append(archived_fam_winner)
                         continue
                     fam_count += 1
-                    best_fam_winner: dict | None = None
+                    best_fam_winner: dict | None = archived_fam_winner
                     for cand, m_key in options:
                         if report["evaluations"] >= self.config.evaluations:
                             break
